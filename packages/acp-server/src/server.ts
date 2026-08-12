@@ -71,6 +71,7 @@ import { buildTerminalAuthMethod, TERMINAL_AUTH_METHOD } from './auth-methods';
 import { acpMcpServersToConfigRecord } from './convert';
 import { log } from './log';
 import { isAcpModeId } from './modes';
+import { LODY_KIMI_EXTENSION, LODY_KIMI_METHODS } from './lody-extension';
 import { AcpSession } from './session';
 import { negotiateVersion } from './version';
 
@@ -208,6 +209,7 @@ export class AcpServer {
       // is not supported (dropped with a warning — see `./convert`).
       mcpCapabilities: { http: true, sse: true },
       auth: { logout: {} },
+      _meta: { 'lody.ai/kimi': LODY_KIMI_EXTENSION },
     };
 
     return {
@@ -507,6 +509,34 @@ export class AcpServer {
     return {};
   }
 
+  async listSubagents(params: ListSubagentsParams): Promise<Record<string, unknown>> {
+    return {
+      tasks: await this.requireAcpSession(params.sessionId).listSubagents(params.activeOnly),
+    };
+  }
+
+  async cancelSubagent(params: CancelSubagentParams): Promise<Record<string, unknown>> {
+    await this.requireAcpSession(params.sessionId).cancelSubagent(params.taskId, params.reason);
+    return {};
+  }
+
+  async subagentOutput(params: SubagentOutputParams): Promise<{ output: string }> {
+    return {
+      output: await this.requireAcpSession(params.sessionId).subagentOutput(
+        params.taskId,
+        params.tail,
+      ),
+    };
+  }
+
+  private requireAcpSession(sessionId: string): AcpSession {
+    const session = this.sessions.get(sessionId);
+    if (session === undefined) {
+      throw RequestError.invalidParams({ sessionId }, `Unknown sessionId: ${sessionId}`);
+    }
+    return session;
+  }
+
   /**
    * Resume a persisted session into the live scope tree and build its ACP
    * session. An unknown session id maps to ACP `invalid_params` (-32602)
@@ -645,6 +675,23 @@ export interface SetSessionModelParams {
   readonly modelId: string;
 }
 
+interface ListSubagentsParams {
+  readonly sessionId: string;
+  readonly activeOnly?: boolean;
+}
+
+interface CancelSubagentParams {
+  readonly sessionId: string;
+  readonly taskId: string;
+  readonly reason?: string;
+}
+
+interface SubagentOutputParams {
+  readonly sessionId: string;
+  readonly taskId: string;
+  readonly tail?: number;
+}
+
 /**
  * Params parser for the custom `session/set_model` route (the app API
  * requires every custom method to bring its own parser). Hand-rolled rather
@@ -661,6 +708,65 @@ function parseSetSessionModelParams(params: unknown): SetSessionModelParams {
     );
   }
   return { sessionId, modelId };
+}
+
+function parseListSubagentsParams(params: unknown): ListSubagentsParams {
+  const record = asRecord(params, LODY_KIMI_METHODS.subagentsList);
+  const sessionId = requiredString(record, 'sessionId', LODY_KIMI_METHODS.subagentsList);
+  const activeOnly = record['activeOnly'];
+  if (activeOnly !== undefined && typeof activeOnly !== 'boolean') {
+    throw RequestError.invalidParams(params, 'activeOnly must be a boolean');
+  }
+  return { sessionId, activeOnly };
+}
+
+function parseCancelSubagentParams(params: unknown): CancelSubagentParams {
+  const record = asRecord(params, LODY_KIMI_METHODS.subagentsCancel);
+  return {
+    sessionId: requiredString(record, 'sessionId', LODY_KIMI_METHODS.subagentsCancel),
+    taskId: requiredString(record, 'taskId', LODY_KIMI_METHODS.subagentsCancel),
+    reason: optionalString(record, 'reason', LODY_KIMI_METHODS.subagentsCancel),
+  };
+}
+
+function parseSubagentOutputParams(params: unknown): SubagentOutputParams {
+  const record = asRecord(params, LODY_KIMI_METHODS.subagentsOutput);
+  const tail = record['tail'];
+  if (tail !== undefined && (!Number.isInteger(tail) || (tail as number) < 0)) {
+    throw RequestError.invalidParams(params, 'tail must be a non-negative integer');
+  }
+  return {
+    sessionId: requiredString(record, 'sessionId', LODY_KIMI_METHODS.subagentsOutput),
+    taskId: requiredString(record, 'taskId', LODY_KIMI_METHODS.subagentsOutput),
+    tail: tail as number | undefined,
+  };
+}
+
+function asRecord(params: unknown, method: string): Record<string, unknown> {
+  if (typeof params !== 'object' || params === null || Array.isArray(params)) {
+    throw RequestError.invalidParams(params, `${method} expects an object`);
+  }
+  return params as Record<string, unknown>;
+}
+
+function requiredString(record: Record<string, unknown>, key: string, method: string): string {
+  const value = record[key];
+  if (typeof value !== 'string' || value.length === 0) {
+    throw RequestError.invalidParams(record, `${method} expects ${key}: string`);
+  }
+  return value;
+}
+
+function optionalString(
+  record: Record<string, unknown>,
+  key: string,
+  method: string,
+): string | undefined {
+  const value = record[key];
+  if (value !== undefined && typeof value !== 'string') {
+    throw RequestError.invalidParams(record, `${method} expects ${key}: string`);
+  }
+  return value;
 }
 
 /**
@@ -694,6 +800,15 @@ export function createAcpAgentApp(getServer: () => AcpServer): AgentApp {
     .onNotification(methods.agent.session.cancel, (ctx) => getServer().cancel(ctx.params))
     .onRequest(SET_SESSION_MODEL_METHOD, parseSetSessionModelParams, (ctx) =>
       getServer().setSessionModel(ctx.params),
+    )
+    .onRequest(LODY_KIMI_METHODS.subagentsList, parseListSubagentsParams, (ctx) =>
+      getServer().listSubagents(ctx.params),
+    )
+    .onRequest(LODY_KIMI_METHODS.subagentsCancel, parseCancelSubagentParams, (ctx) =>
+      getServer().cancelSubagent(ctx.params),
+    )
+    .onRequest(LODY_KIMI_METHODS.subagentsOutput, parseSubagentOutputParams, (ctx) =>
+      getServer().subagentOutput(ctx.params),
     );
 }
 

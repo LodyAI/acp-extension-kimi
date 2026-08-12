@@ -93,6 +93,15 @@ describe('facade routing', () => {
       method: 'status',
       args: [undefined],
     });
+
+    const managedUsage = { kind: 'ok', summary: null, limits: [], extraUsage: null } as const;
+    channel.results.set('oauthService.getManagedUsage', managedUsage);
+    await expect(klient.global.auth.managedUsage()).resolves.toEqual(managedUsage);
+    expect(channel.calls[3]).toMatchObject({
+      service: 'oauthService',
+      method: 'getManagedUsage',
+      args: [undefined],
+    });
   });
 
   it('routes capability calls through the registered app service contract', async () => {
@@ -155,7 +164,6 @@ describe('facade routing', () => {
     expect(channel.calls).toHaveLength(12);
   });
 });
-
 describe('agent profile routing', () => {
   it('thinking calls route to agentProfileService with the agent scope', async () => {
     const channel = new FakeChannel();

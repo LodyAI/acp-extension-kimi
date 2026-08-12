@@ -34,6 +34,7 @@ import type { ContextMessage } from '@moonshot-ai/agent-core-v2';
 import type {
   AgentEventPayloads,
   AgentHandle,
+  AgentTaskInfo,
   ContentPart,
   IDisposable,
   Klient,
@@ -41,6 +42,7 @@ import type {
   SessionEventPayloads,
   SessionHandle,
   SkillSummary,
+  UsageStatus,
 } from '@moonshot-ai/klient';
 import type {
   ToolCallDeltaEvent,
@@ -83,6 +85,16 @@ import {
 } from './events-map';
 import { AcpInteractionBridge } from './interaction-bridge';
 import { log } from './log';
+import {
+  addTokenUsage,
+  hasTokenUsage,
+  LODY_KIMI_METHODS,
+  type TokenUsage,
+  tokenUsageDelta,
+  toLodyRateLimits,
+  toLodySessionUsage,
+  toLodyTaskLifecycle,
+} from './lody-extension';
 import { projectModelCatalog } from './model-catalog';
 import { ACP_MODES, type AcpModeId, acpModeToToggles, DEFAULT_MODE_ID } from './modes';
 import { projectHistoryToSessionUpdates } from './replay';
@@ -236,6 +248,10 @@ export class AcpSession {
    * captured output; only the client-facing card content is de-duplicated.
    */
   private readonly terminalBackedCalls = new Map<string, string>();
+  /** Cumulative engine counters captured when this ACP activation began. */
+  private readonly lodyUsageBaselines = new Map<string, TokenUsage>();
+  /** Cumulative usage attributable only to this ACP activation. */
+  private readonly lodyUsageSinceActivation = new Map<string, TokenUsage>();
   /** Bridges engine approval / ask-user requests to the ACP client. */
   private readonly interactionBridge: AcpInteractionBridge;
 
@@ -256,16 +272,19 @@ export class AcpSession {
      * shared temp-dir fallback applies.
      */
     private readonly resolveOriginalsDir?: (sessionId: string) => string | undefined,
-    private readonly hostCommands:
-      | ReadonlyArray<AvailableCommand>
-      | HostSlashCommandsSnapshot = [],
+    private readonly hostCommands: ReadonlyArray<AvailableCommand> | HostSlashCommandsSnapshot = [],
   ) {
     this.klient = klient;
     this.session = klient.session(sessionId);
     // `main` is auto-materialized by the transport's scope resolution on the
     // first call — no explicit agent bootstrap is needed here.
     this.agent = this.session.agent('main');
-    this.interactionBridge = new AcpInteractionBridge(conn, this.session, sessionId, elicitationForm);
+    this.interactionBridge = new AcpInteractionBridge(
+      conn,
+      this.session,
+      sessionId,
+      elicitationForm,
+    );
   }
 
   /**
@@ -309,6 +328,12 @@ export class AcpSession {
         this.dispatchTurnEvent(event.turnId, () => {
           this.onTurnEnded(event);
         });
+      }),
+      events.on('task.started', (event) => {
+        void this.emitTaskLifecycle('started', event.info);
+      }),
+      events.on('task.terminated', (event) => {
+        void this.emitTaskLifecycle('terminated', event.info);
       }),
       // Compaction runs as a background LLM task outside any turn, so these
       // are not turn-scoped; the subscription is already agent-grained (this
@@ -361,6 +386,15 @@ export class AcpSession {
     // Awaited: the post-`session/new` `available_commands_update` must already
     // carry the skills (see `activateSession`).
     await this.refreshSkills();
+    try {
+      await this.captureDetailedUsage(false);
+    } catch (error) {
+      log.warn('acp: failed to establish Lody token usage baseline', {
+        sessionId: this.sessionId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+    void this.emitManagedUsage();
   }
 
   /** Refresh the skill cache from the session catalog (best-effort). */
@@ -917,7 +951,127 @@ export class AcpSession {
       }
       driver.resolve({ stopReason: turnEndReasonToStopReason(event.reason, error) });
     });
-    void this.emitUsageUpdate();
+    void Promise.all([
+      this.emitUsageUpdate(),
+      this.emitDetailedUsageUpdate(),
+      this.emitManagedUsage(),
+    ]);
+  }
+
+  /** Provider-neutral task snapshot used by Lody's subagent management UI. */
+  async listSubagents(activeOnly = false): Promise<readonly AgentTaskInfo[]> {
+    return (await this.agent.getTasks({ activeOnly })).filter((task) => task.kind === 'agent');
+  }
+
+  async cancelSubagent(taskId: string, reason?: string): Promise<void> {
+    await this.agent.stopTask({ taskId, reason });
+  }
+
+  subagentOutput(taskId: string, tail?: number): Promise<string> {
+    return this.agent.getTaskOutput({ taskId, tail: Math.min(tail ?? 2_000, 2_000) });
+  }
+
+  private async emitTaskLifecycle(
+    event: 'started' | 'terminated',
+    task: AgentTaskInfo,
+  ): Promise<void> {
+    if (task.kind !== 'agent') return;
+    let output: string | undefined;
+    if (event === 'terminated') {
+      try {
+        output = await this.agent.getTaskOutput({ taskId: task.taskId, tail: 2_000 });
+      } catch {
+        // The task registry is still authoritative when output has already rotated away.
+      }
+    }
+    const params = toLodyTaskLifecycle(this.sessionId, event, task, output);
+    if (params === null) return;
+    await this.emitExtension(LODY_KIMI_METHODS.taskLifecycle, params);
+  }
+
+  private async emitDetailedUsageUpdate(): Promise<void> {
+    try {
+      await this.captureDetailedUsage(true);
+      const contextWindow = (await this.klient.global.kosong.listModels()).find(
+        (item) => item.model === this.currentModelId,
+      )?.max_context_size;
+      const update = toLodySessionUsage(
+        Object.fromEntries(this.lodyUsageSinceActivation),
+        contextWindow,
+      );
+      if (update !== null) {
+        await this.emitExtension(LODY_KIMI_METHODS.usageUpdate, { ...update });
+      }
+    } catch (error) {
+      log.warn('acp: failed to push Lody token usage', {
+        sessionId: this.sessionId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  private async captureDetailedUsage(includeDelta: boolean): Promise<void> {
+    const meta = await this.session.agents();
+    const agentIds = new Set(['main', ...Object.keys(meta)]);
+    for (const agentId of agentIds) {
+      const handle = this.session.agent(agentId);
+      try {
+        const status = await handle.getUsage();
+        const byModel = await this.usageByModel(handle, status);
+        for (const [model, usage] of Object.entries(byModel)) {
+          const baselineKey = `${agentId}\0${model}`;
+          const previous = this.lodyUsageBaselines.get(baselineKey);
+          this.lodyUsageBaselines.set(baselineKey, { ...usage });
+          if (!includeDelta) continue;
+          const delta = tokenUsageDelta(usage, previous);
+          if (!hasTokenUsage(delta)) continue;
+          this.lodyUsageSinceActivation.set(
+            model,
+            addTokenUsage(this.lodyUsageSinceActivation.get(model), delta),
+          );
+        }
+      } catch (error) {
+        log.warn('acp: failed to read agent token usage', {
+          sessionId: this.sessionId,
+          agentId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+  }
+
+  private async usageByModel(
+    handle: AgentHandle,
+    status: UsageStatus,
+  ): Promise<Readonly<Record<string, TokenUsage>>> {
+    if (status.byModel !== undefined) return status.byModel;
+    if (status.total === undefined) return {};
+    const model = await handle.getModel();
+    return { [model || 'unknown']: status.total };
+  }
+
+  private async emitManagedUsage(): Promise<void> {
+    try {
+      const usage = await this.klient.global.auth.managedUsage();
+      await this.emitExtension(LODY_KIMI_METHODS.rateLimits, toLodyRateLimits(usage));
+    } catch (error) {
+      log.warn('acp: failed to push Lody managed usage', {
+        sessionId: this.sessionId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  private async emitExtension(method: string, params: Record<string, unknown>): Promise<void> {
+    try {
+      await this.conn.extensionNotification(method, params);
+    } catch (error) {
+      log.warn('acp: failed to push extension notification', {
+        sessionId: this.sessionId,
+        method,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
   }
 
   /**

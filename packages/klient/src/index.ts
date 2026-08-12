@@ -36,6 +36,7 @@ export type {
   GlobalSessionsFacade,
   GlobalWorkspacesFacade,
   KlientEnvInfo,
+  ManagedUsageResult,
   ModelCatalogItem,
   OAuthFlowSnapshot,
   OAuthFlowStart,

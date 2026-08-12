@@ -10,6 +10,7 @@
 import { z } from 'zod';
 
 import type { EventRegistration } from '../types.js';
+import { agentTaskInfoSchema } from './rpc.js';
 
 /**
  * Scope-stream registration (`kind: 'stream'`). Declared structurally here
@@ -182,6 +183,17 @@ export const agentStatusUpdatedEventSchema = z.looseObject({
   phase: z.string().optional(),
 });
 
+/** Durable background-task edges, including subagent task lifecycle. */
+export const taskStartedEventSchema = z.object({
+  type: z.literal('task.started'),
+  info: agentTaskInfoSchema,
+});
+
+export const taskTerminatedEventSchema = z.object({
+  type: z.literal('task.terminated'),
+  info: agentTaskInfoSchema,
+});
+
 // ── registrations ───────────────────────────────────────────────────────────
 
 /** Public event name → payload type. Keys must stay in sync with `agentEvents`. */
@@ -205,6 +217,8 @@ export interface AgentEventPayloads {
   error: z.infer<typeof errorEventSchema>;
   warning: z.infer<typeof warningEventSchema>;
   'agent.status.updated': z.infer<typeof agentStatusUpdatedEventSchema>;
+  'task.started': z.infer<typeof taskStartedEventSchema>;
+  'task.terminated': z.infer<typeof taskTerminatedEventSchema>;
 }
 
 export type AgentEventName = keyof AgentEventPayloads;
@@ -264,5 +278,17 @@ export const agentEvents = {
     name: 'events',
     type: 'agent.status.updated',
     schema: agentStatusUpdatedEventSchema,
+  },
+  'task.started': {
+    kind: 'stream',
+    name: 'events',
+    type: 'task.started',
+    schema: taskStartedEventSchema,
+  },
+  'task.terminated': {
+    kind: 'stream',
+    name: 'events',
+    type: 'task.terminated',
+    schema: taskTerminatedEventSchema,
   },
 } satisfies Record<AgentEventName, AgentEventRegistration>;

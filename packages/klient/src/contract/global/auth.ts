@@ -66,6 +66,42 @@ export const authStatusSchema = z.object({
   provider: z.string().optional(),
 });
 
+const managedUsageWindowSchema = z.object({
+  duration: z.number(),
+  unit: z.enum(['minute', 'hour', 'day', 'week']),
+});
+
+const managedUsageRowSchema = z.object({
+  name: z.string().optional(),
+  window: managedUsageWindowSchema.optional(),
+  used: z.number(),
+  limit: z.number(),
+  resetAt: z.string().optional(),
+});
+
+const managedExtraUsageSchema = z.object({
+  balanceCents: z.number(),
+  totalCents: z.number(),
+  monthlyChargeLimitEnabled: z.boolean(),
+  monthlyChargeLimitCents: z.number(),
+  monthlyUsedCents: z.number(),
+  currency: z.string(),
+});
+
+export const managedUsageResultSchema = z.discriminatedUnion('kind', [
+  z.object({
+    kind: z.literal('ok'),
+    summary: z.union([managedUsageRowSchema, z.null()]),
+    limits: z.array(managedUsageRowSchema),
+    extraUsage: z.union([managedExtraUsageSchema, z.null()]),
+  }),
+  z.object({
+    kind: z.literal('error'),
+    status: z.number().optional(),
+    message: z.string(),
+  }),
+]);
+
 /** Same shape as `refreshProviderModelsResponseSchema` in `./catalog.js` — keep in sync. */
 export const refreshOAuthProviderModelsResponseSchema = z.object({
   changed: z.array(
@@ -92,6 +128,10 @@ export const authContract = {
   },
   logout: { input: z.tuple([z.string().optional()]), output: oAuthLogoutResponseSchema },
   status: { input: z.tuple([z.string().optional()]), output: authStatusSchema },
+  getManagedUsage: {
+    input: z.tuple([z.string().optional()]),
+    output: managedUsageResultSchema,
+  },
   refreshOAuthProviderModels: {
     input: z.tuple([]),
     output: refreshOAuthProviderModelsResponseSchema,

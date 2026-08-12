@@ -77,6 +77,7 @@ export type OAuthFlowStart = Awaited<ReturnType<IOAuthService['startLogin']>>;
 export type OAuthFlowSnapshot = NonNullable<Awaited<ReturnType<IOAuthService['getFlow']>>>;
 export type OAuthLoginCancelResponse = Awaited<ReturnType<IOAuthService['cancelLogin']>>;
 export type OAuthLogoutResponse = Awaited<ReturnType<IOAuthService['logout']>>;
+export type ManagedUsageResult = Awaited<ReturnType<IOAuthService['getManagedUsage']>>;
 
 export type ModelCatalogItem = Awaited<ReturnType<IModelCatalog['listModels']>>[number];
 export type ProviderCatalogItem = Awaited<
@@ -114,7 +115,6 @@ export interface GlobalSessionsFacade {
     mcpServers?: Readonly<Record<string, McpServerConfig>>;
   }): Promise<SessionMeta>;
 }
-
 export interface GlobalWorkspacesFacade {
   list(): Promise<readonly Workspace[]>;
   get(id: string): Promise<Workspace | undefined>;
@@ -178,6 +178,8 @@ export interface GlobalAuthFacade {
    * model usage does not depend on the OAuth-only {@link summarize} view.
    */
   ensureReady(modelOverride?: string): Promise<void>;
+  /** Managed Kimi plan windows and booster-wallet usage; credentials stay engine-side. */
+  managedUsage(provider?: string): Promise<ManagedUsageResult>;
   startLogin(provider?: string): Promise<OAuthFlowStart>;
   flow(provider?: string): Promise<OAuthFlowSnapshot | undefined>;
   cancelLogin(provider?: string): Promise<OAuthLoginCancelResponse>;
@@ -420,6 +422,8 @@ export function createGlobalFacade(scoped: ScopedCaller, scopedStream: ScopedStr
       summarize: () => call('authSummaryService', 'summarize', []) as Promise<readonly AuthStatus[]>,
       ensureReady: (modelOverride) =>
         call('authSummaryService', 'ensureReady', [modelOverride]) as Promise<void>,
+      managedUsage: (provider) =>
+        call('oauthService', 'getManagedUsage', [provider]) as Promise<ManagedUsageResult>,
       startLogin: (provider) =>
         call('oauthService', 'startLogin', [provider]) as Promise<OAuthFlowStart>,
       flow: (provider) =>
