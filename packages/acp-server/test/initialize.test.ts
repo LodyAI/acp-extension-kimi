@@ -55,7 +55,6 @@ describe('negotiateVersion', () => {
     expect(MIN_PROTOCOL_VERSION).toBe(1);
   });
 });
-
 describe('acp-server initialize handshake', () => {
   it(
     'boots agent-core-v2 and answers the ACP initialize request',
@@ -85,6 +84,12 @@ describe('acp-server initialize handshake', () => {
             auth: { logout: {} },
             mcpCapabilities: { http: true, sse: true },
             sessionCapabilities: { additionalDirectories: {}, delete: {}, fork: {} },
+            _meta: {
+              'lody.ai/kimi': {
+                protocolVersion: 1,
+                features: { managedUsage: true, subagentManagement: true, tokenUsage: true },
+              },
+            },
           },
         });
 
