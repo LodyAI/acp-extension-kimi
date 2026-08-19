@@ -184,6 +184,34 @@ interface TurnDriver {
    * the same verdict the live path would have given.
    */
   early: Array<{ readonly turnId: number; readonly dispatch: () => void }>;
+  /**
+   * Settlement withheld while background work this prompt started is still
+   * running. A detached subagent outlives the turn that spawned it and the
+   * engine reports its result by opening a FOLLOW-UP turn on this agent, so
+   * settling at the first `turn.ended` would report the conversation idle
+   * with the answer still to come. Held prompts settle from
+   * {@link AcpSession.settleHeldPromptIfDrained} instead.
+   */
+  pendingSettle?: () => void;
+}
+
+/**
+ * How long a held prompt keeps waiting for the wake turn of a terminated
+ * subagent. The engine enqueues that turn asynchronously (it snapshots the
+ * task's output first), so the wake reliably lands after `task.terminated`;
+ * the bound only exists so an engine that never enqueues cannot strand the
+ * client's `session/prompt` forever.
+ */
+const WAKE_TURN_GRACE_MS = 10_000;
+
+/**
+ * Whether the engine will report this finished task back to the agent as a
+ * follow-up turn. Mirrors the task service's own notification conditions: an
+ * attached task was already awaited inside its tool call, and a suppressed
+ * one is reported by whoever suppressed it.
+ */
+function expectsWakeTurn(task: AgentTaskInfo): boolean {
+  return task.detached !== false && task.terminalNotificationSuppressed !== true;
 }
 
 export class AcpSession {
@@ -206,6 +234,21 @@ export class AcpSession {
   private skills: readonly SkillSummary[] = [];
   /** The in-flight prompt's driver, if any. */
   private driver: TurnDriver | undefined;
+  /**
+   * Turns currently running on this session's main agent. Includes turns the
+   * ENGINE opened on its own (a terminated subagent's notification, a cron
+   * fire): those are ordinary turns of this agent, so a held prompt must wait
+   * for them the same way it waits for its own.
+   */
+  private readonly runningTurns = new Set<number>();
+  /** Subagent (`kind: 'agent'`) tasks started here that have not terminated. */
+  private readonly activeSubagentTasks = new Set<string>();
+  /**
+   * Set when the last subagent task terminated and the engine still owes its
+   * wake turn. Blocks settlement across that gap so the result lands inside
+   * the prompt that started the work; {@link WAKE_TURN_GRACE_MS} bounds it.
+   */
+  private wakeTurnGrace: ReturnType<typeof setTimeout> | undefined;
   /**
    * Abort markers of prompts still in their pre-turn image-compression phase
    * (no turn launched yet, so `agent.cancel` has nothing to cancel).
@@ -294,45 +337,58 @@ export class AcpSession {
   async init(): Promise<void> {
     const events = this.agent.events;
     this.subscriptions.push(
+      // Content events are forwarded for EVERY turn of this agent, not only
+      // the one the in-flight prompt launched: the engine opens turns of its
+      // own (a terminated subagent's notification, a cron fire) and dropping
+      // those would silently swallow the agent's reply. The prompt driver is
+      // about settling `session/prompt`, not about who may speak.
       events.on('assistant.delta', (event) => {
-        this.dispatchTurnEvent(event.turnId, () => {
-          this.onAssistantDelta(event);
-        });
+        this.onAssistantDelta(event);
       }),
       events.on('thinking.delta', (event) => {
-        this.dispatchTurnEvent(event.turnId, () => {
-          this.onThinkingDelta(event);
-        });
+        this.onThinkingDelta(event);
       }),
       events.on('tool.call.started', (event) => {
-        this.dispatchTurnEvent(event.turnId, () => {
-          this.onToolCallStarted(event);
-        });
+        this.onToolCallStarted(event);
       }),
       events.on('tool.call.delta', (event) => {
-        this.dispatchTurnEvent(event.turnId, () => {
-          this.onToolCallDelta(event);
-        });
+        this.onToolCallDelta(event);
       }),
       events.on('tool.progress', (event) => {
-        this.dispatchTurnEvent(event.turnId, () => {
-          this.onToolProgress(event);
-        });
+        this.onToolProgress(event);
       }),
       events.on('tool.result', (event) => {
-        this.dispatchTurnEvent(event.turnId, () => {
-          this.onToolResult(event);
-        });
+        this.onToolResult(event);
+      }),
+      events.on('turn.started', (event) => {
+        this.runningTurns.add(event.turnId);
+        // The awaited wake turn arrived: `runningTurns` now holds settlement.
+        this.clearWakeTurnGrace();
       }),
       events.on('turn.ended', (event) => {
+        this.runningTurns.delete(event.turnId);
+        // Settlement stays turn-scoped (only this prompt's own turn resolves
+        // it), but the drain check runs for every turn — an engine-opened
+        // turn ending is what releases a held prompt.
         this.dispatchTurnEvent(event.turnId, () => {
           this.onTurnEnded(event);
         });
+        this.settleHeldPromptIfDrained();
       }),
       events.on('task.started', (event) => {
+        if (event.info.kind === 'agent') {
+          this.activeSubagentTasks.add(event.info.taskId);
+        }
         void this.emitTaskLifecycle('started', event.info);
       }),
       events.on('task.terminated', (event) => {
+        if (event.info.kind === 'agent') {
+          this.activeSubagentTasks.delete(event.info.taskId);
+          if (this.activeSubagentTasks.size === 0 && expectsWakeTurn(event.info)) {
+            this.startWakeTurnGrace();
+          }
+          this.settleHeldPromptIfDrained();
+        }
         void this.emitTaskLifecycle('terminated', event.info);
       }),
       // Compaction runs as a background LLM task outside any turn, so these
@@ -415,6 +471,7 @@ export class AcpSession {
    * and detaches the event subscriptions. Idempotent.
    */
   dispose(): void {
+    this.clearWakeTurnGrace();
     this.cancel();
     const driver = this.driver;
     if (driver !== undefined) {
@@ -769,17 +826,14 @@ export class AcpSession {
   }
 
   private onAssistantDelta(event: AgentEventPayloads['assistant.delta']): void {
-    if (this.driverFor(event.turnId) === undefined) return;
     this.emit(assistantDeltaToSessionUpdate(this.sessionId, event));
   }
 
   private onThinkingDelta(event: AgentEventPayloads['thinking.delta']): void {
-    if (this.driverFor(event.turnId) === undefined) return;
     this.emit(thinkingDeltaToSessionUpdate(this.sessionId, event));
   }
 
   private onToolCallStarted(event: AgentEventPayloads['tool.call.started']): void {
-    if (this.driverFor(event.turnId) === undefined) return;
     // The klient payload mirrors `ToolCallStartedEvent` (`args` / `display`
     // arrive as `unknown` — cast at this seam).
     const mapped = event as unknown as ToolCallStartedEvent;
@@ -821,7 +875,6 @@ export class AcpSession {
   }
 
   private onToolCallDelta(event: AgentEventPayloads['tool.call.delta']): void {
-    if (this.driverFor(event.turnId) === undefined) return;
     // The klient payload mirrors `ToolCallDeltaEvent` field-for-field.
     const mapped = event as unknown as ToolCallDeltaEvent;
     const key = acpToolCallId(event.turnId, event.toolCallId);
@@ -843,7 +896,6 @@ export class AcpSession {
   }
 
   private onToolProgress(event: AgentEventPayloads['tool.progress']): void {
-    if (this.driverFor(event.turnId) === undefined) return;
     // The klient payload mirrors `ToolProgressEvent` field-for-field; the
     // helper forwards only `status` updates with text (as a title refresh)
     // and returns null for everything else, which `emit` drops.
@@ -851,7 +903,6 @@ export class AcpSession {
   }
 
   private onToolResult(event: AgentEventPayloads['tool.result']): void {
-    if (this.driverFor(event.turnId) === undefined) return;
     const key = acpToolCallId(event.turnId, event.toolCallId);
     const locations = this.toolLocations.get(key);
     this.toolLocations.delete(key);
@@ -942,20 +993,65 @@ export class AcpSession {
     const driver = this.driverFor(event.turnId);
     if (driver === undefined) return;
     const error = event.error as { readonly code: string; readonly message?: string } | undefined;
-    this.settleDriver(driver, () => {
-      // Auth failures must surface as a JSON-RPC `auth_required` error
-      // so the client triggers its re-auth flow, not a silent `end_turn`.
-      if (event.reason === 'failed' && isAuthError(error)) {
+    if (event.reason === 'failed' && isAuthError(error)) {
+      // Auth failures must surface as a JSON-RPC `auth_required` error right
+      // away so the client triggers its re-auth flow — waiting on background
+      // work would only delay a turn that produced nothing.
+      this.settleDriver(driver, () => {
         driver.reject(RequestError.authRequired(undefined, error?.message));
-        return;
-      }
-      driver.resolve({ stopReason: turnEndReasonToStopReason(event.reason, error) });
-    });
+      });
+    } else {
+      const stopReason = turnEndReasonToStopReason(event.reason, error);
+      driver.pendingSettle = () => {
+        driver.resolve({ stopReason });
+      };
+      this.settleHeldPromptIfDrained();
+    }
     void Promise.all([
       this.emitUsageUpdate(),
       this.emitDetailedUsageUpdate(),
       this.emitManagedUsage(),
     ]);
+  }
+
+  /**
+   * Settle a prompt whose turn ended, once the background work it started has
+   * drained: no turn running on this agent (including one the ENGINE opened
+   * to report a finished subagent or a cron fire), no subagent task still
+   * alive, and no wake turn owed. Until then the client's `session/prompt`
+   * stays in flight, which is what keeps the conversation reported as running
+   * while a detached subagent works — matching agents that run a subagent
+   * inside its spawning tool call.
+   */
+  private settleHeldPromptIfDrained(): void {
+    const driver = this.driver;
+    if (driver === undefined || driver.settled) return;
+    const settle = driver.pendingSettle;
+    if (settle === undefined) return;
+    if (this.runningTurns.size > 0) return;
+    if (this.activeSubagentTasks.size > 0) return;
+    if (this.wakeTurnGrace !== undefined) return;
+    driver.pendingSettle = undefined;
+    this.settleDriver(driver, settle);
+  }
+
+  /** Hold settlement across the gap between `task.terminated` and its wake turn. */
+  private startWakeTurnGrace(): void {
+    if (this.driver?.pendingSettle === undefined) return;
+    this.clearWakeTurnGrace();
+    const timer = setTimeout(() => {
+      this.wakeTurnGrace = undefined;
+      this.settleHeldPromptIfDrained();
+    }, WAKE_TURN_GRACE_MS);
+    // The grace period must never be the reason the process stays alive.
+    timer.unref?.();
+    this.wakeTurnGrace = timer;
+  }
+
+  private clearWakeTurnGrace(): void {
+    if (this.wakeTurnGrace === undefined) return;
+    clearTimeout(this.wakeTurnGrace);
+    this.wakeTurnGrace = undefined;
   }
 
   /** Provider-neutral task snapshot used by Lody's subagent management UI. */
@@ -1137,6 +1233,27 @@ export class AcpSession {
     }
     const driver = this.driver;
     if (driver === undefined || driver.settled) return;
+    if (driver.pendingSettle !== undefined) {
+      // The prompt is only being held open for background work; its own turn
+      // is already over. Cancel whatever the engine opened in the meantime (a
+      // wake turn reporting a finished subagent, a cron fire) and stop
+      // waiting. Detached subagents keep running on purpose — they outlive
+      // the turn by design and have their own cancellation surface.
+      if (this.runningTurns.size > 0) {
+        void this.agent.cancel().catch((error) => {
+          log.warn('acp: cancel (held prompt) failed', {
+            sessionId: this.sessionId,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        });
+      }
+      this.clearWakeTurnGrace();
+      driver.pendingSettle = undefined;
+      this.settleDriver(driver, () => {
+        driver.resolve({ stopReason: 'cancelled' });
+      });
+      return;
+    }
     const turnId = driver.turnId;
     if (turnId === undefined) {
       // The launch round-trip has not returned the turn id yet. The engine's

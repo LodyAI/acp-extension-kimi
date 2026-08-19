@@ -106,6 +106,17 @@ export function acpToolCallId(turnId: number, toolCallId: string): string {
 }
 
 /**
+ * Carry the engine's tool name alongside the card. A tool call's `title` is
+ * the human-facing description whenever the tool provides one, so it cannot
+ * identify the tool: clients that treat specific tools specially (a scheduling
+ * card that has to read the cron expression out of `rawInput`, say) need the
+ * canonical name on the wire. Provider-neutral by design — no vendor prefix.
+ */
+export function toolNameMeta(name: string): { readonly toolName: string } {
+  return { toolName: name };
+}
+
+/**
  * Heuristic map from a Kimi tool's `name` to ACP {@link ToolKind}.
  *
  * Pure, never throws — defaults to `'other'` whenever the name is
@@ -221,6 +232,7 @@ export function toolCallStartToSessionUpdate(
       rawInput: event.args,
       locations: toolCallLocations(event.name, event.args, event.display),
       content,
+      _meta: toolNameMeta(event.name),
     },
   };
 }
@@ -275,6 +287,7 @@ export function toolCallLazyCreateToSessionUpdate(
       title: name,
       kind: event.name ? inferToolKind(event.name) : 'other',
       status: 'pending',
+      _meta: event.name === undefined ? undefined : toolNameMeta(event.name),
       content: [
         {
           type: 'content',
@@ -320,6 +333,7 @@ export function toolCallStartedUpgradeToSessionUpdate(
       rawInput: event.args,
       locations: toolCallLocations(event.name, event.args, event.display),
       content,
+      _meta: toolNameMeta(event.name),
     },
   };
 }
