@@ -17,7 +17,7 @@ function normalizeBackgroundField(value: string | undefined): string | undefined
 export function formatBackgroundAgentTranscript(
   phase: BackgroundAgentStatusPhase,
   meta: BackgroundAgentMetadata,
-  extras: { resultSummary?: string; error?: string } | undefined = undefined,
+  extras?: { resultSummary?: string; error?: string },
 ): BackgroundAgentStatusData {
   const normalizedAgentName = normalizeBackgroundField(meta.agentName);
   const subject = normalizedAgentName !== undefined ? `${normalizedAgentName} agent` : 'agent';

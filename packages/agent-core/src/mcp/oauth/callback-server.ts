@@ -149,7 +149,7 @@ export async function startCallbackServer(): Promise<CallbackServer> {
     await closeServer();
   };
 
-  const waitForCode: CallbackServer['waitForCode'] = ({ signal, timeoutMs } = {}) => {
+  const waitForCode: CallbackServer['waitForCode'] = ({ signal, timeoutMs }) => {
     return new Promise<CallbackResult>((resolve, reject) => {
       if (outcome.status === 'resolved') {
         resolve(outcome.value);

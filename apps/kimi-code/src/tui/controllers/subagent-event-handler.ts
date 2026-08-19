@@ -419,7 +419,7 @@ export class SubAgentEventHandler {
   private appendBackgroundAgentEntry(
     phase: 'started' | 'completed' | 'failed',
     meta: BackgroundAgentMetadata,
-    extras: { resultSummary?: string; error?: string } | undefined = undefined,
+    extras?: { resultSummary?: string; error?: string },
   ): void {
     const status = formatBackgroundAgentTranscript(phase, meta, extras);
     const entry: TranscriptEntry = {

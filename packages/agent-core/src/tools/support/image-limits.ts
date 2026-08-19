@@ -27,7 +27,7 @@ import {
 export class ImageLimits {
   constructor(
     private readonly env: Readonly<Record<string, string | undefined>> = process.env,
-    private config: ImageConfig | undefined = undefined,
+    private config?: ImageConfig,
   ) {}
 
   /** Push (or clear, with `undefined`) the owning config. Called by the

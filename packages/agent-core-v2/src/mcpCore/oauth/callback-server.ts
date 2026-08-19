@@ -104,7 +104,7 @@ export async function startCallbackServer(): Promise<CallbackServer> {
     });
   };
 
-  const waitForCode: CallbackServer['waitForCode'] = ({ signal, timeoutMs } = {}) => {
+  const waitForCode: CallbackServer['waitForCode'] = ({ signal, timeoutMs }) => {
     return new Promise<CallbackResult>((resolve, reject) => {
       let timer: NodeJS.Timeout | undefined;
       const onAbort = () => {
