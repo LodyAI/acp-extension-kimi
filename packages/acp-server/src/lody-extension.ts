@@ -30,11 +30,17 @@ export function readLodyForkTurnIndex(meta: unknown): number | undefined {
   return Number.isSafeInteger(turnIndex) && turnIndex >= 0 ? turnIndex : undefined;
 }
 
-/** Attach `_meta.lody.turnId` without disturbing any other `_meta` entry. */
-export function withLodyTurnId(
-  notification: SessionNotification,
-  forkTurnIndex: number,
-): SessionNotification {
+/**
+ * Attach `_meta.lody.turnId` without disturbing any other `_meta` entry. Both
+ * absences pass through untouched, so callers stamp unconditionally instead of
+ * repeating the guards: no notification to send, or a turn with no fork
+ * position (see {@link isUserVisibleTurnOrigin}).
+ */
+export function withLodyTurnId<T extends SessionNotification | null>(
+  notification: T,
+  turnId: string | undefined,
+): T {
+  if (notification === null || turnId === undefined) return notification;
   const update = notification.update as typeof notification.update & {
     _meta?: Record<string, unknown> | null;
   };
@@ -42,11 +48,8 @@ export function withLodyTurnId(
   const lody = asRecord(meta['lody']) ?? {};
   return {
     ...notification,
-    update: {
-      ...update,
-      _meta: { ...meta, lody: { ...lody, turnId: String(forkTurnIndex) } },
-    },
-  };
+    update: { ...update, _meta: { ...meta, lody: { ...lody, turnId } } },
+  } as T;
 }
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
@@ -55,27 +58,7 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
     : undefined;
 }
 
-/**
- * Whether a turn's origin makes it a fork boundary. Mirrors the engine's
- * `isUserVisibleTurnRecord`: those are the turns `fork({ turnIndex })` counts,
- * so anything the engine skips must not consume an index here either.
- */
-export function isForkableTurnOrigin(origin: unknown): boolean {
-  const record = asRecord(origin);
-  const kind = record?.['kind'];
-  switch (kind) {
-    case undefined:
-    case 'user':
-      return true;
-    case 'skill_activation':
-    case 'plugin_command':
-      return record?.['trigger'] === 'user-slash';
-    case 'shell_command':
-      return record?.['phase'] === 'input';
-    default:
-      return false;
-  }
-}
+
 
 export const LODY_KIMI_METHODS = {
   usageUpdate: '_acp_ext:session_usage_update',

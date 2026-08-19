@@ -27,8 +27,9 @@ Package-local rules for `packages/acp-server`.
 - Fork positions are engine positions. The engine addresses `fork({ turnIndex })` by
   counting user-visible turns in the durable records, so the `_meta.lody.turnId` this
   server publishes IS that index, anchored per activation from `session.forkTurns()` and
-  advanced only by turns the engine would count — a wake or cron turn must never consume
-  one. Never derive a position from rendered history: compaction drops messages from
-  context while the records defining these positions stay. A turn that cannot be matched
-  to a record position is published without one; forking the wrong turn is worse than
-  not offering the branch.
+  advanced only by turns `isUserVisibleTurnOrigin` accepts — a wake or cron turn must
+  never consume one. Resolve a replayed turn to its position through the prompt's durable
+  id, never through rendered text: compaction drops messages from context while the
+  records defining these positions stay, and a repeated or truncated prompt would match
+  the wrong turn. A turn with no resolvable position is published without one; forking
+  the wrong turn is worse than not offering the branch.

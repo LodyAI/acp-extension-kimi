@@ -5,7 +5,6 @@ import type { BindAgentInput } from '#/agent/profile/profile';
 import type { McpServerConfig } from '#/mcpCore/config-schema';
 
 
-
 export type SessionCreateSource = 'startup' | 'resume' | 'fork';
 
 export type SessionCloseReason = 'exit' | 'archive';
@@ -25,14 +24,41 @@ export interface CreateSessionOptions {
 }
 
 /**
- * One fork-addressable turn: `turnIndex` is what `fork({ turnIndex })` takes,
- * and `prompt` is the same prompt metadata the fork records, which lets a
- * caller align these against a history whose head has been compacted away.
+ * One fork-addressable turn. `turnIndex` is what `fork({ turnIndex })` takes;
+ * `messageId` is the durable id of the prompt that opened it, which is how a
+ * caller lines these up against a rendered history whose head has been
+ * compacted away. `prompt` is the same prompt metadata a fork records, kept
+ * for diagnostics only — never match on it, it is sanitized and truncated.
  */
 export interface ForkTurnSummary {
   readonly turnIndex: number;
+  readonly messageId?: string;
   readonly prompt?: string;
-  readonly time?: number;
+}
+
+/**
+ * Whether a prompt origin opens a turn `fork({ turnIndex })` counts. The fork
+ * index space is defined by this predicate, so anything that publishes or
+ * resolves a fork position classifies origins through it rather than restating
+ * the rule.
+ */
+export function isUserVisibleTurnOrigin(origin: unknown): boolean {
+  const fields =
+    typeof origin === 'object' && origin !== null && !Array.isArray(origin)
+      ? (origin as Record<string, unknown>)
+      : undefined;
+  switch (fields?.['kind']) {
+    case undefined:
+    case 'user':
+      return true;
+    case 'skill_activation':
+    case 'plugin_command':
+      return fields?.['trigger'] === 'user-slash';
+    case 'shell_command':
+      return fields?.['phase'] === 'input';
+    default:
+      return false;
+  }
 }
 
 export interface ForkSessionOptions {

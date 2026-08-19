@@ -53,8 +53,8 @@ export const handleWireSchema = z.looseObject({
 /** One fork-addressable turn (`ForkTurnSummary` in the engine). */
 export const forkTurnSummarySchema = z.object({
   turnIndex: z.number(),
+  messageId: z.string().optional(),
   prompt: z.string().optional(),
-  time: z.number().optional(),
 });
 
 export const sessionManagerContract = {

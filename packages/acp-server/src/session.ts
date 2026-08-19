@@ -30,7 +30,11 @@ import type {
   ToolCallLocation,
 } from '@agentclientprotocol/sdk';
 import { RequestError } from '@agentclientprotocol/sdk';
-import type { ContextMessage, ForkTurnSummary } from '@moonshot-ai/agent-core-v2';
+import {
+  type ContextMessage,
+  type ForkTurnSummary,
+  isUserVisibleTurnOrigin,
+} from '@moonshot-ai/agent-core-v2';
 import type {
   AgentEventPayloads,
   AgentHandle,
@@ -88,7 +92,6 @@ import { log } from './log';
 import {
   addTokenUsage,
   hasTokenUsage,
-  isForkableTurnOrigin,
   LODY_KIMI_METHODS,
   type TokenUsage,
   tokenUsageDelta,
@@ -187,14 +190,14 @@ interface TurnDriver {
    */
   early: Array<{ readonly turnId: number; readonly dispatch: () => void }>;
   /**
-   * Settlement withheld while background work this prompt started is still
-   * running. A detached subagent outlives the turn that spawned it and the
-   * engine reports its result by opening a FOLLOW-UP turn on this agent, so
-   * settling at the first `turn.ended` would report the conversation idle
-   * with the answer still to come. Held prompts settle from
+   * The stop reason this prompt will answer with, withheld while background
+   * work it started is still running. A detached subagent outlives the turn
+   * that spawned it and the engine reports its result by opening a FOLLOW-UP
+   * turn on this agent, so settling at the first `turn.ended` would report the
+   * conversation idle with the answer still to come. Held prompts settle from
    * {@link AcpSession.settleHeldPromptIfDrained} instead.
    */
-  pendingSettle?: () => void;
+  pendingStopReason?: PromptResponse['stopReason'];
 }
 
 /**
@@ -246,12 +249,12 @@ export class AcpSession {
   /** Subagent (`kind: 'agent'`) tasks started here that have not terminated. */
   private readonly activeSubagentTasks = new Set<string>();
   /**
-   * Engine turn id → the fork turn index that turn can be forked at. The
-   * engine addresses forks by position among user-visible turns, so this is
-   * the id published to the client (`_meta.lody.turnId`) and the value it
-   * sends back in `session/fork`.
+   * Engine turn id → the fork position published on that turn's updates. The
+   * engine addresses forks by position among user-visible turns, so this id is
+   * the fork turn index, minted once per turn and echoed back by the client in
+   * `session/fork`.
    */
-  private readonly forkTurnIndexByTurn = new Map<number, number>();
+  private readonly forkTurnIdByTurn = new Map<number, string>();
   /**
    * Index the next user-visible turn will take, anchored at activation from
    * the engine's own record-level count. Undefined when that read failed —
@@ -384,6 +387,7 @@ export class AcpSession {
       }),
       events.on('turn.ended', (event) => {
         this.runningTurns.delete(event.turnId);
+        this.forkTurnIdByTurn.delete(event.turnId);
         // Settlement stays turn-scoped (only this prompt's own turn resolves
         // it), but the drain check runs for every turn — an engine-opened
         // turn ending is what releases a held prompt.
@@ -879,18 +883,14 @@ export class AcpSession {
    */
   private assignForkTurnIndex(event: AgentEventPayloads['turn.started']): void {
     if (this.nextForkTurnIndex === undefined) return;
-    if (!isForkableTurnOrigin(event.origin)) return;
-    this.forkTurnIndexByTurn.set(event.turnId, this.nextForkTurnIndex);
+    if (!isUserVisibleTurnOrigin(event.origin)) return;
+    this.forkTurnIdByTurn.set(event.turnId, String(this.nextForkTurnIndex));
     this.nextForkTurnIndex += 1;
   }
 
   /** Emit a turn's update, carrying its fork position when it has one. */
   private emitForTurn(turnId: number, notification: SessionNotification | null): void {
-    if (notification === null) return;
-    const forkTurnIndex = this.forkTurnIndexByTurn.get(turnId);
-    this.emit(
-      forkTurnIndex === undefined ? notification : withLodyTurnId(notification, forkTurnIndex),
-    );
+    this.emit(withLodyTurnId(notification, this.forkTurnIdByTurn.get(turnId)));
   }
 
   private onAssistantDelta(event: AgentEventPayloads['assistant.delta']): void {
@@ -1075,10 +1075,7 @@ export class AcpSession {
         driver.reject(RequestError.authRequired(undefined, error?.message));
       });
     } else {
-      const stopReason = turnEndReasonToStopReason(event.reason, error);
-      driver.pendingSettle = () => {
-        driver.resolve({ stopReason });
-      };
+      driver.pendingStopReason = turnEndReasonToStopReason(event.reason, error);
       this.settleHeldPromptIfDrained();
     }
     void Promise.all([
@@ -1100,18 +1097,24 @@ export class AcpSession {
   private settleHeldPromptIfDrained(): void {
     const driver = this.driver;
     if (driver === undefined || driver.settled) return;
-    const settle = driver.pendingSettle;
-    if (settle === undefined) return;
+    const stopReason = driver.pendingStopReason;
+    if (stopReason === undefined) return;
     if (this.runningTurns.size > 0) return;
     if (this.activeSubagentTasks.size > 0) return;
     if (this.wakeTurnGrace !== undefined) return;
-    driver.pendingSettle = undefined;
-    this.settleDriver(driver, settle);
+    driver.pendingStopReason = undefined;
+    this.settleDriver(driver, () => {
+      driver.resolve({ stopReason });
+    });
   }
 
-  /** Hold settlement across the gap between `task.terminated` and its wake turn. */
+  /**
+   * Hold settlement across the gap between `task.terminated` and its wake
+   * turn. Armed whatever the spawning turn is doing: when the task finishes
+   * first, this is what keeps the turn's own end from settling before the
+   * report arrives.
+   */
   private startWakeTurnGrace(): void {
-    if (this.driver?.pendingSettle === undefined) return;
     this.clearWakeTurnGrace();
     const timer = setTimeout(() => {
       this.wakeTurnGrace = undefined;
@@ -1307,22 +1310,15 @@ export class AcpSession {
     }
     const driver = this.driver;
     if (driver === undefined || driver.settled) return;
-    if (driver.pendingSettle !== undefined) {
+    if (driver.pendingStopReason !== undefined) {
       // The prompt is only being held open for background work; its own turn
       // is already over. Cancel whatever the engine opened in the meantime (a
       // wake turn reporting a finished subagent, a cron fire) and stop
       // waiting. Detached subagents keep running on purpose — they outlive
       // the turn by design and have their own cancellation surface.
-      if (this.runningTurns.size > 0) {
-        void this.agent.cancel().catch((error) => {
-          log.warn('acp: cancel (held prompt) failed', {
-            sessionId: this.sessionId,
-            error: error instanceof Error ? error.message : String(error),
-          });
-        });
-      }
+      if (this.runningTurns.size > 0) this.cancelAgentTurn('held prompt');
       this.clearWakeTurnGrace();
-      driver.pendingSettle = undefined;
+      driver.pendingStopReason = undefined;
       this.settleDriver(driver, () => {
         driver.resolve({ stopReason: 'cancelled' });
       });
@@ -1338,17 +1334,22 @@ export class AcpSession {
       // handler re-issues a precisely-addressed cancel, and a no-launch
       // outcome settles `cancelled` instead of `end_turn`.
       driver.cancelRequested = true;
-      void this.agent.cancel().catch((error) => {
-        log.warn('acp: cancel (unaddressed) failed', {
-          sessionId: this.sessionId,
-          error: error instanceof Error ? error.message : String(error),
-        });
-      });
+      this.cancelAgentTurn('unaddressed');
       return;
     }
-    void this.agent.cancel({ turnId }).catch((error) => {
+    this.cancelAgentTurn('addressed', turnId);
+  }
+
+  /**
+   * Ask the engine to stop a turn, fire-and-forget. An omitted `turnId`
+   * cancels whatever turn is active — the engine's contract for a cancel that
+   * cannot name its target yet.
+   */
+  private cancelAgentTurn(context: string, turnId?: number): void {
+    void this.agent.cancel(turnId === undefined ? undefined : { turnId }).catch((error) => {
       log.warn('acp: cancel failed', {
         sessionId: this.sessionId,
+        context,
         error: error instanceof Error ? error.message : String(error),
       });
     });

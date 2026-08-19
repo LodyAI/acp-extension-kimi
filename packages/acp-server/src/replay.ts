@@ -20,12 +20,11 @@
  */
 
 import type { SessionNotification } from '@agentclientprotocol/sdk';
-import {
-  type ContentPart,
-  type ContextMessage,
-  type ForkTurnSummary,
-  promptMetadataTextFromContentParts,
-  type ToolCall,
+import type {
+  ContentPart,
+  ContextMessage,
+  ForkTurnSummary,
+  ToolCall,
 } from '@moonshot-ai/agent-core-v2';
 
 import {
@@ -33,7 +32,7 @@ import {
   thinkingDeltaToSessionUpdate,
   toolCallStartToSessionUpdate,
 } from './events-map';
-import { isForkableTurnOrigin, withLodyTurnId } from './lody-extension';
+import { withLodyTurnId } from './lody-extension';
 
 /**
  * Project a persisted context history into an ordered batch of ACP
@@ -48,20 +47,18 @@ export function projectHistoryToSessionUpdates(
   const out: SessionNotification[] = [];
   let turnId = 0;
   const toolCallTurnIds = new Map<string, number>();
-  const forkPositions = new ForkTurnCursor(forkTurns);
-  let forkTurnIndex: number | undefined;
+  const forkPositions = forkTurnIdByMessageId(forkTurns);
+  let forkTurnId: string | undefined;
 
   const push = (notification: SessionNotification | null): void => {
-    if (notification === null) return;
-    out.push(
-      forkTurnIndex === undefined ? notification : withLodyTurnId(notification, forkTurnIndex),
-    );
+    const stamped = withLodyTurnId(notification, forkTurnId);
+    if (stamped !== null) out.push(stamped);
   };
 
   for (const message of messages) {
     switch (message.role) {
       case 'user':
-        forkTurnIndex = forkPositions.advanceTo(message);
+        forkTurnId = message.id === undefined ? undefined : forkPositions.get(message.id);
         for (const part of message.content) {
           if (part.type === 'text' && part.text) {
             push(userMessageChunk(sessionId, part.text));
@@ -92,33 +89,22 @@ export function projectHistoryToSessionUpdates(
 }
 
 /**
- * Walks the engine's fork turn list alongside a replayed history so each
- * replayed turn carries the position the engine would fork it at.
- *
- * The two sequences share an order but not a length: compaction drops
- * messages from context while the records defining fork positions stay, so a
- * replayed history is a subsequence. Matching on the same prompt metadata the
- * engine records lets the cursor skip the compacted-away entries; a turn that
- * cannot be matched carries no position and is simply not forkable, which is
- * the safe direction — a guessed index would branch the wrong turn.
+ * Index the engine's fork turn list by the durable id of the prompt that
+ * opened each turn, which is how a replayed message resolves to the position
+ * `fork({ turnIndex })` takes. The two sequences share an order but not a
+ * length — compaction drops messages from context while the records defining
+ * fork positions stay — and matching on identity rather than on rendered
+ * prompt text keeps a repeated or truncated prompt from resolving to the wrong
+ * turn. A message with no matching id carries no position and is simply not
+ * forkable, which is the safe direction.
  */
-class ForkTurnCursor {
-  private next = 0;
-
-  constructor(private readonly turns: readonly ForkTurnSummary[]) {}
-
-  advanceTo(message: ContextMessage): number | undefined {
-    if (!isForkableTurnOrigin(message.origin)) return undefined;
-    const prompt = promptMetadataTextFromContentParts(message.content);
-    if (prompt === undefined) return undefined;
-    for (let index = this.next; index < this.turns.length; index += 1) {
-      const turn = this.turns[index];
-      if (turn === undefined || turn.prompt !== prompt) continue;
-      this.next = index + 1;
-      return turn.turnIndex;
-    }
-    return undefined;
+function forkTurnIdByMessageId(turns: readonly ForkTurnSummary[]): ReadonlyMap<string, string> {
+  const byId = new Map<string, string>();
+  for (const turn of turns) {
+    if (turn.messageId === undefined) continue;
+    byId.set(turn.messageId, String(turn.turnIndex));
   }
+  return byId;
 }
 
 function userMessageChunk(sessionId: string, text: string): SessionNotification {

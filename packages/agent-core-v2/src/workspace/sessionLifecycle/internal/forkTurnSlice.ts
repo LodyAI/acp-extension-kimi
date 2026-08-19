@@ -6,14 +6,13 @@ import {
 } from '#/agent/prompt/promptMetadataText';
 import type { WireRecord } from '#/wire/record';
 
-import type { ForkTurnSummary } from '../sessionLifecycle';
+import { type ForkTurnSummary, isUserVisibleTurnOrigin } from '../sessionLifecycle';
 
 export interface MainTurnSlice {
   readonly records: readonly WireRecord[];
   readonly cutoffTime?: number;
   readonly lastPrompt?: string;
 }
-
 
 export function assertForkTurnIndex(turnIndex: number | undefined): void {
   if (turnIndex === undefined) return;
@@ -62,10 +61,9 @@ export function sliceMainRecordsAtTurn(
 }
 
 /**
- * The fork-addressable turns of a session, in record order. `turnIndex` is
- * what `fork({ turnIndex })` takes; `prompt` is the same prompt metadata a
- * fork records as its last prompt, which lets a caller line these up against
- * a rendered history whose head may have been compacted away.
+ * The fork-addressable turns of a session, in record order — the positions
+ * `fork({ turnIndex })` accepts, each carrying the durable id of the prompt
+ * that opened it so a caller can resolve a rendered turn to a position.
  */
 export function listForkTurns(records: readonly WireRecord[]): ForkTurnSummary[] {
   const turns: ForkTurnSummary[] = [];
@@ -73,8 +71,8 @@ export function listForkTurns(records: readonly WireRecord[]): ForkTurnSummary[]
     if (!isUserVisibleTurnRecord(record)) continue;
     turns.push({
       turnIndex: turns.length,
+      messageId: turnRecordMessageId(record),
       prompt: promptMetadataFromTurnRecord(record),
-      time: recordTime(record),
     });
   }
   return turns;
@@ -100,19 +98,7 @@ function isUserVisibleTurnRecord(record: WireRecord): boolean {
   if (record.type !== 'context.append_message') return false;
   const message = asRecord(record['message']);
   if (message === undefined || message['role'] !== 'user') return false;
-  const origin = asRecord(message['origin']);
-  switch (origin?.['kind']) {
-    case undefined:
-    case 'user':
-      return true;
-    case 'skill_activation':
-    case 'plugin_command':
-      return origin?.['trigger'] === 'user-slash';
-    case 'shell_command':
-      return origin?.['phase'] === 'input';
-    default:
-      return false;
-  }
+  return isUserVisibleTurnOrigin(message['origin']);
 }
 
 function isUserVisibleTurnInputRecord(record: WireRecord): boolean {
@@ -193,6 +179,11 @@ function turnInputMatchesRecord(
 function sameTurnOrigin(inputKind: string, messageKind: string | undefined): boolean {
   if (inputKind === 'user') return messageKind === undefined || messageKind === 'user';
   return inputKind === messageKind;
+}
+
+function turnRecordMessageId(record: WireRecord): string | undefined {
+  const id = asRecord(record['message'])?.['id'];
+  return typeof id === 'string' && id.length > 0 ? id : undefined;
 }
 
 function recordTime(record: WireRecord): number | undefined {
