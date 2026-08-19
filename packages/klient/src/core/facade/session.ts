@@ -25,14 +25,12 @@ import type {
   SessionMeta,
   SessionMetaPatch,
 } from '@moonshot-ai/agent-core-v2/session/sessionMetadata/sessionMetadata';
+import type { ForkTurnSummary } from '@moonshot-ai/agent-core-v2/workspace/sessionLifecycle/sessionLifecycle';
 import type { SkillSummary } from '@moonshot-ai/agent-core-v2/app/skillCatalog/types';
 
 import type { ScopeRef } from '../channel.js';
 import type { McpServerConfig } from '../../contract/mcp.js';
-import { RPCError } from '../errors.js';
 import type { ScopedCaller } from './global.js';
-
-const NOT_FOUND = 40404;
 
 export type { ScopedCaller } from './global.js';
 
@@ -88,6 +86,19 @@ export type SessionStatus = 'running' | 'idle' | 'awaiting_approval' | 'awaiting
 export interface SessionFacade {
   get(): Promise<SessionMeta>;
   setTitle(title: string): Promise<void>;
+  /**
+   * Generate and apply a title from the main agent's first prompts via the
+   * managed `chat_title` tool. `undefined` when generation is unavailable
+   * (no managed OAuth login, no prompt yet, or a custom title is set).
+   * `force` regenerates anyway, overwriting a generated or custom title.
+   * `source` picks the conversation excerpt: `user_prompts` (default),
+   * `first_turn` (opening prompt + first reply; strict), or `digest`
+   * (head+tail of a multi-turn conversation).
+   */
+  generateTitle(opts?: {
+    force?: boolean;
+    source?: 'user_prompts' | 'first_turn' | 'digest';
+  }): Promise<string | undefined>;
   update(patch: SessionMetaPatch): Promise<void>;
   setArchived(archived: boolean): Promise<void>;
   status(): Promise<SessionStatus>;
@@ -97,7 +108,18 @@ export interface SessionFacade {
   restore(opts?: SessionRestoreOptions): Promise<boolean>;
   /** Permanently delete the session and its persisted data; throws when missing. */
   delete(): Promise<void>;
-  fork(input?: { title?: string; metadata?: Record<string, unknown> }): Promise<SessionMeta>;
+  /**
+   * The turns `fork({ turnIndex })` can address, oldest first. Positions come
+   * from the durable records, so they stay valid after a compaction has
+   * dropped the corresponding messages from the rendered context.
+   */
+  forkTurns(): Promise<readonly ForkTurnSummary[]>;
+  fork(input?: {
+    title?: string;
+    metadata?: Record<string, unknown>;
+    /** Retain the session through this turn only (see {@link forkTurns}). */
+    turnIndex?: number;
+  }): Promise<SessionMeta>;
   createChild(input?: { title?: string; metadata?: Record<string, unknown> }): Promise<SessionMeta>;
   readonly approvals: SessionApprovalsFacade;
   readonly questions: SessionQuestionsFacade;
@@ -111,24 +133,17 @@ export function createSessionFacade(call: ScopedCaller, sessionId: string): Sess
   const scope: ScopeRef = { sessionId };
   const read = (): Promise<SessionMeta> =>
     call(scope, 'sessionMetadata', 'read', []) as Promise<SessionMeta>;
-  // Session lifecycle methods live on the session's workspace handler
-  // (Workspace scope) — the index supplies the handler's workspaceId.
-  const resolveWorkspaceId = async (): Promise<string | undefined> => {
-    const summary = (await call({}, 'sessionIndex', 'get', [sessionId])) as
-      | { workspaceId: string }
-      | undefined;
-    return summary?.workspaceId;
-  };
   const spawn = async (
     method: 'fork' | 'createChild',
-    input: { title?: string; metadata?: Record<string, unknown> } = {},
+    input: { title?: string; metadata?: Record<string, unknown>; turnIndex?: number } = {},
   ): Promise<SessionMeta> => {
-    const workspaceId = await resolveWorkspaceId();
-    if (workspaceId === undefined) {
-      throw new RPCError(NOT_FOUND, `session not found: ${sessionId}`);
-    }
-    const handle = (await call({ workspaceId }, 'sessionLifecycleService', method, [
-      { sourceSessionId: sessionId, title: input.title, metadata: input.metadata },
+    const handle = (await call({}, 'sessionManager', method, [
+      {
+        sourceSessionId: sessionId,
+        title: input.title,
+        metadata: input.metadata,
+        turnIndex: input.turnIndex,
+      },
     ])) as HandleWire;
     return call({ sessionId: handle.id }, 'sessionMetadata', 'read', []) as Promise<SessionMeta>;
   };
@@ -136,6 +151,10 @@ export function createSessionFacade(call: ScopedCaller, sessionId: string): Sess
   return {
     get: read,
     setTitle: (title) => call(scope, 'sessionMetadata', 'setTitle', [title]) as Promise<void>,
+    generateTitle: (opts) =>
+      call(scope, 'sessionTitleService', 'generateTitle', [opts]) as Promise<
+        string | undefined
+      >,
     update: (patch) => call(scope, 'sessionMetadata', 'update', [patch]) as Promise<void>,
     setArchived: (archived) =>
       call(scope, 'sessionMetadata', 'setArchived', [archived]) as Promise<void>,
@@ -164,34 +183,17 @@ export function createSessionFacade(call: ScopedCaller, sessionId: string): Sess
       }
       return 'idle';
     },
-    close: async () => {
-      const workspaceId = await resolveWorkspaceId();
-      if (workspaceId === undefined) return;
-      await call({ workspaceId }, 'sessionLifecycleService', 'close', [sessionId]);
-    },
-    archive: async () => {
-      const workspaceId = await resolveWorkspaceId();
-      if (workspaceId === undefined) return;
-      await call({ workspaceId }, 'sessionLifecycleService', 'archive', [sessionId]);
-    },
+    close: () => call({}, 'sessionManager', 'close', [sessionId]) as Promise<void>,
+    archive: () => call({}, 'sessionManager', 'archive', [sessionId]) as Promise<void>,
     restore: async (opts) => {
-      const workspaceId = await resolveWorkspaceId();
-      if (workspaceId === undefined) return false;
-      const handle = (await call({ workspaceId }, 'sessionLifecycleService', 'restore', [
-        sessionId,
-        opts,
-      ])) as HandleWire | null;
-      // The engine reports "not found" with `undefined`, which JSON transports
-      // may surface as `null` — reject both.
+      const handle = (await call({}, 'sessionManager', 'restore', [sessionId, opts])) as HandleWire | null;
       return handle !== null && handle !== undefined;
     },
-    delete: async () => {
-      const workspaceId = await resolveWorkspaceId();
-      if (workspaceId === undefined) {
-        throw new RPCError(NOT_FOUND, `session not found: ${sessionId}`);
-      }
-      await call({ workspaceId }, 'sessionLifecycleService', 'delete', [sessionId]);
-    },
+    delete: () => call({}, 'sessionManager', 'delete', [sessionId]) as Promise<void>,
+    forkTurns: () =>
+      call({}, 'sessionManager', 'listForkTurns', [sessionId]) as Promise<
+        readonly ForkTurnSummary[]
+      >,
     fork: (input) => spawn('fork', input),
     createChild: (input) => spawn('createChild', input),
 

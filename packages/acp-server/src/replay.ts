@@ -20,13 +20,19 @@
  */
 
 import type { SessionNotification } from '@agentclientprotocol/sdk';
-import type { ContentPart, ContextMessage, ToolCall } from '@moonshot-ai/agent-core-v2';
+import type {
+  ContentPart,
+  ContextMessage,
+  ForkTurnSummary,
+  ToolCall,
+} from '@moonshot-ai/agent-core-v2';
 
 import {
   assistantDeltaToSessionUpdate,
   thinkingDeltaToSessionUpdate,
   toolCallStartToSessionUpdate,
 } from './events-map';
+import { withLodyTurnId } from './lody-extension';
 
 /**
  * Project a persisted context history into an ordered batch of ACP
@@ -36,35 +42,42 @@ import {
 export function projectHistoryToSessionUpdates(
   sessionId: string,
   messages: readonly ContextMessage[],
+  forkTurns: readonly ForkTurnSummary[] = [],
 ): SessionNotification[] {
   const out: SessionNotification[] = [];
   let turnId = 0;
   const toolCallTurnIds = new Map<string, number>();
+  const forkPositions = forkTurnIdByMessageId(forkTurns);
+  let forkTurnId: string | undefined;
+
+  const push = (notification: SessionNotification | null): void => {
+    const stamped = withLodyTurnId(notification, forkTurnId);
+    if (stamped !== null) out.push(stamped);
+  };
 
   for (const message of messages) {
     switch (message.role) {
       case 'user':
+        forkTurnId = message.id === undefined ? undefined : forkPositions.get(message.id);
         for (const part of message.content) {
           if (part.type === 'text' && part.text) {
-            out.push(userMessageChunk(sessionId, part.text));
+            push(userMessageChunk(sessionId, part.text));
           }
         }
         break;
       case 'assistant': {
         turnId += 1;
         for (const part of message.content) {
-          const update = assistantContentPartToUpdate(part, sessionId, turnId);
-          if (update !== null) out.push(update);
+          push(assistantContentPartToUpdate(part, sessionId, turnId));
         }
         for (const toolCall of message.toolCalls ?? []) {
           toolCallTurnIds.set(toolCall.id, turnId);
-          out.push(syntheticToolCall(sessionId, turnId, toolCall));
+          push(syntheticToolCall(sessionId, turnId, toolCall));
         }
         break;
       }
       case 'tool': {
-        const update = toolMessageToUpdate(message, sessionId, toolCallTurnIds);
-        if (update !== null) out.push(update);
+        push(toolMessageToUpdate(message, sessionId, toolCallTurnIds));
         break;
       }
       default:
@@ -73,6 +86,25 @@ export function projectHistoryToSessionUpdates(
     }
   }
   return out;
+}
+
+/**
+ * Index the engine's fork turn list by the durable id of the prompt that
+ * opened each turn, which is how a replayed message resolves to the position
+ * `fork({ turnIndex })` takes. The two sequences share an order but not a
+ * length — compaction drops messages from context while the records defining
+ * fork positions stay — and matching on identity rather than on rendered
+ * prompt text keeps a repeated or truncated prompt from resolving to the wrong
+ * turn. A message with no matching id carries no position and is simply not
+ * forkable, which is the safe direction.
+ */
+function forkTurnIdByMessageId(turns: readonly ForkTurnSummary[]): ReadonlyMap<string, string> {
+  const byId = new Map<string, string>();
+  for (const turn of turns) {
+    if (turn.messageId === undefined) continue;
+    byId.set(turn.messageId, String(turn.turnIndex));
+  }
+  return byId;
 }
 
 function userMessageChunk(sessionId: string, text: string): SessionNotification {

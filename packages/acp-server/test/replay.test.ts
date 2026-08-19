@@ -127,3 +127,69 @@ describe('projectHistoryToSessionUpdates', () => {
     expect(ids).toEqual(['1:a', '2:b']);
   });
 });
+
+describe('fork positions in a replayed history', () => {
+  const lodyTurnId = (update: SessionNotification['update']): string | undefined =>
+    (update as { _meta?: { lody?: { turnId?: string } } })._meta?.lody?.turnId;
+
+  it('carries the engine position for each replayed turn', () => {
+    const messages: ContextMessage[] = [
+      { role: 'user', id: 'msg_1', content: [{ type: 'text', text: 'first' }], toolCalls: [] },
+      { role: 'assistant', content: [{ type: 'text', text: 'one' }], toolCalls: [] },
+      { role: 'user', id: 'msg_2', content: [{ type: 'text', text: 'second' }], toolCalls: [] },
+      { role: 'assistant', content: [{ type: 'text', text: 'two' }], toolCalls: [] },
+    ];
+    const updates = projectHistoryToSessionUpdates(SESSION_ID, messages, [
+      { turnIndex: 0, messageId: 'msg_1' },
+      { turnIndex: 1, messageId: 'msg_2' },
+    ]);
+    expect(updates.map((entry) => lodyTurnId(entry.update))).toEqual(['0', '0', '1', '1']);
+  });
+
+  it('keeps positions aligned when compaction dropped a turn from the middle', () => {
+    // The records still hold three turns; the replayed context lost the second.
+    const messages: ContextMessage[] = [
+      { role: 'user', id: 'msg_1', content: [{ type: 'text', text: 'first' }], toolCalls: [] },
+      { role: 'assistant', content: [{ type: 'text', text: 'one' }], toolCalls: [] },
+      { role: 'user', id: 'msg_3', content: [{ type: 'text', text: 'third' }], toolCalls: [] },
+      { role: 'assistant', content: [{ type: 'text', text: 'three' }], toolCalls: [] },
+    ];
+    const updates = projectHistoryToSessionUpdates(SESSION_ID, messages, [
+      { turnIndex: 0, messageId: 'msg_1' },
+      { turnIndex: 1, messageId: 'msg_2' },
+      { turnIndex: 2, messageId: 'msg_3' },
+    ]);
+    expect(updates.map((entry) => lodyTurnId(entry.update))).toEqual(['0', '0', '2', '2']);
+  });
+
+  it('does not let a repeated prompt resolve to the wrong turn', () => {
+    // Same text, different turns: identity decides, never the rendered prose.
+    const messages: ContextMessage[] = [
+      { role: 'user', id: 'msg_2', content: [{ type: 'text', text: 'continue' }], toolCalls: [] },
+      { role: 'assistant', content: [{ type: 'text', text: 'answer' }], toolCalls: [] },
+    ];
+    const updates = projectHistoryToSessionUpdates(SESSION_ID, messages, [
+      { turnIndex: 0, messageId: 'msg_1', prompt: 'continue' },
+      { turnIndex: 1, messageId: 'msg_2', prompt: 'continue' },
+    ]);
+    expect(updates.map((entry) => lodyTurnId(entry.update))).toEqual(['1', '1']);
+  });
+
+  it('leaves a turn unstamped rather than guessing when it matches nothing', () => {
+    const messages: ContextMessage[] = [
+      { role: 'user', content: [{ type: 'text', text: 'no durable id' }], toolCalls: [] },
+      { role: 'assistant', content: [{ type: 'text', text: 'answer' }], toolCalls: [] },
+      { role: 'user', id: 'msg_gone', content: [{ type: 'text', text: 'dropped' }], toolCalls: [] },
+      { role: 'assistant', content: [{ type: 'text', text: 'answer' }], toolCalls: [] },
+    ];
+    const updates = projectHistoryToSessionUpdates(SESSION_ID, messages, [
+      { turnIndex: 0, messageId: 'msg_other' },
+    ]);
+    expect(updates.map((entry) => lodyTurnId(entry.update))).toEqual([
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+    ]);
+  });
+});

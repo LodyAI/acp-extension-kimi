@@ -1,38 +1,13 @@
-/**
- * `sessionLifecycle` domain — per-handler session lifecycle contract.
- *
- * Defines the public contract of one workspace handler: the
- * `CreateSessionOptions`, `ForkSessionOptions`, `CreateChildSessionOptions`,
- * `ResumeSessionOptions`, and the `ISessionLifecycleService` used to create
- * sessions (`create`), look up the live ones (`get` / `list`), close them
- * (`close`), archive/restore them, delete them (`delete` — closes a live
- * session first, then removes its persisted data and its index entries;
- * unknown ids raise `session.not_found`), fork them (`fork`), and
- * fork-then-tag
- * them as direct children (`createChild`) — always as child scopes of THIS
- * handler's Workspace scope, so a handler owns exactly the sessions of one
- * workspace and fork never crosses handlers. Announces lifecycle transitions
- * through `onDidCreateSession` / `onDidCloseSession` / `onDidArchiveSession`
- * / `onDidForkSession`; the ordered hook slots are per-session seeds.
- * Workspace-scope services that must participate in a session's creation
- * (read its seeded facts, contribute a session seed, attach teardown to its
- * lifetime) subscribe to `onWillCreateSession` — the participation surface
- * speaks the session domain's own vocabulary, so the lifecycle depends on
- * neither its participants nor the DI kernel's assembly mechanics.
- * Workspace-scoped — one instance per materialized handler.
- */
-
 import { createDecorator, type ServiceIdentifier } from '#/_base/di/instantiation';
 import type { ISessionScopeHandle } from '#/_base/di/scope';
-import type { Event } from '#/_base/event';
+import { type Event, type IWaitUntil } from '#/_base/event';
 import type { BindAgentInput } from '#/agent/profile/profile';
 import type { McpServerConfig } from '#/mcpCore/config-schema';
-import type {
-  SessionCloseReason,
-  SessionCreateSource,
-} from '#/session/sessionLifecycleHooks/sessionLifecycleHooks';
 
-export type { SessionCloseReason, SessionCreateSource };
+
+export type SessionCreateSource = 'startup' | 'resume' | 'fork';
+
+export type SessionCloseReason = 'exit' | 'archive';
 
 export interface CreateSessionOptions {
   readonly sessionId?: string;
@@ -48,11 +23,54 @@ export interface CreateSessionOptions {
   readonly mcpServers?: Readonly<Record<string, McpServerConfig>>;
 }
 
+/**
+ * One fork-addressable turn. `turnIndex` is what `fork({ turnIndex })` takes;
+ * `messageId` is the durable id of the prompt that opened it, which is how a
+ * caller lines these up against a rendered history whose head has been
+ * compacted away. `prompt` is the same prompt metadata a fork records, kept
+ * for diagnostics only — never match on it, it is sanitized and truncated.
+ */
+export interface ForkTurnSummary {
+  readonly turnIndex: number;
+  readonly messageId?: string;
+  readonly prompt?: string;
+}
+
+/**
+ * Whether a prompt origin opens a turn `fork({ turnIndex })` counts. The fork
+ * index space is defined by this predicate, so anything that publishes or
+ * resolves a fork position classifies origins through it rather than restating
+ * the rule.
+ */
+export function isUserVisibleTurnOrigin(origin: unknown): boolean {
+  const fields =
+    typeof origin === 'object' && origin !== null && !Array.isArray(origin)
+      ? (origin as Record<string, unknown>)
+      : undefined;
+  switch (fields?.['kind']) {
+    case undefined:
+    case 'user':
+      return true;
+    case 'skill_activation':
+    case 'plugin_command':
+      return fields?.['trigger'] === 'user-slash';
+    case 'shell_command':
+      return fields?.['phase'] === 'input';
+    default:
+      return false;
+  }
+}
+
 export interface ForkSessionOptions {
   readonly sourceSessionId: string;
   readonly newSessionId?: string;
   readonly title?: string;
   readonly metadata?: Record<string, unknown>;
+  /**
+   * Zero-based index of the user-visible turn to retain through. When omitted,
+   * the complete session is copied (the existing fork behavior).
+   */
+  readonly turnIndex?: number;
 }
 
 export interface ResumeSessionOptions {
@@ -124,7 +142,8 @@ export interface ISessionLifecycleService {
   readonly _serviceBrand: undefined;
 
   readonly onWillCreateSession: Event<SessionWillCreateEvent>;
-  readonly onDidCreateSession: Event<SessionCreatedEvent>;
+  readonly onDidCreateSession: Event<SessionCreatedEvent & IWaitUntil>;
+  readonly onWillCloseSession: Event<SessionWillCloseEvent & IWaitUntil>;
   readonly onDidCloseSession: Event<SessionClosedEvent>;
   readonly onDidArchiveSession: Event<SessionArchivedEvent>;
   readonly onDidForkSession: Event<SessionForkedEvent>;
@@ -136,6 +155,13 @@ export interface ISessionLifecycleService {
   archive(sessionId: string): Promise<void>;
   restore(sessionId: string, opts?: ResumeSessionOptions): Promise<ISessionScopeHandle | undefined>;
   delete(sessionId: string): Promise<void>;
+  /**
+   * The turns `fork({ turnIndex })` can address, in record order. A rendered
+   * history is not a reliable index source — compaction drops messages from
+   * context while the records that define these indices stay — so a client
+   * that offers "fork from here" resolves its position against this list.
+   */
+  listForkTurns(sourceSessionId: string): Promise<ForkTurnSummary[]>;
   fork(opts: ForkSessionOptions): Promise<ISessionScopeHandle>;
   createChild(opts: CreateChildSessionOptions): Promise<ISessionScopeHandle>;
 }

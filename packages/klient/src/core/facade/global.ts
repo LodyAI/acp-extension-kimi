@@ -31,6 +31,7 @@ import type {
   FsBrowseResponse,
   FsHomeResponse,
 } from '@moonshot-ai/agent-core-v2/app/hostFolderBrowser/hostFolderBrowser';
+import type { FileMeta } from '@moonshot-ai/agent-core-v2/app/file/fileService';
 import type { ModelRecord } from '@moonshot-ai/agent-core-v2/kosong/model/model';
 import type { IModelCatalog } from '@moonshot-ai/agent-core-v2/kosong/model/catalog';
 import type { IProviderDiscoveryService } from '@moonshot-ai/agent-core-v2/app/kosongConfig/discovery';
@@ -77,6 +78,7 @@ export type OAuthFlowStart = Awaited<ReturnType<IOAuthService['startLogin']>>;
 export type OAuthFlowSnapshot = NonNullable<Awaited<ReturnType<IOAuthService['getFlow']>>>;
 export type OAuthLoginCancelResponse = Awaited<ReturnType<IOAuthService['cancelLogin']>>;
 export type OAuthLogoutResponse = Awaited<ReturnType<IOAuthService['logout']>>;
+export type ManagedUsageResult = Awaited<ReturnType<IOAuthService['getManagedUsage']>>;
 
 export type ModelCatalogItem = Awaited<ReturnType<IModelCatalog['listModels']>>[number];
 export type ProviderCatalogItem = Awaited<
@@ -114,7 +116,6 @@ export interface GlobalSessionsFacade {
     mcpServers?: Readonly<Record<string, McpServerConfig>>;
   }): Promise<SessionMeta>;
 }
-
 export interface GlobalWorkspacesFacade {
   list(): Promise<readonly Workspace[]>;
   get(id: string): Promise<Workspace | undefined>;
@@ -178,6 +179,8 @@ export interface GlobalAuthFacade {
    * model usage does not depend on the OAuth-only {@link summarize} view.
    */
   ensureReady(modelOverride?: string): Promise<void>;
+  /** Managed Kimi plan windows and booster-wallet usage; credentials stay engine-side. */
+  managedUsage(provider?: string): Promise<ManagedUsageResult>;
   startLogin(provider?: string): Promise<OAuthFlowStart>;
   flow(provider?: string): Promise<OAuthFlowSnapshot | undefined>;
   cancelLogin(provider?: string): Promise<OAuthLoginCancelResponse>;
@@ -221,6 +224,30 @@ export interface GlobalHostFsFacade {
   home(): Promise<FsHomeResponse>;
 }
 
+/** One downloaded upload: its metadata plus the buffered bytes. */
+export interface FileDownload {
+  readonly meta: FileMeta;
+  readonly data: Uint8Array;
+}
+
+export interface GlobalFilesFacade {
+  /**
+   * Upload buffered bytes to the daemon's file store. Bytes cross the wire
+   * base64-encoded (JSON cannot carry them), so very large uploads pay one
+   * encode here and one decode in the dispatcher.
+   */
+  save(input: {
+    data: Uint8Array;
+    filename: string;
+    name?: string;
+    mimeType?: string;
+    expiresInSec?: number;
+  }): Promise<FileMeta>;
+  /** Download one upload back into memory. */
+  get(fileId: string): Promise<FileDownload>;
+  delete(fileId: string): Promise<void>;
+}
+
 /** Aggregated host/environment snapshot (`bootstrapService` properties). */
 export interface KlientEnvInfo {
   readonly platform: string;
@@ -247,6 +274,7 @@ export interface GlobalFacade {
   readonly plugins: GlobalPluginsFacade;
   readonly capabilities: GlobalCapabilitiesFacade;
   readonly hostFs: GlobalHostFsFacade;
+  readonly files: GlobalFilesFacade;
   env(): Promise<KlientEnvInfo>;
 }
 
@@ -301,12 +329,7 @@ export function createGlobalFacade(scoped: ScopedCaller, scopedStream: ScopedStr
       countActive: (workspaceIds) =>
         call('sessionIndex', 'count', [{ workspaceIds }]) as Promise<number>,
       create: async ({ workDir, additionalDirs, title, mcpServers }) => {
-        // The workspace handler owns session creation: materialize (or reuse)
-        // the handler for the root, then create under it.
-        const handler = (await scoped({}, 'workspaceLifecycleService', 'handlerFor', [
-          { root: workDir },
-        ])) as { id: string };
-        const handle = (await scoped({ workspaceId: handler.id }, 'sessionLifecycleService', 'create', [
+        const handle = (await scoped({}, 'sessionManager', 'create', [
           { workDir, additionalDirs, mcpServers },
         ])) as { id: string };
         const scope = { sessionId: handle.id };
@@ -420,6 +443,8 @@ export function createGlobalFacade(scoped: ScopedCaller, scopedStream: ScopedStr
       summarize: () => call('authSummaryService', 'summarize', []) as Promise<readonly AuthStatus[]>,
       ensureReady: (modelOverride) =>
         call('authSummaryService', 'ensureReady', [modelOverride]) as Promise<void>,
+      managedUsage: (provider) =>
+        call('oauthService', 'getManagedUsage', [provider]) as Promise<ManagedUsageResult>,
       startLogin: (provider) =>
         call('oauthService', 'startLogin', [provider]) as Promise<OAuthFlowStart>,
       flow: (provider) =>
@@ -468,6 +493,23 @@ export function createGlobalFacade(scoped: ScopedCaller, scopedStream: ScopedStr
       browse: (absPath) =>
         call('hostFolderBrowser', 'browse', [absPath]) as Promise<FsBrowseResponse>,
       home: () => call('hostFolderBrowser', 'home', []) as Promise<FsHomeResponse>,
+    },
+
+    files: {
+      save: ({ data, filename, name, mimeType, expiresInSec }) =>
+        call('fileService', 'save', [
+          Buffer.from(data).toString('base64'),
+          filename,
+          { name, mimeType, expiresInSec },
+        ]) as Promise<FileMeta>,
+      get: async (fileId) => {
+        const wire = (await call('fileService', 'get', [fileId])) as {
+          meta: FileMeta;
+          data: string;
+        };
+        return { meta: wire.meta, data: Buffer.from(wire.data, 'base64') };
+      },
+      delete: (fileId) => call('fileService', 'delete', [fileId]) as Promise<void>,
     },
 
     env,

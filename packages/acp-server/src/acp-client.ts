@@ -40,8 +40,9 @@ export interface AcpClient extends IAcpFsClient, IAcpTerminalClient {
   requestPermission(params: RequestPermissionRequest): Promise<RequestPermissionResponse>;
   /** Reverse-RPC `elicitation/create` (ask-user bridge for form-capable clients). */
   createElicitation(params: CreateElicitationRequest): Promise<CreateElicitationResponse>;
+  /** Send a namespaced ACP extension notification. */
+  extensionNotification(method: string, params: Record<string, unknown>): Promise<void>;
 }
-
 /**
  * Build the {@link AcpClient} over an app-API {@link AgentContext} (the
  * `client` handle of an `AgentConnection`).
@@ -52,6 +53,7 @@ export function acpClientFromContext(client: AgentContext): AcpClient {
     requestPermission: (params) =>
       client.request(methods.client.session.requestPermission, params),
     createElicitation: (params) => client.request(methods.client.elicitation.create, params),
+    extensionNotification: (method, params) => client.notify(method, params),
     readTextFile: (params) => client.request(methods.client.fs.readTextFile, params),
     writeTextFile: (params) => client.request(methods.client.fs.writeTextFile, params),
     createTerminal: async (params) => {

@@ -30,10 +30,15 @@ import type {
   ToolCallLocation,
 } from '@agentclientprotocol/sdk';
 import { RequestError } from '@agentclientprotocol/sdk';
-import type { ContextMessage } from '@moonshot-ai/agent-core-v2';
+import {
+  type ContextMessage,
+  type ForkTurnSummary,
+  isUserVisibleTurnOrigin,
+} from '@moonshot-ai/agent-core-v2';
 import type {
   AgentEventPayloads,
   AgentHandle,
+  AgentTaskInfo,
   ContentPart,
   IDisposable,
   Klient,
@@ -41,6 +46,7 @@ import type {
   SessionEventPayloads,
   SessionHandle,
   SkillSummary,
+  UsageStatus,
 } from '@moonshot-ai/klient';
 import type {
   ToolCallDeltaEvent,
@@ -83,6 +89,17 @@ import {
 } from './events-map';
 import { AcpInteractionBridge } from './interaction-bridge';
 import { log } from './log';
+import {
+  addTokenUsage,
+  hasTokenUsage,
+  LODY_KIMI_METHODS,
+  type TokenUsage,
+  tokenUsageDelta,
+  toLodyRateLimits,
+  toLodySessionUsage,
+  toLodyTaskLifecycle,
+  withLodyTurnId,
+} from './lody-extension';
 import { projectModelCatalog } from './model-catalog';
 import { ACP_MODES, type AcpModeId, acpModeToToggles, DEFAULT_MODE_ID } from './modes';
 import { projectHistoryToSessionUpdates } from './replay';
@@ -172,6 +189,34 @@ interface TurnDriver {
    * the same verdict the live path would have given.
    */
   early: Array<{ readonly turnId: number; readonly dispatch: () => void }>;
+  /**
+   * The stop reason this prompt will answer with, withheld while background
+   * work it started is still running. A detached subagent outlives the turn
+   * that spawned it and the engine reports its result by opening a FOLLOW-UP
+   * turn on this agent, so settling at the first `turn.ended` would report the
+   * conversation idle with the answer still to come. Held prompts settle from
+   * {@link AcpSession.settleHeldPromptIfDrained} instead.
+   */
+  pendingStopReason?: PromptResponse['stopReason'];
+}
+
+/**
+ * How long a held prompt keeps waiting for the wake turn of a terminated
+ * subagent. The engine enqueues that turn asynchronously (it snapshots the
+ * task's output first), so the wake reliably lands after `task.terminated`;
+ * the bound only exists so an engine that never enqueues cannot strand the
+ * client's `session/prompt` forever.
+ */
+const WAKE_TURN_GRACE_MS = 10_000;
+
+/**
+ * Whether the engine will report this finished task back to the agent as a
+ * follow-up turn. Mirrors the task service's own notification conditions: an
+ * attached task was already awaited inside its tool call, and a suppressed
+ * one is reported by whoever suppressed it.
+ */
+function expectsWakeTurn(task: AgentTaskInfo): boolean {
+  return task.detached !== false && task.terminalNotificationSuppressed !== true;
 }
 
 export class AcpSession {
@@ -194,6 +239,35 @@ export class AcpSession {
   private skills: readonly SkillSummary[] = [];
   /** The in-flight prompt's driver, if any. */
   private driver: TurnDriver | undefined;
+  /**
+   * Turns currently running on this session's main agent. Includes turns the
+   * ENGINE opened on its own (a terminated subagent's notification, a cron
+   * fire): those are ordinary turns of this agent, so a held prompt must wait
+   * for them the same way it waits for its own.
+   */
+  private readonly runningTurns = new Set<number>();
+  /** Subagent (`kind: 'agent'`) tasks started here that have not terminated. */
+  private readonly activeSubagentTasks = new Set<string>();
+  /**
+   * Engine turn id → the fork position published on that turn's updates. The
+   * engine addresses forks by position among user-visible turns, so this id is
+   * the fork turn index, minted once per turn and echoed back by the client in
+   * `session/fork`.
+   */
+  private readonly forkTurnIdByTurn = new Map<number, string>();
+  /**
+   * Index the next user-visible turn will take, anchored at activation from
+   * the engine's own record-level count. Undefined when that read failed —
+   * publishing a guessed position would fork the wrong turn, so we publish
+   * nothing instead.
+   */
+  private nextForkTurnIndex: number | undefined;
+  /**
+   * Set when the last subagent task terminated and the engine still owes its
+   * wake turn. Blocks settlement across that gap so the result lands inside
+   * the prompt that started the work; {@link WAKE_TURN_GRACE_MS} bounds it.
+   */
+  private wakeTurnGrace: ReturnType<typeof setTimeout> | undefined;
   /**
    * Abort markers of prompts still in their pre-turn image-compression phase
    * (no turn launched yet, so `agent.cancel` has nothing to cancel).
@@ -236,6 +310,10 @@ export class AcpSession {
    * captured output; only the client-facing card content is de-duplicated.
    */
   private readonly terminalBackedCalls = new Map<string, string>();
+  /** Cumulative engine counters captured when this ACP activation began. */
+  private readonly lodyUsageBaselines = new Map<string, TokenUsage>();
+  /** Cumulative usage attributable only to this ACP activation. */
+  private readonly lodyUsageSinceActivation = new Map<string, TokenUsage>();
   /** Bridges engine approval / ask-user requests to the ACP client. */
   private readonly interactionBridge: AcpInteractionBridge;
 
@@ -256,16 +334,19 @@ export class AcpSession {
      * shared temp-dir fallback applies.
      */
     private readonly resolveOriginalsDir?: (sessionId: string) => string | undefined,
-    private readonly hostCommands:
-      | ReadonlyArray<AvailableCommand>
-      | HostSlashCommandsSnapshot = [],
+    private readonly hostCommands: ReadonlyArray<AvailableCommand> | HostSlashCommandsSnapshot = [],
   ) {
     this.klient = klient;
     this.session = klient.session(sessionId);
     // `main` is auto-materialized by the transport's scope resolution on the
     // first call — no explicit agent bootstrap is needed here.
     this.agent = this.session.agent('main');
-    this.interactionBridge = new AcpInteractionBridge(conn, this.session, sessionId, elicitationForm);
+    this.interactionBridge = new AcpInteractionBridge(
+      conn,
+      this.session,
+      sessionId,
+      elicitationForm,
+    );
   }
 
   /**
@@ -275,40 +356,61 @@ export class AcpSession {
   async init(): Promise<void> {
     const events = this.agent.events;
     this.subscriptions.push(
+      // Content events are forwarded for EVERY turn of this agent, not only
+      // the one the in-flight prompt launched: the engine opens turns of its
+      // own (a terminated subagent's notification, a cron fire) and dropping
+      // those would silently swallow the agent's reply. The prompt driver is
+      // about settling `session/prompt`, not about who may speak.
       events.on('assistant.delta', (event) => {
-        this.dispatchTurnEvent(event.turnId, () => {
-          this.onAssistantDelta(event);
-        });
+        this.onAssistantDelta(event);
       }),
       events.on('thinking.delta', (event) => {
-        this.dispatchTurnEvent(event.turnId, () => {
-          this.onThinkingDelta(event);
-        });
+        this.onThinkingDelta(event);
       }),
       events.on('tool.call.started', (event) => {
-        this.dispatchTurnEvent(event.turnId, () => {
-          this.onToolCallStarted(event);
-        });
+        this.onToolCallStarted(event);
       }),
       events.on('tool.call.delta', (event) => {
-        this.dispatchTurnEvent(event.turnId, () => {
-          this.onToolCallDelta(event);
-        });
+        this.onToolCallDelta(event);
       }),
       events.on('tool.progress', (event) => {
-        this.dispatchTurnEvent(event.turnId, () => {
-          this.onToolProgress(event);
-        });
+        this.onToolProgress(event);
       }),
       events.on('tool.result', (event) => {
-        this.dispatchTurnEvent(event.turnId, () => {
-          this.onToolResult(event);
-        });
+        this.onToolResult(event);
+      }),
+      events.on('turn.started', (event) => {
+        this.runningTurns.add(event.turnId);
+        this.assignForkTurnIndex(event);
+        // The awaited wake turn arrived: `runningTurns` now holds settlement.
+        this.clearWakeTurnGrace();
       }),
       events.on('turn.ended', (event) => {
+        this.runningTurns.delete(event.turnId);
+        this.forkTurnIdByTurn.delete(event.turnId);
+        // Settlement stays turn-scoped (only this prompt's own turn resolves
+        // it), but the drain check runs for every turn — an engine-opened
+        // turn ending is what releases a held prompt.
         this.dispatchTurnEvent(event.turnId, () => {
           this.onTurnEnded(event);
         });
+        this.settleHeldPromptIfDrained();
+      }),
+      events.on('task.started', (event) => {
+        if (event.info.kind === 'agent') {
+          this.activeSubagentTasks.add(event.info.taskId);
+        }
+        void this.emitTaskLifecycle('started', event.info);
+      }),
+      events.on('task.terminated', (event) => {
+        if (event.info.kind === 'agent') {
+          this.activeSubagentTasks.delete(event.info.taskId);
+          if (this.activeSubagentTasks.size === 0 && expectsWakeTurn(event.info)) {
+            this.startWakeTurnGrace();
+          }
+          this.settleHeldPromptIfDrained();
+        }
+        void this.emitTaskLifecycle('terminated', event.info);
       }),
       // Compaction runs as a background LLM task outside any turn, so these
       // are not turn-scoped; the subscription is already agent-grained (this
@@ -361,6 +463,16 @@ export class AcpSession {
     // Awaited: the post-`session/new` `available_commands_update` must already
     // carry the skills (see `activateSession`).
     await this.refreshSkills();
+    await this.anchorForkTurnIndex();
+    try {
+      await this.captureDetailedUsage(false);
+    } catch (error) {
+      log.warn('acp: failed to establish Lody token usage baseline', {
+        sessionId: this.sessionId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+    void this.emitManagedUsage();
   }
 
   /** Refresh the skill cache from the session catalog (best-effort). */
@@ -381,6 +493,7 @@ export class AcpSession {
    * and detaches the event subscriptions. Idempotent.
    */
   dispose(): void {
+    this.clearWakeTurnGrace();
     this.cancel();
     const driver = this.driver;
     if (driver !== undefined) {
@@ -414,7 +527,18 @@ export class AcpSession {
       });
       return;
     }
-    const updates = projectHistoryToSessionUpdates(this.sessionId, messages);
+    // Replayed turns carry their fork positions too: a client that reloads a
+    // session must still be able to branch at an older turn.
+    let forkTurns: readonly ForkTurnSummary[] = [];
+    try {
+      forkTurns = await this.session.forkTurns();
+    } catch (error) {
+      log.warn('acp: replayHistory could not read fork turn positions', {
+        sessionId: this.sessionId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+    const updates = projectHistoryToSessionUpdates(this.sessionId, messages, forkTurns);
     for (const update of updates) {
       try {
         await this.conn.sessionUpdate(update);
@@ -734,18 +858,50 @@ export class AcpSession {
     return driver;
   }
 
+  /**
+   * Read the engine's current fork turn count so published positions line up
+   * with the records `fork({ turnIndex })` slices. A rendered history cannot
+   * supply this: compaction drops messages from context while the records
+   * defining those positions stay.
+   */
+  private async anchorForkTurnIndex(): Promise<void> {
+    try {
+      this.nextForkTurnIndex = (await this.session.forkTurns()).length;
+    } catch (error) {
+      this.nextForkTurnIndex = undefined;
+      log.warn('acp: fork turn positions unavailable; fork-at-turn will be inert', {
+        sessionId: this.sessionId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  /**
+   * Claim this turn's fork position. Only turns the engine counts as
+   * user-visible take an index — a wake turn or a cron fire is not a fork
+   * boundary, and consuming an index for one would shift every later turn.
+   */
+  private assignForkTurnIndex(event: AgentEventPayloads['turn.started']): void {
+    if (this.nextForkTurnIndex === undefined) return;
+    if (!isUserVisibleTurnOrigin(event.origin)) return;
+    this.forkTurnIdByTurn.set(event.turnId, String(this.nextForkTurnIndex));
+    this.nextForkTurnIndex += 1;
+  }
+
+  /** Emit a turn's update, carrying its fork position when it has one. */
+  private emitForTurn(turnId: number, notification: SessionNotification | null): void {
+    this.emit(withLodyTurnId(notification, this.forkTurnIdByTurn.get(turnId)));
+  }
+
   private onAssistantDelta(event: AgentEventPayloads['assistant.delta']): void {
-    if (this.driverFor(event.turnId) === undefined) return;
-    this.emit(assistantDeltaToSessionUpdate(this.sessionId, event));
+    this.emitForTurn(event.turnId, assistantDeltaToSessionUpdate(this.sessionId, event));
   }
 
   private onThinkingDelta(event: AgentEventPayloads['thinking.delta']): void {
-    if (this.driverFor(event.turnId) === undefined) return;
-    this.emit(thinkingDeltaToSessionUpdate(this.sessionId, event));
+    this.emitForTurn(event.turnId, thinkingDeltaToSessionUpdate(this.sessionId, event));
   }
 
   private onToolCallStarted(event: AgentEventPayloads['tool.call.started']): void {
-    if (this.driverFor(event.turnId) === undefined) return;
     // The klient payload mirrors `ToolCallStartedEvent` (`args` / `display`
     // arrive as `unknown` — cast at this seam).
     const mapped = event as unknown as ToolCallStartedEvent;
@@ -774,20 +930,21 @@ export class AcpSession {
     const streamArgs = { args: stringifyArgs(mapped.args) };
     const lazyCreated = this.toolCallStreamArgs.has(key);
     this.toolCallStreamArgs.set(key, streamArgs);
-    this.emit(
+    this.emitForTurn(
+      event.turnId,
       lazyCreated
         ? toolCallStartedUpgradeToSessionUpdate(this.sessionId, mapped)
         : toolCallStartToSessionUpdate(this.sessionId, mapped),
     );
     if (event.display !== undefined) {
-      this.emit(
+      this.emitForTurn(
+        event.turnId,
         planFromDisplayBlock(this.sessionId, event.turnId, event.display as ToolInputDisplay),
       );
     }
   }
 
   private onToolCallDelta(event: AgentEventPayloads['tool.call.delta']): void {
-    if (this.driverFor(event.turnId) === undefined) return;
     // The klient payload mirrors `ToolCallDeltaEvent` field-for-field.
     const mapped = event as unknown as ToolCallDeltaEvent;
     const key = acpToolCallId(event.turnId, event.toolCallId);
@@ -800,24 +957,25 @@ export class AcpSession {
       // — clients otherwise surface "Tool call not found" until the start
       // eventually lands.
       this.toolCallStreamArgs.set(key, { args: event.argumentsPart ?? '' });
-      this.emit(toolCallLazyCreateToSessionUpdate(this.sessionId, mapped));
+      this.emitForTurn(event.turnId, toolCallLazyCreateToSessionUpdate(this.sessionId, mapped));
       return;
     }
     // Subsequent delta — the helper accumulates the fragment and emits an
     // update with the cumulative args text (REPLACE-content semantics).
-    this.emit(toolCallDeltaToSessionUpdate(this.sessionId, mapped, acc));
+    this.emitForTurn(event.turnId, toolCallDeltaToSessionUpdate(this.sessionId, mapped, acc));
   }
 
   private onToolProgress(event: AgentEventPayloads['tool.progress']): void {
-    if (this.driverFor(event.turnId) === undefined) return;
     // The klient payload mirrors `ToolProgressEvent` field-for-field; the
     // helper forwards only `status` updates with text (as a title refresh)
     // and returns null for everything else, which `emit` drops.
-    this.emit(toolProgressToSessionUpdate(this.sessionId, event as unknown as ToolProgressEvent));
+    this.emitForTurn(
+      event.turnId,
+      toolProgressToSessionUpdate(this.sessionId, event as unknown as ToolProgressEvent),
+    );
   }
 
   private onToolResult(event: AgentEventPayloads['tool.result']): void {
-    if (this.driverFor(event.turnId) === undefined) return;
     const key = acpToolCallId(event.turnId, event.toolCallId);
     const locations = this.toolLocations.get(key);
     this.toolLocations.delete(key);
@@ -830,7 +988,7 @@ export class AcpSession {
       // the terminal pane, so the card gets the terminal embed instead of a
       // textual copy. The full output still reached the model (and the
       // persisted wire record) untouched.
-      this.emit({
+      this.emitForTurn(event.turnId, {
         sessionId: this.sessionId,
         update: {
           sessionUpdate: 'tool_call_update',
@@ -842,7 +1000,8 @@ export class AcpSession {
       });
       return;
     }
-    this.emit(
+    this.emitForTurn(
+      event.turnId,
       toolResultToSessionUpdate(this.sessionId, event as unknown as ToolResultEvent, locations),
     );
   }
@@ -908,16 +1067,184 @@ export class AcpSession {
     const driver = this.driverFor(event.turnId);
     if (driver === undefined) return;
     const error = event.error as { readonly code: string; readonly message?: string } | undefined;
-    this.settleDriver(driver, () => {
-      // Auth failures must surface as a JSON-RPC `auth_required` error
-      // so the client triggers its re-auth flow, not a silent `end_turn`.
-      if (event.reason === 'failed' && isAuthError(error)) {
+    if (event.reason === 'failed' && isAuthError(error)) {
+      // Auth failures must surface as a JSON-RPC `auth_required` error right
+      // away so the client triggers its re-auth flow — waiting on background
+      // work would only delay a turn that produced nothing.
+      this.settleDriver(driver, () => {
         driver.reject(RequestError.authRequired(undefined, error?.message));
-        return;
-      }
-      driver.resolve({ stopReason: turnEndReasonToStopReason(event.reason, error) });
+      });
+    } else {
+      driver.pendingStopReason = turnEndReasonToStopReason(event.reason, error);
+      this.settleHeldPromptIfDrained();
+    }
+    void Promise.all([
+      this.emitUsageUpdate(),
+      this.emitDetailedUsageUpdate(),
+      this.emitManagedUsage(),
+    ]);
+  }
+
+  /**
+   * Settle a prompt whose turn ended, once the background work it started has
+   * drained: no turn running on this agent (including one the ENGINE opened
+   * to report a finished subagent or a cron fire), no subagent task still
+   * alive, and no wake turn owed. Until then the client's `session/prompt`
+   * stays in flight, which is what keeps the conversation reported as running
+   * while a detached subagent works — matching agents that run a subagent
+   * inside its spawning tool call.
+   */
+  private settleHeldPromptIfDrained(): void {
+    const driver = this.driver;
+    if (driver === undefined || driver.settled) return;
+    const stopReason = driver.pendingStopReason;
+    if (stopReason === undefined) return;
+    if (this.runningTurns.size > 0) return;
+    if (this.activeSubagentTasks.size > 0) return;
+    if (this.wakeTurnGrace !== undefined) return;
+    driver.pendingStopReason = undefined;
+    this.settleDriver(driver, () => {
+      driver.resolve({ stopReason });
     });
-    void this.emitUsageUpdate();
+  }
+
+  /**
+   * Hold settlement across the gap between `task.terminated` and its wake
+   * turn. Armed whatever the spawning turn is doing: when the task finishes
+   * first, this is what keeps the turn's own end from settling before the
+   * report arrives.
+   */
+  private startWakeTurnGrace(): void {
+    this.clearWakeTurnGrace();
+    const timer = setTimeout(() => {
+      this.wakeTurnGrace = undefined;
+      this.settleHeldPromptIfDrained();
+    }, WAKE_TURN_GRACE_MS);
+    // The grace period must never be the reason the process stays alive.
+    timer.unref?.();
+    this.wakeTurnGrace = timer;
+  }
+
+  private clearWakeTurnGrace(): void {
+    if (this.wakeTurnGrace === undefined) return;
+    clearTimeout(this.wakeTurnGrace);
+    this.wakeTurnGrace = undefined;
+  }
+
+  /** Provider-neutral task snapshot used by Lody's subagent management UI. */
+  async listSubagents(activeOnly = false): Promise<readonly AgentTaskInfo[]> {
+    return (await this.agent.getTasks({ activeOnly })).filter((task) => task.kind === 'agent');
+  }
+
+  async cancelSubagent(taskId: string, reason?: string): Promise<void> {
+    await this.agent.stopTask({ taskId, reason });
+  }
+
+  subagentOutput(taskId: string, tail?: number): Promise<string> {
+    return this.agent.getTaskOutput({ taskId, tail: Math.min(tail ?? 2_000, 2_000) });
+  }
+
+  private async emitTaskLifecycle(
+    event: 'started' | 'terminated',
+    task: AgentTaskInfo,
+  ): Promise<void> {
+    if (task.kind !== 'agent') return;
+    let output: string | undefined;
+    if (event === 'terminated') {
+      try {
+        output = await this.agent.getTaskOutput({ taskId: task.taskId, tail: 2_000 });
+      } catch {
+        // The task registry is still authoritative when output has already rotated away.
+      }
+    }
+    const params = toLodyTaskLifecycle(this.sessionId, event, task, output);
+    if (params === null) return;
+    await this.emitExtension(LODY_KIMI_METHODS.taskLifecycle, params);
+  }
+
+  private async emitDetailedUsageUpdate(): Promise<void> {
+    try {
+      await this.captureDetailedUsage(true);
+      const contextWindow = (await this.klient.global.kosong.listModels()).find(
+        (item) => item.model === this.currentModelId,
+      )?.max_context_size;
+      const update = toLodySessionUsage(
+        Object.fromEntries(this.lodyUsageSinceActivation),
+        contextWindow,
+      );
+      if (update !== null) {
+        await this.emitExtension(LODY_KIMI_METHODS.usageUpdate, { ...update });
+      }
+    } catch (error) {
+      log.warn('acp: failed to push Lody token usage', {
+        sessionId: this.sessionId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  private async captureDetailedUsage(includeDelta: boolean): Promise<void> {
+    const meta = await this.session.agents();
+    const agentIds = new Set(['main', ...Object.keys(meta)]);
+    for (const agentId of agentIds) {
+      const handle = this.session.agent(agentId);
+      try {
+        const status = await handle.getUsage();
+        const byModel = await this.usageByModel(handle, status);
+        for (const [model, usage] of Object.entries(byModel)) {
+          const baselineKey = `${agentId}\0${model}`;
+          const previous = this.lodyUsageBaselines.get(baselineKey);
+          this.lodyUsageBaselines.set(baselineKey, { ...usage });
+          if (!includeDelta) continue;
+          const delta = tokenUsageDelta(usage, previous);
+          if (!hasTokenUsage(delta)) continue;
+          this.lodyUsageSinceActivation.set(
+            model,
+            addTokenUsage(this.lodyUsageSinceActivation.get(model), delta),
+          );
+        }
+      } catch (error) {
+        log.warn('acp: failed to read agent token usage', {
+          sessionId: this.sessionId,
+          agentId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+  }
+
+  private async usageByModel(
+    handle: AgentHandle,
+    status: UsageStatus,
+  ): Promise<Readonly<Record<string, TokenUsage>>> {
+    if (status.byModel !== undefined) return status.byModel;
+    if (status.total === undefined) return {};
+    const model = await handle.getModel();
+    return { [model || 'unknown']: status.total };
+  }
+
+  private async emitManagedUsage(): Promise<void> {
+    try {
+      const usage = await this.klient.global.auth.managedUsage();
+      await this.emitExtension(LODY_KIMI_METHODS.rateLimits, toLodyRateLimits(usage));
+    } catch (error) {
+      log.warn('acp: failed to push Lody managed usage', {
+        sessionId: this.sessionId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  private async emitExtension(method: string, params: Record<string, unknown>): Promise<void> {
+    try {
+      await this.conn.extensionNotification(method, params);
+    } catch (error) {
+      log.warn('acp: failed to push extension notification', {
+        sessionId: this.sessionId,
+        method,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
   }
 
   /**
@@ -983,6 +1310,20 @@ export class AcpSession {
     }
     const driver = this.driver;
     if (driver === undefined || driver.settled) return;
+    if (driver.pendingStopReason !== undefined) {
+      // The prompt is only being held open for background work; its own turn
+      // is already over. Cancel whatever the engine opened in the meantime (a
+      // wake turn reporting a finished subagent, a cron fire) and stop
+      // waiting. Detached subagents keep running on purpose — they outlive
+      // the turn by design and have their own cancellation surface.
+      if (this.runningTurns.size > 0) this.cancelAgentTurn('held prompt');
+      this.clearWakeTurnGrace();
+      driver.pendingStopReason = undefined;
+      this.settleDriver(driver, () => {
+        driver.resolve({ stopReason: 'cancelled' });
+      });
+      return;
+    }
     const turnId = driver.turnId;
     if (turnId === undefined) {
       // The launch round-trip has not returned the turn id yet. The engine's
@@ -993,17 +1334,22 @@ export class AcpSession {
       // handler re-issues a precisely-addressed cancel, and a no-launch
       // outcome settles `cancelled` instead of `end_turn`.
       driver.cancelRequested = true;
-      void this.agent.cancel().catch((error) => {
-        log.warn('acp: cancel (unaddressed) failed', {
-          sessionId: this.sessionId,
-          error: error instanceof Error ? error.message : String(error),
-        });
-      });
+      this.cancelAgentTurn('unaddressed');
       return;
     }
-    void this.agent.cancel({ turnId }).catch((error) => {
+    this.cancelAgentTurn('addressed', turnId);
+  }
+
+  /**
+   * Ask the engine to stop a turn, fire-and-forget. An omitted `turnId`
+   * cancels whatever turn is active — the engine's contract for a cancel that
+   * cannot name its target yet.
+   */
+  private cancelAgentTurn(context: string, turnId?: number): void {
+    void this.agent.cancel(turnId === undefined ? undefined : { turnId }).catch((error) => {
       log.warn('acp: cancel failed', {
         sessionId: this.sessionId,
+        context,
         error: error instanceof Error ? error.message : String(error),
       });
     });

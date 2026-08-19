@@ -63,6 +63,7 @@ import type {
   SessionRestoreOptions,
   SessionSummary,
 } from '@moonshot-ai/klient';
+import { ErrorCodes, isError2 } from '@moonshot-ai/agent-core-v2';
 import { RPCError } from '@moonshot-ai/klient';
 
 import type { AcpClient } from './acp-client';
@@ -71,6 +72,12 @@ import { buildTerminalAuthMethod, TERMINAL_AUTH_METHOD } from './auth-methods';
 import { acpMcpServersToConfigRecord } from './convert';
 import { log } from './log';
 import { isAcpModeId } from './modes';
+import {
+  LODY_FORK_AT_TURN_CAPABILITY,
+  LODY_KIMI_EXTENSION,
+  LODY_KIMI_METHODS,
+  readLodyForkTurnIndex,
+} from './lody-extension';
 import { AcpSession } from './session';
 import { negotiateVersion } from './version';
 
@@ -79,6 +86,13 @@ import { negotiateVersion } from './version';
  * branch key across the wire, mirrored from the klient facade's `NOT_FOUND`.
  */
 const SESSION_NOT_FOUND_CODE = 40404;
+
+function isSessionNotFound(error: unknown): boolean {
+  return (
+    (error instanceof RPCError && error.code === SESSION_NOT_FOUND_CODE) ||
+    (isError2(error) && error.code === ErrorCodes.SESSION_NOT_FOUND)
+  );
+}
 
 /** Host-provided slash commands plus optional aliases that activate engine skills. */
 export interface SlashCommandsSnapshot {
@@ -127,6 +141,8 @@ export interface AcpServerOptions {
    * scope. Absent → `persistOriginalImage`'s shared temp-dir fallback.
    */
   readonly resolveOriginalsDir?: (sessionId: string) => string | undefined;
+  readonly bindSessionRuntime?: (sessionId: string) => Promise<void>;
+  readonly unbindSessionRuntime?: (sessionId: string) => Promise<void>;
   /** Static or per-session host command palette, compatible with acp-adapter. */
   readonly slashCommands?: SlashCommandsResolver;
 }
@@ -138,6 +154,8 @@ export class AcpServer {
   private readonly terminalAuthEnv: Readonly<Record<string, string>> | undefined;
   private readonly terminalAuthLegacyCommand: string | undefined;
   private readonly resolveOriginalsDir: ((sessionId: string) => string | undefined) | undefined;
+  private readonly bindSessionRuntime: ((sessionId: string) => Promise<void>) | undefined;
+  private readonly unbindSessionRuntime: ((sessionId: string) => Promise<void>) | undefined;
   private readonly resolveSlashCommands: (
     session: SessionHandle,
   ) => Promise<ReadonlyArray<AvailableCommand> | SlashCommandsSnapshot>;
@@ -159,6 +177,8 @@ export class AcpServer {
     this.terminalAuthEnv = opts.terminalAuthEnv;
     this.terminalAuthLegacyCommand = opts.terminalAuthLegacyCommand;
     this.resolveOriginalsDir = opts.resolveOriginalsDir;
+    this.bindSessionRuntime = opts.bindSessionRuntime;
+    this.unbindSessionRuntime = opts.unbindSessionRuntime;
     const slashCommands = opts.slashCommands;
     this.resolveSlashCommands =
       typeof slashCommands === 'function'
@@ -208,6 +228,10 @@ export class AcpServer {
       // is not supported (dropped with a warning — see `./convert`).
       mcpCapabilities: { http: true, sse: true },
       auth: { logout: {} },
+      _meta: {
+        'lody.ai/kimi': LODY_KIMI_EXTENSION,
+        lody: { forkAtTurn: LODY_FORK_AT_TURN_CAPABILITY },
+      },
     };
 
     return {
@@ -248,6 +272,11 @@ export class AcpServer {
    * `mcpServers` (ephemeral servers are not carried over), so those request
    * fields are ignored with a warning, mirroring load/resume. An unknown
    * source id maps to ACP `invalid_params` (-32602).
+   *
+   * `_meta.lody.forkAtTurn` selects a historical branch point: its `turnId` is
+   * the position this server published on that turn's updates, which is
+   * exactly the engine's fork turn index. Absent (or from a client that never
+   * saw a position) the fork keeps the whole session, as before.
    */
   async unstable_forkSession(params: ForkSessionRequest): Promise<ForkSessionResponse> {
     await this.ensureAuthed();
@@ -257,11 +286,12 @@ export class AcpServer {
         servers: params.mcpServers.map((server) => server.name),
       });
     }
+    const turnIndex = readLodyForkTurnIndex(params._meta);
     let forkedId: string;
     try {
-      forkedId = (await this.klient.session(params.sessionId).fork()).id;
+      forkedId = (await this.klient.session(params.sessionId).fork({ turnIndex })).id;
     } catch (error) {
-      if (error instanceof RPCError && error.code === SESSION_NOT_FOUND_CODE) {
+      if (isSessionNotFound(error)) {
         throw RequestError.invalidParams(
           { sessionId: params.sessionId },
           `Unknown sessionId: ${params.sessionId}`,
@@ -323,6 +353,7 @@ export class AcpServer {
       this.sessions.delete(params.sessionId);
     }
     await this.klient.session(params.sessionId).close();
+    await this.unbindSessionRuntime?.(params.sessionId);
   }
 
   /**
@@ -337,7 +368,7 @@ export class AcpServer {
     try {
       await this.klient.session(params.sessionId).delete();
     } catch (error) {
-      if (error instanceof RPCError && error.code === SESSION_NOT_FOUND_CODE) {
+      if (isSessionNotFound(error)) {
         throw RequestError.invalidParams(
           { sessionId: params.sessionId },
           `Unknown sessionId: ${params.sessionId}`,
@@ -350,6 +381,7 @@ export class AcpServer {
       acpSession.dispose();
       this.sessions.delete(params.sessionId);
     }
+    await this.unbindSessionRuntime?.(params.sessionId);
     return {};
   }
 
@@ -507,6 +539,34 @@ export class AcpServer {
     return {};
   }
 
+  async listSubagents(params: ListSubagentsParams): Promise<Record<string, unknown>> {
+    return {
+      tasks: await this.requireAcpSession(params.sessionId).listSubagents(params.activeOnly),
+    };
+  }
+
+  async cancelSubagent(params: CancelSubagentParams): Promise<Record<string, unknown>> {
+    await this.requireAcpSession(params.sessionId).cancelSubagent(params.taskId, params.reason);
+    return {};
+  }
+
+  async subagentOutput(params: SubagentOutputParams): Promise<{ output: string }> {
+    return {
+      output: await this.requireAcpSession(params.sessionId).subagentOutput(
+        params.taskId,
+        params.tail,
+      ),
+    };
+  }
+
+  private requireAcpSession(sessionId: string): AcpSession {
+    const session = this.sessions.get(sessionId);
+    if (session === undefined) {
+      throw RequestError.invalidParams({ sessionId }, `Unknown sessionId: ${sessionId}`);
+    }
+    return session;
+  }
+
   /**
    * Resume a persisted session into the live scope tree and build its ACP
    * session. An unknown session id maps to ACP `invalid_params` (-32602)
@@ -539,6 +599,7 @@ export class AcpServer {
   private async wireSession(sessionId: string): Promise<AcpSession> {
     const session = this.klient.session(sessionId);
     await this.bindDefaultModel(session.agent('main'));
+    await this.bindSessionRuntime?.(sessionId);
     const hostCommands = await this.resolveSlashCommands(session);
     const acpSession = new AcpSession(
       this.conn,
@@ -645,6 +706,23 @@ export interface SetSessionModelParams {
   readonly modelId: string;
 }
 
+interface ListSubagentsParams {
+  readonly sessionId: string;
+  readonly activeOnly?: boolean;
+}
+
+interface CancelSubagentParams {
+  readonly sessionId: string;
+  readonly taskId: string;
+  readonly reason?: string;
+}
+
+interface SubagentOutputParams {
+  readonly sessionId: string;
+  readonly taskId: string;
+  readonly tail?: number;
+}
+
 /**
  * Params parser for the custom `session/set_model` route (the app API
  * requires every custom method to bring its own parser). Hand-rolled rather
@@ -661,6 +739,65 @@ function parseSetSessionModelParams(params: unknown): SetSessionModelParams {
     );
   }
   return { sessionId, modelId };
+}
+
+function parseListSubagentsParams(params: unknown): ListSubagentsParams {
+  const record = asRecord(params, LODY_KIMI_METHODS.subagentsList);
+  const sessionId = requiredString(record, 'sessionId', LODY_KIMI_METHODS.subagentsList);
+  const activeOnly = record['activeOnly'];
+  if (activeOnly !== undefined && typeof activeOnly !== 'boolean') {
+    throw RequestError.invalidParams(params, 'activeOnly must be a boolean');
+  }
+  return { sessionId, activeOnly };
+}
+
+function parseCancelSubagentParams(params: unknown): CancelSubagentParams {
+  const record = asRecord(params, LODY_KIMI_METHODS.subagentsCancel);
+  return {
+    sessionId: requiredString(record, 'sessionId', LODY_KIMI_METHODS.subagentsCancel),
+    taskId: requiredString(record, 'taskId', LODY_KIMI_METHODS.subagentsCancel),
+    reason: optionalString(record, 'reason', LODY_KIMI_METHODS.subagentsCancel),
+  };
+}
+
+function parseSubagentOutputParams(params: unknown): SubagentOutputParams {
+  const record = asRecord(params, LODY_KIMI_METHODS.subagentsOutput);
+  const tail = record['tail'];
+  if (tail !== undefined && (!Number.isInteger(tail) || (tail as number) < 0)) {
+    throw RequestError.invalidParams(params, 'tail must be a non-negative integer');
+  }
+  return {
+    sessionId: requiredString(record, 'sessionId', LODY_KIMI_METHODS.subagentsOutput),
+    taskId: requiredString(record, 'taskId', LODY_KIMI_METHODS.subagentsOutput),
+    tail: tail as number | undefined,
+  };
+}
+
+function asRecord(params: unknown, method: string): Record<string, unknown> {
+  if (typeof params !== 'object' || params === null || Array.isArray(params)) {
+    throw RequestError.invalidParams(params, `${method} expects an object`);
+  }
+  return params as Record<string, unknown>;
+}
+
+function requiredString(record: Record<string, unknown>, key: string, method: string): string {
+  const value = record[key];
+  if (typeof value !== 'string' || value.length === 0) {
+    throw RequestError.invalidParams(record, `${method} expects ${key}: string`);
+  }
+  return value;
+}
+
+function optionalString(
+  record: Record<string, unknown>,
+  key: string,
+  method: string,
+): string | undefined {
+  const value = record[key];
+  if (value !== undefined && typeof value !== 'string') {
+    throw RequestError.invalidParams(record, `${method} expects ${key}: string`);
+  }
+  return value;
 }
 
 /**
@@ -694,6 +831,15 @@ export function createAcpAgentApp(getServer: () => AcpServer): AgentApp {
     .onNotification(methods.agent.session.cancel, (ctx) => getServer().cancel(ctx.params))
     .onRequest(SET_SESSION_MODEL_METHOD, parseSetSessionModelParams, (ctx) =>
       getServer().setSessionModel(ctx.params),
+    )
+    .onRequest(LODY_KIMI_METHODS.subagentsList, parseListSubagentsParams, (ctx) =>
+      getServer().listSubagents(ctx.params),
+    )
+    .onRequest(LODY_KIMI_METHODS.subagentsCancel, parseCancelSubagentParams, (ctx) =>
+      getServer().cancelSubagent(ctx.params),
+    )
+    .onRequest(LODY_KIMI_METHODS.subagentsOutput, parseSubagentOutputParams, (ctx) =>
+      getServer().subagentOutput(ctx.params),
     );
 }
 

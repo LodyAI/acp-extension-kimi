@@ -55,7 +55,6 @@ describe('negotiateVersion', () => {
     expect(MIN_PROTOCOL_VERSION).toBe(1);
   });
 });
-
 describe('acp-server initialize handshake', () => {
   it(
     'boots agent-core-v2 and answers the ACP initialize request',
@@ -85,6 +84,13 @@ describe('acp-server initialize handshake', () => {
             auth: { logout: {} },
             mcpCapabilities: { http: true, sse: true },
             sessionCapabilities: { additionalDirectories: {}, delete: {}, fork: {} },
+            _meta: {
+              'lody.ai/kimi': {
+                protocolVersion: 1,
+                features: { managedUsage: true, subagentManagement: true, tokenUsage: true },
+              },
+              lody: { forkAtTurn: { version: 1 } },
+            },
           },
         });
 
@@ -92,7 +98,7 @@ describe('acp-server initialize handshake', () => {
         toAgent.end();
         toClient.end();
       } finally {
-        await rm(homeDir, { recursive: true, force: true });
+        await rm(homeDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
       }
     },
     30_000,
@@ -125,7 +131,7 @@ describe('acp-server initialize handshake', () => {
         toAgent.end();
         toClient.end();
       } finally {
-        await rm(homeDir, { recursive: true, force: true });
+        await rm(homeDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
       }
     },
     30_000,
@@ -176,7 +182,7 @@ describe('acp-server initialize handshake', () => {
         toAgent.end();
         toClient.end();
       } finally {
-        await rm(homeDir, { recursive: true, force: true });
+        await rm(homeDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
       }
     },
     30_000,
