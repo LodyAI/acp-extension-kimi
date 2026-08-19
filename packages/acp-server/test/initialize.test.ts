@@ -89,6 +89,7 @@ describe('acp-server initialize handshake', () => {
                 protocolVersion: 1,
                 features: { managedUsage: true, subagentManagement: true, tokenUsage: true },
               },
+              lody: { forkAtTurn: { version: 1 } },
             },
           },
         });

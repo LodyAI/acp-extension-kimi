@@ -20,13 +20,20 @@
  */
 
 import type { SessionNotification } from '@agentclientprotocol/sdk';
-import type { ContentPart, ContextMessage, ToolCall } from '@moonshot-ai/agent-core-v2';
+import {
+  type ContentPart,
+  type ContextMessage,
+  type ForkTurnSummary,
+  promptMetadataTextFromContentParts,
+  type ToolCall,
+} from '@moonshot-ai/agent-core-v2';
 
 import {
   assistantDeltaToSessionUpdate,
   thinkingDeltaToSessionUpdate,
   toolCallStartToSessionUpdate,
 } from './events-map';
+import { isForkableTurnOrigin, withLodyTurnId } from './lody-extension';
 
 /**
  * Project a persisted context history into an ordered batch of ACP
@@ -36,35 +43,44 @@ import {
 export function projectHistoryToSessionUpdates(
   sessionId: string,
   messages: readonly ContextMessage[],
+  forkTurns: readonly ForkTurnSummary[] = [],
 ): SessionNotification[] {
   const out: SessionNotification[] = [];
   let turnId = 0;
   const toolCallTurnIds = new Map<string, number>();
+  const forkPositions = new ForkTurnCursor(forkTurns);
+  let forkTurnIndex: number | undefined;
+
+  const push = (notification: SessionNotification | null): void => {
+    if (notification === null) return;
+    out.push(
+      forkTurnIndex === undefined ? notification : withLodyTurnId(notification, forkTurnIndex),
+    );
+  };
 
   for (const message of messages) {
     switch (message.role) {
       case 'user':
+        forkTurnIndex = forkPositions.advanceTo(message);
         for (const part of message.content) {
           if (part.type === 'text' && part.text) {
-            out.push(userMessageChunk(sessionId, part.text));
+            push(userMessageChunk(sessionId, part.text));
           }
         }
         break;
       case 'assistant': {
         turnId += 1;
         for (const part of message.content) {
-          const update = assistantContentPartToUpdate(part, sessionId, turnId);
-          if (update !== null) out.push(update);
+          push(assistantContentPartToUpdate(part, sessionId, turnId));
         }
         for (const toolCall of message.toolCalls ?? []) {
           toolCallTurnIds.set(toolCall.id, turnId);
-          out.push(syntheticToolCall(sessionId, turnId, toolCall));
+          push(syntheticToolCall(sessionId, turnId, toolCall));
         }
         break;
       }
       case 'tool': {
-        const update = toolMessageToUpdate(message, sessionId, toolCallTurnIds);
-        if (update !== null) out.push(update);
+        push(toolMessageToUpdate(message, sessionId, toolCallTurnIds));
         break;
       }
       default:
@@ -73,6 +89,36 @@ export function projectHistoryToSessionUpdates(
     }
   }
   return out;
+}
+
+/**
+ * Walks the engine's fork turn list alongside a replayed history so each
+ * replayed turn carries the position the engine would fork it at.
+ *
+ * The two sequences share an order but not a length: compaction drops
+ * messages from context while the records defining fork positions stay, so a
+ * replayed history is a subsequence. Matching on the same prompt metadata the
+ * engine records lets the cursor skip the compacted-away entries; a turn that
+ * cannot be matched carries no position and is simply not forkable, which is
+ * the safe direction — a guessed index would branch the wrong turn.
+ */
+class ForkTurnCursor {
+  private next = 0;
+
+  constructor(private readonly turns: readonly ForkTurnSummary[]) {}
+
+  advanceTo(message: ContextMessage): number | undefined {
+    if (!isForkableTurnOrigin(message.origin)) return undefined;
+    const prompt = promptMetadataTextFromContentParts(message.content);
+    if (prompt === undefined) return undefined;
+    for (let index = this.next; index < this.turns.length; index += 1) {
+      const turn = this.turns[index];
+      if (turn === undefined || turn.prompt !== prompt) continue;
+      this.next = index + 1;
+      return turn.turnIndex;
+    }
+    return undefined;
+  }
 }
 
 function userMessageChunk(sessionId: string, text: string): SessionNotification {

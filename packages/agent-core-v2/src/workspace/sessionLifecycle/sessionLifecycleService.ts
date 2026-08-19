@@ -78,6 +78,7 @@ import { agentScopeOf, sessionDirOf, sessionScopeOf } from './internal/addressin
 import { SessionArchived } from './sessionLifecycleEvents';
 import {
   assertForkTurnIndex,
+  listForkTurns,
   sliceMainRecordsAtTurn,
   sliceSubagentRecordsAtTime,
 } from './internal/forkTurnSlice';
@@ -85,6 +86,7 @@ import {
   type CreateChildSessionOptions,
   type CreateSessionOptions,
   type ForkSessionOptions,
+  type ForkTurnSummary,
   type ResumeSessionOptions,
   type SessionArchivedEvent,
   type SessionClosedEvent,
@@ -439,6 +441,19 @@ export class SessionLifecycleService extends Disposable implements ISessionLifec
     for (const agent of agentLifecycle.list()) {
       await agentLifecycle.remove(agent.id);
     }
+  }
+
+  async listForkTurns(sourceSessionId: string): Promise<ForkTurnSummary[]> {
+    const sourceHandle = this.sessions.get(sourceSessionId);
+    if (sourceHandle === undefined && (await this.index.get(sourceSessionId)) === undefined) {
+      throw new Error2(
+        ErrorCodes.SESSION_NOT_FOUND,
+        `Session "${sourceSessionId}" does not exist`,
+      );
+    }
+    return listForkTurns(
+      await this.readSourceWireRecords(sourceHandle, sourceSessionId, MAIN_AGENT_ID),
+    );
   }
 
   async fork(opts: ForkSessionOptions): Promise<ISessionScopeHandle> {

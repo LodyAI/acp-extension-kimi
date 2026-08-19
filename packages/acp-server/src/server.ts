@@ -72,7 +72,12 @@ import { buildTerminalAuthMethod, TERMINAL_AUTH_METHOD } from './auth-methods';
 import { acpMcpServersToConfigRecord } from './convert';
 import { log } from './log';
 import { isAcpModeId } from './modes';
-import { LODY_KIMI_EXTENSION, LODY_KIMI_METHODS } from './lody-extension';
+import {
+  LODY_FORK_AT_TURN_CAPABILITY,
+  LODY_KIMI_EXTENSION,
+  LODY_KIMI_METHODS,
+  readLodyForkTurnIndex,
+} from './lody-extension';
 import { AcpSession } from './session';
 import { negotiateVersion } from './version';
 
@@ -223,7 +228,10 @@ export class AcpServer {
       // is not supported (dropped with a warning — see `./convert`).
       mcpCapabilities: { http: true, sse: true },
       auth: { logout: {} },
-      _meta: { 'lody.ai/kimi': LODY_KIMI_EXTENSION },
+      _meta: {
+        'lody.ai/kimi': LODY_KIMI_EXTENSION,
+        lody: { forkAtTurn: LODY_FORK_AT_TURN_CAPABILITY },
+      },
     };
 
     return {
@@ -264,6 +272,11 @@ export class AcpServer {
    * `mcpServers` (ephemeral servers are not carried over), so those request
    * fields are ignored with a warning, mirroring load/resume. An unknown
    * source id maps to ACP `invalid_params` (-32602).
+   *
+   * `_meta.lody.forkAtTurn` selects a historical branch point: its `turnId` is
+   * the position this server published on that turn's updates, which is
+   * exactly the engine's fork turn index. Absent (or from a client that never
+   * saw a position) the fork keeps the whole session, as before.
    */
   async unstable_forkSession(params: ForkSessionRequest): Promise<ForkSessionResponse> {
     await this.ensureAuthed();
@@ -273,9 +286,10 @@ export class AcpServer {
         servers: params.mcpServers.map((server) => server.name),
       });
     }
+    const turnIndex = readLodyForkTurnIndex(params._meta);
     let forkedId: string;
     try {
-      forkedId = (await this.klient.session(params.sessionId).fork()).id;
+      forkedId = (await this.klient.session(params.sessionId).fork({ turnIndex })).id;
     } catch (error) {
       if (isSessionNotFound(error)) {
         throw RequestError.invalidParams(

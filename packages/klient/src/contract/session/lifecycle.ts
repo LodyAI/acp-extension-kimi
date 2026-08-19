@@ -50,6 +50,13 @@ export const handleWireSchema = z.looseObject({
   kind: z.string(),
 });
 
+/** One fork-addressable turn (`ForkTurnSummary` in the engine). */
+export const forkTurnSummarySchema = z.object({
+  turnIndex: z.number(),
+  prompt: z.string().optional(),
+  time: z.number().optional(),
+});
+
 export const sessionManagerContract = {
   create: { input: z.tuple([createSessionOptionsSchema]), output: handleWireSchema },
   resume: {
@@ -63,6 +70,10 @@ export const sessionManagerContract = {
     output: maybe(handleWireSchema),
   },
   delete: { input: z.tuple([z.string()]), output: noResult },
+  listForkTurns: {
+    input: z.tuple([z.string()]),
+    output: z.array(forkTurnSummarySchema),
+  },
   fork: { input: z.tuple([forkSessionOptionsSchema]), output: handleWireSchema },
   createChild: { input: z.tuple([createChildSessionOptionsSchema]), output: handleWireSchema },
 } satisfies ServiceContract;

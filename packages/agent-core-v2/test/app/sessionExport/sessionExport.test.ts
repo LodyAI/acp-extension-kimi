@@ -900,6 +900,7 @@ function registerSessionExportServices(
     archive: async () => {},
     restore: async () => options.lifecycleHandle,
     delete: async () => {},
+    listForkTurns: async () => [],
     fork: async () => {
       throw new Error('fork should not be called by session export');
     },

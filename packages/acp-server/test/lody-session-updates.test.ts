@@ -1,4 +1,5 @@
 import type { SessionNotification } from '@agentclientprotocol/sdk';
+import type { ForkTurnSummary } from '@moonshot-ai/agent-core-v2';
 import type { AgentTaskInfo, Klient } from '@moonshot-ai/klient';
 import { describe, expect, it } from 'vitest';
 
@@ -16,10 +17,11 @@ type Listener = (event: unknown) => void;
  * turn settlement make. Reads answer with empty/neutral data — the session
  * treats every one of them as best-effort.
  */
-function makeFakeKlient(): {
+function makeFakeKlient(forkTurns: readonly ForkTurnSummary[] = []): {
   readonly klient: Klient;
   emit(event: string, payload: unknown): void;
   readonly prompts: number[];
+  readonly forks: Array<Record<string, unknown> | undefined>;
   readonly cancels: number;
 } {
   const listeners = new Map<string, Listener[]>();
@@ -55,12 +57,18 @@ function makeFakeKlient(): {
     getUsage: () => Promise.resolve({}),
     getTasks: () => Promise.resolve([]),
   };
+  const forks: Array<Record<string, unknown> | undefined> = [];
   const session = {
     agent: () => agent,
     agents: () => Promise.resolve({}),
     events: { on, onError: () => ({ dispose: () => {} }) },
     skills: { list: () => Promise.resolve([]) },
     interactions: { list: () => Promise.resolve([]), respond: () => Promise.resolve() },
+    forkTurns: () => Promise.resolve(forkTurns),
+    fork: (input?: Record<string, unknown>) => {
+      forks.push(input);
+      return Promise.resolve({ id: 'session_forked' });
+    },
   };
   const klient = {
     session: () => session,
@@ -75,6 +83,7 @@ function makeFakeKlient(): {
       for (const listener of listeners.get(event) ?? []) listener(payload);
     },
     prompts,
+    forks,
     get cancels() {
       return cancels;
     },
@@ -115,8 +124,8 @@ function subagentTask(overrides: Partial<AgentTaskInfo> = {}): AgentTaskInfo {
 /** Let queued microtasks (and the settlement they carry) run. */
 const flush = () => new Promise((resolve) => setImmediate(resolve));
 
-async function startSession() {
-  const fake = makeFakeKlient();
+async function startSession(forkTurns: readonly ForkTurnSummary[] = []) {
+  const fake = makeFakeKlient(forkTurns);
   const { conn, updates } = makeFakeConn();
   const session = new AcpSession(conn, fake.klient, SESSION_ID, acpConnection, false);
   await session.init();
@@ -250,5 +259,61 @@ describe('background subagent work and the client prompt', () => {
     fake.emit('turn.ended', { turnId: 1, reason: 'completed' });
 
     await expect(pending).resolves.toEqual({ stopReason: 'end_turn' });
+  });
+});
+
+describe('fork positions on the wire', () => {
+  const lodyTurnId = (update: SessionNotification['update']): string | undefined =>
+    (update as { _meta?: { lody?: { turnId?: string } } })._meta?.lody?.turnId;
+
+  it('publishes the engine fork position on a user turn and forks back at it', async () => {
+    // Two turns already recorded: the next user turn is fork index 2.
+    const { fake, session, updates } = await startSession([
+      { turnIndex: 0, prompt: 'first' },
+      { turnIndex: 1, prompt: 'second' },
+    ]);
+
+    void session.prompt([{ type: 'text', text: 'third' }]);
+    await flush();
+    fake.emit('turn.started', { turnId: 7, origin: { kind: 'user' } });
+    fake.emit('assistant.delta', { turnId: 7, delta: 'answering' });
+    await flush();
+
+    const stamped = updates
+      .map((entry) => entry.update)
+      .filter((update) => update.sessionUpdate === 'agent_message_chunk')
+      .map(lodyTurnId);
+    expect(stamped).toEqual(['2']);
+  });
+
+  it('does not spend a fork position on an engine-opened turn', async () => {
+    const { fake, session, updates } = await startSession([{ turnIndex: 0, prompt: 'first' }]);
+
+    void session.prompt([{ type: 'text', text: 'second' }]);
+    await flush();
+    // A cron fire and a subagent wake sit between two user turns; neither is a
+    // fork boundary, so neither may consume an index.
+    fake.emit('turn.started', { turnId: 1, origin: { kind: 'cron_job' } });
+    fake.emit('assistant.delta', { turnId: 1, delta: 'cron' });
+    fake.emit('turn.ended', { turnId: 1, reason: 'completed' });
+    fake.emit('turn.started', { turnId: 2, origin: { kind: 'task' } });
+    fake.emit('assistant.delta', { turnId: 2, delta: 'wake' });
+    fake.emit('turn.ended', { turnId: 2, reason: 'completed' });
+    fake.emit('turn.started', { turnId: 3, origin: { kind: 'user' } });
+    fake.emit('assistant.delta', { turnId: 3, delta: 'user turn' });
+    await flush();
+
+    const byText = new Map(
+      updates
+        .map((entry) => entry.update)
+        .filter((update) => update.sessionUpdate === 'agent_message_chunk')
+        .map((update) => [
+          (update as { content: { text?: string } }).content.text,
+          lodyTurnId(update),
+        ]),
+    );
+    expect(byText.get('cron')).toBeUndefined();
+    expect(byText.get('wake')).toBeUndefined();
+    expect(byText.get('user turn')).toBe('1');
   });
 });

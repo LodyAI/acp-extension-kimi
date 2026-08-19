@@ -4,6 +4,8 @@ import { type Event, type IWaitUntil } from '#/_base/event';
 import type { BindAgentInput } from '#/agent/profile/profile';
 import type { McpServerConfig } from '#/mcpCore/config-schema';
 
+
+
 export type SessionCreateSource = 'startup' | 'resume' | 'fork';
 
 export type SessionCloseReason = 'exit' | 'archive';
@@ -20,6 +22,17 @@ export interface CreateSessionOptions {
    * the session closes. Not carried over by fork or resume.
    */
   readonly mcpServers?: Readonly<Record<string, McpServerConfig>>;
+}
+
+/**
+ * One fork-addressable turn: `turnIndex` is what `fork({ turnIndex })` takes,
+ * and `prompt` is the same prompt metadata the fork records, which lets a
+ * caller align these against a history whose head has been compacted away.
+ */
+export interface ForkTurnSummary {
+  readonly turnIndex: number;
+  readonly prompt?: string;
+  readonly time?: number;
 }
 
 export interface ForkSessionOptions {
@@ -116,6 +129,13 @@ export interface ISessionLifecycleService {
   archive(sessionId: string): Promise<void>;
   restore(sessionId: string, opts?: ResumeSessionOptions): Promise<ISessionScopeHandle | undefined>;
   delete(sessionId: string): Promise<void>;
+  /**
+   * The turns `fork({ turnIndex })` can address, in record order. A rendered
+   * history is not a reliable index source — compaction drops messages from
+   * context while the records that define these indices stay — so a client
+   * that offers "fork from here" resolves its position against this list.
+   */
+  listForkTurns(sourceSessionId: string): Promise<ForkTurnSummary[]>;
   fork(opts: ForkSessionOptions): Promise<ISessionScopeHandle>;
   createChild(opts: CreateChildSessionOptions): Promise<ISessionScopeHandle>;
 }

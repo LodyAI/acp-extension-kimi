@@ -8,6 +8,7 @@ import { ISessionIndex } from '#/app/sessionIndex/sessionIndex';
 import {
   type CreateChildSessionOptions,
   type ForkSessionOptions,
+  type ForkTurnSummary,
   type ResumeSessionOptions,
   type SessionArchivedEvent,
   type SessionClosedEvent,
@@ -166,6 +167,14 @@ export class SessionManager implements ISessionManager {
       }
       await controller.delete(sessionId);
     });
+  }
+
+  async listForkTurns(sourceSessionId: string): Promise<ForkTurnSummary[]> {
+    const controller = await this.controllerForSession(sourceSessionId);
+    if (controller === undefined) {
+      throw new Error2(ErrorCodes.SESSION_NOT_FOUND, `session ${sourceSessionId} does not exist`);
+    }
+    return controller.listForkTurns(sourceSessionId);
   }
 
   async fork(options: ForkSessionOptions): Promise<ISessionScopeHandle> {

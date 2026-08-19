@@ -24,3 +24,11 @@ Package-local rules for `packages/acp-server`.
   `_meta.toolName`. Clients that treat specific tools specially (scheduling cards read
   the cron expression out of `rawInput`) must be able to identify the tool without
   parsing prose.
+- Fork positions are engine positions. The engine addresses `fork({ turnIndex })` by
+  counting user-visible turns in the durable records, so the `_meta.lody.turnId` this
+  server publishes IS that index, anchored per activation from `session.forkTurns()` and
+  advanced only by turns the engine would count — a wake or cron turn must never consume
+  one. Never derive a position from rendered history: compaction drops messages from
+  context while the records defining these positions stay. A turn that cannot be matched
+  to a record position is published without one; forking the wrong turn is worse than
+  not offering the branch.

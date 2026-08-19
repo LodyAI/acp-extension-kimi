@@ -108,6 +108,7 @@ describe('RestGateway', () => {
       archive: () => Promise.resolve(),
       restore: () => Promise.resolve(sessionHandle),
       delete: () => Promise.resolve(),
+      listForkTurns: () => Promise.resolve([]),
       fork: () => Promise.resolve(sessionHandle),
       createChild: () => Promise.resolve(sessionHandle),
     };
@@ -127,6 +128,7 @@ describe('RestGateway', () => {
       archive: () => Promise.resolve(),
       restore: () => Promise.resolve(sessionHandle),
       delete: () => Promise.resolve(),
+      listForkTurns: () => Promise.resolve([]),
       fork: () => Promise.resolve(sessionHandle),
     });
     ix.stub(ILogService, stubLog());

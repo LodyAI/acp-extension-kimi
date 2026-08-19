@@ -25,6 +25,7 @@ import type {
   SessionMeta,
   SessionMetaPatch,
 } from '@moonshot-ai/agent-core-v2/session/sessionMetadata/sessionMetadata';
+import type { ForkTurnSummary } from '@moonshot-ai/agent-core-v2/workspace/sessionLifecycle/sessionLifecycle';
 import type { SkillSummary } from '@moonshot-ai/agent-core-v2/app/skillCatalog/types';
 
 import type { ScopeRef } from '../channel.js';
@@ -107,7 +108,18 @@ export interface SessionFacade {
   restore(opts?: SessionRestoreOptions): Promise<boolean>;
   /** Permanently delete the session and its persisted data; throws when missing. */
   delete(): Promise<void>;
-  fork(input?: { title?: string; metadata?: Record<string, unknown> }): Promise<SessionMeta>;
+  /**
+   * The turns `fork({ turnIndex })` can address, oldest first. Positions come
+   * from the durable records, so they stay valid after a compaction has
+   * dropped the corresponding messages from the rendered context.
+   */
+  forkTurns(): Promise<readonly ForkTurnSummary[]>;
+  fork(input?: {
+    title?: string;
+    metadata?: Record<string, unknown>;
+    /** Retain the session through this turn only (see {@link forkTurns}). */
+    turnIndex?: number;
+  }): Promise<SessionMeta>;
   createChild(input?: { title?: string; metadata?: Record<string, unknown> }): Promise<SessionMeta>;
   readonly approvals: SessionApprovalsFacade;
   readonly questions: SessionQuestionsFacade;
@@ -123,10 +135,15 @@ export function createSessionFacade(call: ScopedCaller, sessionId: string): Sess
     call(scope, 'sessionMetadata', 'read', []) as Promise<SessionMeta>;
   const spawn = async (
     method: 'fork' | 'createChild',
-    input: { title?: string; metadata?: Record<string, unknown> } = {},
+    input: { title?: string; metadata?: Record<string, unknown>; turnIndex?: number } = {},
   ): Promise<SessionMeta> => {
     const handle = (await call({}, 'sessionManager', method, [
-      { sourceSessionId: sessionId, title: input.title, metadata: input.metadata },
+      {
+        sourceSessionId: sessionId,
+        title: input.title,
+        metadata: input.metadata,
+        turnIndex: input.turnIndex,
+      },
     ])) as HandleWire;
     return call({ sessionId: handle.id }, 'sessionMetadata', 'read', []) as Promise<SessionMeta>;
   };
@@ -173,6 +190,10 @@ export function createSessionFacade(call: ScopedCaller, sessionId: string): Sess
       return handle !== null && handle !== undefined;
     },
     delete: () => call({}, 'sessionManager', 'delete', [sessionId]) as Promise<void>,
+    forkTurns: () =>
+      call({}, 'sessionManager', 'listForkTurns', [sessionId]) as Promise<
+        readonly ForkTurnSummary[]
+      >,
     fork: (input) => spawn('fork', input),
     createChild: (input) => spawn('createChild', input),
 

@@ -6,11 +6,14 @@ import {
 } from '#/agent/prompt/promptMetadataText';
 import type { WireRecord } from '#/wire/record';
 
+import type { ForkTurnSummary } from '../sessionLifecycle';
+
 export interface MainTurnSlice {
   readonly records: readonly WireRecord[];
   readonly cutoffTime?: number;
   readonly lastPrompt?: string;
 }
+
 
 export function assertForkTurnIndex(turnIndex: number | undefined): void {
   if (turnIndex === undefined) return;
@@ -56,6 +59,25 @@ export function sliceMainRecordsAtTurn(
     cutoffTime: cutoffTimes.length === 0 ? undefined : Math.max(...cutoffTimes),
     lastPrompt,
   };
+}
+
+/**
+ * The fork-addressable turns of a session, in record order. `turnIndex` is
+ * what `fork({ turnIndex })` takes; `prompt` is the same prompt metadata a
+ * fork records as its last prompt, which lets a caller line these up against
+ * a rendered history whose head may have been compacted away.
+ */
+export function listForkTurns(records: readonly WireRecord[]): ForkTurnSummary[] {
+  const turns: ForkTurnSummary[] = [];
+  for (const record of records) {
+    if (!isUserVisibleTurnRecord(record)) continue;
+    turns.push({
+      turnIndex: turns.length,
+      prompt: promptMetadataFromTurnRecord(record),
+      time: recordTime(record),
+    });
+  }
+  return turns;
 }
 
 export function sliceSubagentRecordsAtTime(

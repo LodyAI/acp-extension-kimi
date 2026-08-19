@@ -30,7 +30,7 @@ import type {
   ToolCallLocation,
 } from '@agentclientprotocol/sdk';
 import { RequestError } from '@agentclientprotocol/sdk';
-import type { ContextMessage } from '@moonshot-ai/agent-core-v2';
+import type { ContextMessage, ForkTurnSummary } from '@moonshot-ai/agent-core-v2';
 import type {
   AgentEventPayloads,
   AgentHandle,
@@ -88,12 +88,14 @@ import { log } from './log';
 import {
   addTokenUsage,
   hasTokenUsage,
+  isForkableTurnOrigin,
   LODY_KIMI_METHODS,
   type TokenUsage,
   tokenUsageDelta,
   toLodyRateLimits,
   toLodySessionUsage,
   toLodyTaskLifecycle,
+  withLodyTurnId,
 } from './lody-extension';
 import { projectModelCatalog } from './model-catalog';
 import { ACP_MODES, type AcpModeId, acpModeToToggles, DEFAULT_MODE_ID } from './modes';
@@ -244,6 +246,20 @@ export class AcpSession {
   /** Subagent (`kind: 'agent'`) tasks started here that have not terminated. */
   private readonly activeSubagentTasks = new Set<string>();
   /**
+   * Engine turn id → the fork turn index that turn can be forked at. The
+   * engine addresses forks by position among user-visible turns, so this is
+   * the id published to the client (`_meta.lody.turnId`) and the value it
+   * sends back in `session/fork`.
+   */
+  private readonly forkTurnIndexByTurn = new Map<number, number>();
+  /**
+   * Index the next user-visible turn will take, anchored at activation from
+   * the engine's own record-level count. Undefined when that read failed —
+   * publishing a guessed position would fork the wrong turn, so we publish
+   * nothing instead.
+   */
+  private nextForkTurnIndex: number | undefined;
+  /**
    * Set when the last subagent task terminated and the engine still owes its
    * wake turn. Blocks settlement across that gap so the result lands inside
    * the prompt that started the work; {@link WAKE_TURN_GRACE_MS} bounds it.
@@ -362,6 +378,7 @@ export class AcpSession {
       }),
       events.on('turn.started', (event) => {
         this.runningTurns.add(event.turnId);
+        this.assignForkTurnIndex(event);
         // The awaited wake turn arrived: `runningTurns` now holds settlement.
         this.clearWakeTurnGrace();
       }),
@@ -442,6 +459,7 @@ export class AcpSession {
     // Awaited: the post-`session/new` `available_commands_update` must already
     // carry the skills (see `activateSession`).
     await this.refreshSkills();
+    await this.anchorForkTurnIndex();
     try {
       await this.captureDetailedUsage(false);
     } catch (error) {
@@ -505,7 +523,18 @@ export class AcpSession {
       });
       return;
     }
-    const updates = projectHistoryToSessionUpdates(this.sessionId, messages);
+    // Replayed turns carry their fork positions too: a client that reloads a
+    // session must still be able to branch at an older turn.
+    let forkTurns: readonly ForkTurnSummary[] = [];
+    try {
+      forkTurns = await this.session.forkTurns();
+    } catch (error) {
+      log.warn('acp: replayHistory could not read fork turn positions', {
+        sessionId: this.sessionId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+    const updates = projectHistoryToSessionUpdates(this.sessionId, messages, forkTurns);
     for (const update of updates) {
       try {
         await this.conn.sessionUpdate(update);
@@ -825,12 +854,51 @@ export class AcpSession {
     return driver;
   }
 
+  /**
+   * Read the engine's current fork turn count so published positions line up
+   * with the records `fork({ turnIndex })` slices. A rendered history cannot
+   * supply this: compaction drops messages from context while the records
+   * defining those positions stay.
+   */
+  private async anchorForkTurnIndex(): Promise<void> {
+    try {
+      this.nextForkTurnIndex = (await this.session.forkTurns()).length;
+    } catch (error) {
+      this.nextForkTurnIndex = undefined;
+      log.warn('acp: fork turn positions unavailable; fork-at-turn will be inert', {
+        sessionId: this.sessionId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  /**
+   * Claim this turn's fork position. Only turns the engine counts as
+   * user-visible take an index — a wake turn or a cron fire is not a fork
+   * boundary, and consuming an index for one would shift every later turn.
+   */
+  private assignForkTurnIndex(event: AgentEventPayloads['turn.started']): void {
+    if (this.nextForkTurnIndex === undefined) return;
+    if (!isForkableTurnOrigin(event.origin)) return;
+    this.forkTurnIndexByTurn.set(event.turnId, this.nextForkTurnIndex);
+    this.nextForkTurnIndex += 1;
+  }
+
+  /** Emit a turn's update, carrying its fork position when it has one. */
+  private emitForTurn(turnId: number, notification: SessionNotification | null): void {
+    if (notification === null) return;
+    const forkTurnIndex = this.forkTurnIndexByTurn.get(turnId);
+    this.emit(
+      forkTurnIndex === undefined ? notification : withLodyTurnId(notification, forkTurnIndex),
+    );
+  }
+
   private onAssistantDelta(event: AgentEventPayloads['assistant.delta']): void {
-    this.emit(assistantDeltaToSessionUpdate(this.sessionId, event));
+    this.emitForTurn(event.turnId, assistantDeltaToSessionUpdate(this.sessionId, event));
   }
 
   private onThinkingDelta(event: AgentEventPayloads['thinking.delta']): void {
-    this.emit(thinkingDeltaToSessionUpdate(this.sessionId, event));
+    this.emitForTurn(event.turnId, thinkingDeltaToSessionUpdate(this.sessionId, event));
   }
 
   private onToolCallStarted(event: AgentEventPayloads['tool.call.started']): void {
@@ -862,13 +930,15 @@ export class AcpSession {
     const streamArgs = { args: stringifyArgs(mapped.args) };
     const lazyCreated = this.toolCallStreamArgs.has(key);
     this.toolCallStreamArgs.set(key, streamArgs);
-    this.emit(
+    this.emitForTurn(
+      event.turnId,
       lazyCreated
         ? toolCallStartedUpgradeToSessionUpdate(this.sessionId, mapped)
         : toolCallStartToSessionUpdate(this.sessionId, mapped),
     );
     if (event.display !== undefined) {
-      this.emit(
+      this.emitForTurn(
+        event.turnId,
         planFromDisplayBlock(this.sessionId, event.turnId, event.display as ToolInputDisplay),
       );
     }
@@ -887,19 +957,22 @@ export class AcpSession {
       // — clients otherwise surface "Tool call not found" until the start
       // eventually lands.
       this.toolCallStreamArgs.set(key, { args: event.argumentsPart ?? '' });
-      this.emit(toolCallLazyCreateToSessionUpdate(this.sessionId, mapped));
+      this.emitForTurn(event.turnId, toolCallLazyCreateToSessionUpdate(this.sessionId, mapped));
       return;
     }
     // Subsequent delta — the helper accumulates the fragment and emits an
     // update with the cumulative args text (REPLACE-content semantics).
-    this.emit(toolCallDeltaToSessionUpdate(this.sessionId, mapped, acc));
+    this.emitForTurn(event.turnId, toolCallDeltaToSessionUpdate(this.sessionId, mapped, acc));
   }
 
   private onToolProgress(event: AgentEventPayloads['tool.progress']): void {
     // The klient payload mirrors `ToolProgressEvent` field-for-field; the
     // helper forwards only `status` updates with text (as a title refresh)
     // and returns null for everything else, which `emit` drops.
-    this.emit(toolProgressToSessionUpdate(this.sessionId, event as unknown as ToolProgressEvent));
+    this.emitForTurn(
+      event.turnId,
+      toolProgressToSessionUpdate(this.sessionId, event as unknown as ToolProgressEvent),
+    );
   }
 
   private onToolResult(event: AgentEventPayloads['tool.result']): void {
@@ -915,7 +988,7 @@ export class AcpSession {
       // the terminal pane, so the card gets the terminal embed instead of a
       // textual copy. The full output still reached the model (and the
       // persisted wire record) untouched.
-      this.emit({
+      this.emitForTurn(event.turnId, {
         sessionId: this.sessionId,
         update: {
           sessionUpdate: 'tool_call_update',
@@ -927,7 +1000,8 @@ export class AcpSession {
       });
       return;
     }
-    this.emit(
+    this.emitForTurn(
+      event.turnId,
       toolResultToSessionUpdate(this.sessionId, event as unknown as ToolResultEvent, locations),
     );
   }

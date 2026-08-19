@@ -1,3 +1,4 @@
+import type { SessionNotification } from '@agentclientprotocol/sdk';
 import type { AgentTaskInfo, ManagedUsageResult, UsageStatus } from '@moonshot-ai/klient';
 
 export const LODY_KIMI_EXTENSION = {
@@ -9,6 +10,72 @@ export const LODY_KIMI_EXTENSION = {
     subagentManagement: true,
   },
 } as const;
+
+/**
+ * Lody's fork-at-turn contract: the agent declares this capability, stamps
+ * every turn-scoped `session/update` with `_meta.lody.turnId`, and accepts
+ * that same id back in `session/fork`'s `_meta.lody.forkAtTurn`. The engine
+ * addresses turns positionally, so the id we mint IS the fork turn index.
+ */
+export const LODY_FORK_AT_TURN_CAPABILITY = { version: 1 } as const;
+
+/** Read the fork position out of a `session/fork` request's `_meta`. */
+export function readLodyForkTurnIndex(meta: unknown): number | undefined {
+  const lody = asRecord(asRecord(meta)?.['lody']);
+  const forkAtTurn = asRecord(lody?.['forkAtTurn']);
+  if (forkAtTurn?.['version'] !== 1) return undefined;
+  const turnId = forkAtTurn['turnId'];
+  if (typeof turnId !== 'string') return undefined;
+  const turnIndex = Number(turnId);
+  return Number.isSafeInteger(turnIndex) && turnIndex >= 0 ? turnIndex : undefined;
+}
+
+/** Attach `_meta.lody.turnId` without disturbing any other `_meta` entry. */
+export function withLodyTurnId(
+  notification: SessionNotification,
+  forkTurnIndex: number,
+): SessionNotification {
+  const update = notification.update as typeof notification.update & {
+    _meta?: Record<string, unknown> | null;
+  };
+  const meta = update._meta ?? {};
+  const lody = asRecord(meta['lody']) ?? {};
+  return {
+    ...notification,
+    update: {
+      ...update,
+      _meta: { ...meta, lody: { ...lody, turnId: String(forkTurnIndex) } },
+    },
+  };
+}
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
+}
+
+/**
+ * Whether a turn's origin makes it a fork boundary. Mirrors the engine's
+ * `isUserVisibleTurnRecord`: those are the turns `fork({ turnIndex })` counts,
+ * so anything the engine skips must not consume an index here either.
+ */
+export function isForkableTurnOrigin(origin: unknown): boolean {
+  const record = asRecord(origin);
+  const kind = record?.['kind'];
+  switch (kind) {
+    case undefined:
+    case 'user':
+      return true;
+    case 'skill_activation':
+    case 'plugin_command':
+      return record?.['trigger'] === 'user-slash';
+    case 'shell_command':
+      return record?.['phase'] === 'input';
+    default:
+      return false;
+  }
+}
 
 export const LODY_KIMI_METHODS = {
   usageUpdate: '_acp_ext:session_usage_update',

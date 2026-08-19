@@ -5,6 +5,7 @@ import type {
   CreateChildSessionOptions,
   CreateSessionOptions,
   ForkSessionOptions,
+  ForkTurnSummary,
   ResumeSessionOptions,
   SessionArchivedEvent,
   SessionClosedEvent,
@@ -44,6 +45,7 @@ export interface ISessionManager {
   archive(sessionId: string): Promise<void>;
   restore(sessionId: string, options?: ResumeSessionOptions): Promise<ISessionScopeHandle | undefined>;
   delete(sessionId: string): Promise<void>;
+  listForkTurns(sourceSessionId: string): Promise<ForkTurnSummary[]>;
   fork(options: ForkSessionOptions): Promise<ISessionScopeHandle>;
   createChild(options: CreateChildSessionOptions): Promise<ISessionScopeHandle>;
 }

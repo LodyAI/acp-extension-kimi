@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   hasTokenUsage,
+  readLodyForkTurnIndex,
   tokenUsageDelta,
   toLodyRateLimits,
   toLodySessionUsage,
@@ -121,5 +122,31 @@ describe('Lody ACP extension projections', () => {
         summary: 'Done',
       },
     });
+  });
+});
+
+describe('fork-at-turn request parsing', () => {
+  it('reads the published position back out of a fork request', () => {
+    expect(readLodyForkTurnIndex({ lody: { forkAtTurn: { version: 1, turnId: '3' } } })).toBe(3);
+    expect(readLodyForkTurnIndex({ lody: { forkAtTurn: { version: 1, turnId: '0' } } })).toBe(0);
+  });
+
+  it('ignores anything it did not mint, so the fork keeps the whole session', () => {
+    // A guessed position would branch the wrong turn; only an exact, current
+    // contract counts.
+    expect(readLodyForkTurnIndex(undefined)).toBeUndefined();
+    expect(readLodyForkTurnIndex({ lody: {} })).toBeUndefined();
+    expect(
+      readLodyForkTurnIndex({ lody: { forkAtTurn: { version: 2, turnId: '3' } } }),
+    ).toBeUndefined();
+    expect(
+      readLodyForkTurnIndex({ lody: { forkAtTurn: { version: 1, turnId: 'turn_abc' } } }),
+    ).toBeUndefined();
+    expect(
+      readLodyForkTurnIndex({ lody: { forkAtTurn: { version: 1, turnId: '-1' } } }),
+    ).toBeUndefined();
+    expect(
+      readLodyForkTurnIndex({ lody: { forkAtTurn: { version: 1, turnId: 3 } } }),
+    ).toBeUndefined();
   });
 });
