@@ -30,6 +30,8 @@ import type {
   ToolCallLocation,
 } from '@agentclientprotocol/sdk';
 import { RequestError } from '@agentclientprotocol/sdk';
+import { randomUUID } from 'node:crypto';
+import { LODY_EXTENSION_METHODS, type LodyActivityMeta } from 'acp-extension-core';
 import {
   type ContextMessage,
   type ForkTurnSummary,
@@ -92,7 +94,7 @@ import { log } from './log';
 import {
   addTokenUsage,
   hasTokenUsage,
-  LODY_KIMI_METHODS,
+  type SubagentTaskInfo,
   type TokenUsage,
   tokenUsageDelta,
   toLodyRateLimits,
@@ -314,6 +316,8 @@ export class AcpSession {
   private readonly lodyUsageBaselines = new Map<string, TokenUsage>();
   /** Cumulative usage attributable only to this ACP activation. */
   private readonly lodyUsageSinceActivation = new Map<string, TokenUsage>();
+  /** Compaction tool-call correlation for the current background compaction. */
+  private activeCompaction: { readonly id: string; readonly automatic: boolean } | undefined;
   /** Bridges engine approval / ask-user requests to the ACP client. */
   private readonly interactionBridge: AcpInteractionBridge;
 
@@ -422,12 +426,10 @@ export class AcpSession {
         this.onCompactionCompleted(event);
       }),
       events.on('compaction.cancelled', () => {
-        this.emitLocalChunk('Compaction cancelled.');
+        this.finishCompaction('Compaction cancelled');
       }),
       events.on('compaction.blocked', () => {
-        this.emitLocalChunk(
-          'Compaction is blocked by the current turn; retry when the turn is idle.',
-        );
+        this.finishCompaction('Compaction is blocked by the current turn');
       }),
     );
     // Session-scope stream: title changes surface as `session_info_update`.
@@ -1032,33 +1034,73 @@ export class AcpSession {
     }
   }
 
-  /**
-   * Report an auto-triggered compaction start. A manual `/compact` is already
-   * acknowledged by the builtin command's reply chunk, so echoing its
-   * `compaction.started` event too would double-report; an auto-triggered
-   * compaction has no other client-visible signal.
-   */
+  /** Represent compaction through the standard ACP tool-call lifecycle. */
   private onCompactionStarted(event: AgentEventPayloads['compaction.started']): void {
-    if (event.trigger !== 'auto') return;
-    this.emitLocalChunk(
-      event.instruction === undefined
-        ? 'Compacting conversation context…'
-        : `Compacting conversation context with instruction: ${event.instruction}`,
-    );
-  }
-
-  /** Report the compaction result (token/message summary). */
-  private onCompactionCompleted(event: AgentEventPayloads['compaction.completed']): void {
-    this.emitLocalChunk(formatCompactionCompleted(event.result));
-  }
-
-  /** Push one local `agent_message_chunk` (best-effort, never throws). */
-  private emitLocalChunk(text: string): void {
+    const id = `context-compaction:${randomUUID()}`;
+    const automatic = event.trigger === 'auto';
+    this.activeCompaction = { id, automatic };
+    const activity: LodyActivityMeta = {
+      version: 1,
+      kind: 'context_compaction',
+      automatic,
+    };
     this.emit({
       sessionId: this.sessionId,
       update: {
-        sessionUpdate: 'agent_message_chunk',
-        content: { type: 'text', text },
+        sessionUpdate: 'tool_call',
+        toolCallId: id,
+        title: 'Compacting context',
+        kind: 'think',
+        status: 'in_progress',
+        _meta: { lody: { activity } },
+      },
+    });
+  }
+
+  /** Report the compaction token result on the same tool call. */
+  private onCompactionCompleted(event: AgentEventPayloads['compaction.completed']): void {
+    const active = this.activeCompaction;
+    const id = active?.id ?? `context-compaction:${randomUUID()}`;
+    this.activeCompaction = undefined;
+    const activity: LodyActivityMeta = {
+      version: 1,
+      kind: 'context_compaction',
+      automatic: active?.automatic ?? true,
+      usedTokensBefore: event.result.tokensBefore,
+      usedTokensAfter: event.result.tokensAfter,
+    };
+    this.emit({
+      sessionId: this.sessionId,
+      update: {
+        sessionUpdate: active === undefined ? 'tool_call' : 'tool_call_update',
+        toolCallId: id,
+        title: 'Context compacted',
+        ...(active === undefined ? { kind: 'think' as const } : {}),
+        status: 'completed',
+        _meta: { lody: { activity } },
+      },
+    });
+  }
+
+  private finishCompaction(failureReason: string): void {
+    const active = this.activeCompaction;
+    const id = active?.id ?? `context-compaction:${randomUUID()}`;
+    this.activeCompaction = undefined;
+    const activity: LodyActivityMeta = {
+      version: 1,
+      kind: 'context_compaction',
+      automatic: active?.automatic ?? false,
+      failureReason,
+    };
+    this.emit({
+      sessionId: this.sessionId,
+      update: {
+        sessionUpdate: active === undefined ? 'tool_call' : 'tool_call_update',
+        toolCallId: id,
+        title: failureReason,
+        ...(active === undefined ? { kind: 'think' as const } : {}),
+        status: 'failed',
+        _meta: { lody: { activity } },
       },
     });
   }
@@ -1132,8 +1174,10 @@ export class AcpSession {
   }
 
   /** Provider-neutral task snapshot used by Lody's subagent management UI. */
-  async listSubagents(activeOnly = false): Promise<readonly AgentTaskInfo[]> {
-    return (await this.agent.getTasks({ activeOnly })).filter((task) => task.kind === 'agent');
+  async listSubagents(activeOnly = false): Promise<readonly SubagentTaskInfo[]> {
+    return (await this.agent.getTasks({ activeOnly })).filter(
+      (task): task is SubagentTaskInfo => task.kind === 'agent',
+    );
   }
 
   async cancelSubagent(taskId: string, reason?: string): Promise<void> {
@@ -1158,8 +1202,7 @@ export class AcpSession {
       }
     }
     const params = toLodyTaskLifecycle(this.sessionId, event, task, output);
-    if (params === null) return;
-    await this.emitExtension(LODY_KIMI_METHODS.taskLifecycle, params);
+    await this.conn.sessionUpdate(params);
   }
 
   private async emitDetailedUsageUpdate(): Promise<void> {
@@ -1169,11 +1212,12 @@ export class AcpSession {
         (item) => item.model === this.currentModelId,
       )?.max_context_size;
       const update = toLodySessionUsage(
+        this.sessionId,
         Object.fromEntries(this.lodyUsageSinceActivation),
         contextWindow,
       );
       if (update !== null) {
-        await this.emitExtension(LODY_KIMI_METHODS.usageUpdate, { ...update });
+        await this.emitExtension(LODY_EXTENSION_METHODS.sessionUsageUpdate, { ...update });
       }
     } catch (error) {
       log.warn('acp: failed to push Lody token usage', {
@@ -1226,7 +1270,10 @@ export class AcpSession {
   private async emitManagedUsage(): Promise<void> {
     try {
       const usage = await this.klient.global.auth.managedUsage();
-      await this.emitExtension(LODY_KIMI_METHODS.rateLimits, toLodyRateLimits(usage));
+      await this.emitExtension(
+        LODY_EXTENSION_METHODS.rateLimitsUpdate,
+        toLodyRateLimits(usage) as unknown as Record<string, unknown>,
+      );
     } catch (error) {
       log.warn('acp: failed to push Lody managed usage', {
         sessionId: this.sessionId,
@@ -1480,21 +1527,4 @@ export class AcpSession {
       });
     }
   }
-}
-
-/**
- * Render the client-facing summary of a finished compaction (mirrors the
- * legacy adapter's wording).
- */
-function formatCompactionCompleted(result: {
-  readonly compactedCount: number;
-  readonly tokensBefore: number;
-  readonly tokensAfter: number;
-}): string {
-  return [
-    'Compaction completed.',
-    `- Messages compacted: ${result.compactedCount.toLocaleString('en-US')}`,
-    `- Tokens before: ${result.tokensBefore.toLocaleString('en-US')}`,
-    `- Tokens after: ${result.tokensAfter.toLocaleString('en-US')}`,
-  ].join('\n');
 }

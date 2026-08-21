@@ -242,7 +242,7 @@ describe('background subagent work and the client prompt', () => {
     expect(toolCall).toMatchObject({
       title: 'Scheduling cron */5 * * * *',
       rawInput: { cron: '*/5 * * * *' },
-      _meta: { toolName: 'CronCreate' },
+      _meta: { lody: { toolName: 'CronCreate' } },
     });
   });
 

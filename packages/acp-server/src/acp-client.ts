@@ -36,7 +36,7 @@ import type { IAcpFsClient, IAcpTerminalClient, IAcpTerminalHandle } from './acp
 export interface AcpClient extends IAcpFsClient, IAcpTerminalClient {
   /** Send a `session/update` notification to the client. */
   sessionUpdate(params: SessionNotification): Promise<void>;
-  /** Reverse-RPC `session/request_permission` (approval / ask-user bridge). */
+  /** Reverse-RPC `session/request_permission` (approval bridge). */
   requestPermission(params: RequestPermissionRequest): Promise<RequestPermissionResponse>;
   /** Reverse-RPC `elicitation/create` (ask-user bridge for form-capable clients). */
   createElicitation(params: CreateElicitationRequest): Promise<CreateElicitationResponse>;

@@ -1,7 +1,7 @@
 export type { Implementation } from '@agentclientprotocol/sdk';
 
 export { AcpServer, createAcpAgentApp } from './server';
-export { LODY_KIMI_EXTENSION, LODY_KIMI_METHODS } from './lody-extension';
+export { LODY_EXTENSION_CAPABILITIES } from './lody-extension';
 export type {
   AcpServerOptions,
   SetSessionModelParams,
@@ -82,8 +82,6 @@ export {
 } from './approval';
 export {
   elicitationResponseToQuestionAnswers,
-  outcomeToQuestionAnswer,
-  questionItemToPermissionOptions,
   questionRequestToElicitationParams,
 } from './question';
 export { projectHistoryToSessionUpdates } from './replay';

@@ -1,15 +1,22 @@
 import type { SessionNotification } from '@agentclientprotocol/sdk';
 import type { AgentTaskInfo, ManagedUsageResult, UsageStatus } from '@moonshot-ai/klient';
+import type {
+  LodyExtensionCapabilities,
+  LodySubagentTask,
+  LodyTaskMeta,
+  ModelUsage,
+  RateLimitsSnapshot,
+  SessionUsageUpdate,
+} from 'acp-extension-core';
 
-export const LODY_KIMI_EXTENSION = {
-  protocolVersion: 1,
-  features: {
-    managedUsage: true,
-    tokenUsage: true,
-    subagentLifecycle: true,
-    subagentManagement: true,
-  },
-} as const;
+export const LODY_EXTENSION_CAPABILITIES = {
+  usage: { version: 1 },
+  rateLimits: { version: 1, query: true },
+  forkAtTurn: { version: 1 },
+  tasks: { version: 1, background: true },
+  subagents: { version: 1, lifecycle: true, list: true, cancel: true, output: true },
+  compaction: { version: 1 },
+} as const satisfies LodyExtensionCapabilities;
 
 /**
  * Lody's fork-at-turn contract: the agent declares this capability, stamps
@@ -17,8 +24,6 @@ export const LODY_KIMI_EXTENSION = {
  * that same id back in `session/fork`'s `_meta.lody.forkAtTurn`. The engine
  * addresses turns positionally, so the id we mint IS the fork turn index.
  */
-export const LODY_FORK_AT_TURN_CAPABILITY = { version: 1 } as const;
-
 /** Read the fork position out of a `session/fork` request's `_meta`. */
 export function readLodyForkTurnIndex(meta: unknown): number | undefined {
   const lody = asRecord(asRecord(meta)?.['lody']);
@@ -58,31 +63,8 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
     : undefined;
 }
 
-
-
-export const LODY_KIMI_METHODS = {
-  usageUpdate: '_acp_ext:session_usage_update',
-  rateLimits: '_acp_ext:session_rate_limits',
-  taskLifecycle: '_kimi/taskLifecycle',
-  subagentsList: '_kimi/subagents/list',
-  subagentsCancel: '_kimi/subagents/cancel',
-  subagentsOutput: '_kimi/subagents/output',
-} as const;
-
 export type TokenUsage = NonNullable<UsageStatus['total']>;
-
-export interface LodySessionUsageUpdate {
-  readonly usage: LodyModelUsage;
-  readonly modelUsage?: Readonly<Record<string, LodyModelUsage>>;
-}
-
-interface LodyModelUsage {
-  readonly inputTokens: number;
-  readonly outputTokens: number;
-  readonly cacheReadInputTokens: number;
-  readonly cacheCreationInputTokens: number;
-  readonly contextWindow?: number;
-}
+export type SubagentTaskInfo = Extract<AgentTaskInfo, { kind: 'agent' }>;
 
 export function addTokenUsage(left: TokenUsage | undefined, right: TokenUsage): TokenUsage {
   if (left === undefined) return { ...right };
@@ -112,96 +94,123 @@ export function hasTokenUsage(usage: TokenUsage): boolean {
   );
 }
 
-export function toLodyModelUsage(usage: TokenUsage, contextWindow?: number): LodyModelUsage {
+export function toLodyModelUsage(usage: TokenUsage, contextWindow?: number): ModelUsage {
   return {
     inputTokens: usage.inputOther,
     outputTokens: usage.output,
     cacheReadInputTokens: usage.inputCacheRead,
     cacheCreationInputTokens: usage.inputCacheCreation,
-    contextWindow,
+    ...(contextWindow === undefined ? {} : { contextWindow }),
   };
 }
 
 export function toLodySessionUsage(
+  sessionId: string,
   byModel: Readonly<Record<string, TokenUsage>>,
   contextWindow?: number,
-): LodySessionUsageUpdate | null {
+): SessionUsageUpdate | null {
   let total: TokenUsage | undefined;
-  const modelUsage: Record<string, LodyModelUsage> = {};
+  const modelUsage: Record<string, ModelUsage> = {};
   for (const [model, usage] of Object.entries(byModel)) {
     total = addTokenUsage(total, usage);
     modelUsage[model] = toLodyModelUsage(usage, contextWindow);
   }
   if (total === undefined) return null;
   return {
+    sessionId,
     usage: toLodyModelUsage(total, contextWindow),
     modelUsage,
   };
 }
 
-export function toLodyRateLimits(result: ManagedUsageResult): Record<string, unknown> {
+export function toLodyRateLimits(
+  result: ManagedUsageResult,
+  now = Date.now(),
+): RateLimitsSnapshot {
   if (result.kind === 'error') {
     return {
-      schemaVersion: 2,
-      planName: 'Kimi Code',
-      limitId: 'kimi',
-      fiveHour: null,
-      sevenDay: null,
-      fiveHourResetAt: null,
-      sevenDayResetAt: null,
-      apiUnavailable: true,
+      rateLimits: [],
+      fetchedAtEpochSeconds: Math.floor(now / 1_000),
     };
   }
 
   const rows = [...(result.summary === null ? [] : [result.summary]), ...result.limits];
   const windows = rows.map((row) => ({
     usedPercent: row.limit <= 0 ? 0 : Math.min(100, Math.max(0, (row.used / row.limit) * 100)),
-    windowDurationMins: durationMinutes(row.window),
-    resetsAt: resetEpochSeconds(row.resetAt),
+    windowDurationSeconds: durationSeconds(row.window),
+    resetsAtEpochSeconds: resetEpochSeconds(row.resetAt),
   }));
-  const fiveHour = windows.find((window) => window.windowDurationMins === 300);
-  const weekly = windows.find((window) => window.windowDurationMins === 7 * 24 * 60);
 
   return {
-    schemaVersion: 2,
-    planName: 'Kimi Code',
-    limitId: 'kimi',
-    windows,
-    fiveHour: fiveHour?.usedPercent ?? null,
-    sevenDay: weekly?.usedPercent ?? null,
-    fiveHourResetAt: fiveHour?.resetsAt ?? null,
-    sevenDayResetAt: weekly?.resetsAt ?? null,
-    extraUsage: result.extraUsage,
+    rateLimits: [
+      {
+        limitId: 'kimi',
+        scope: { providerId: 'kimi' },
+        planName: 'Kimi Code',
+        windows,
+        wallet: result.extraUsage,
+      },
+    ],
+    fetchedAtEpochSeconds: Math.floor(now / 1_000),
   };
 }
 
 export function toLodyTaskLifecycle(
   sessionId: string,
   event: 'started' | 'terminated',
-  task: AgentTaskInfo,
+  task: SubagentTaskInfo,
   output?: string,
-): Record<string, unknown> | null {
-  if (task.kind !== 'agent') return null;
+): SessionNotification {
   const terminal = event === 'terminated';
+  const status = terminal ? taskStatus(task.status) : 'in_progress';
+  const description = bounded(task.description, 2_000);
+  const summary = terminal ? bounded(output ?? task.stopReason, 2_000) : undefined;
+  const taskMeta: LodyTaskMeta = {
+    version: 1,
+    taskId: task.taskId,
+    kind: 'subagent',
+    status,
+    ...(description === undefined ? {} : { description }),
+    actor: task.subagentType === undefined ? 'Kimi subagent' : `Kimi ${task.subagentType}`,
+    ...(task.model === undefined ? {} : { modelId: task.model }),
+    startedAtEpochSeconds: Math.floor(task.startedAt / 1_000),
+    ...(task.endedAt === null
+      ? {}
+      : { endedAtEpochSeconds: Math.floor(task.endedAt / 1_000) }),
+    ...(summary === undefined ? {} : { summary }),
+    ...(terminal && task.status !== 'completed' && task.stopReason
+      ? { error: task.stopReason }
+      : {}),
+  };
   return {
     sessionId,
-    acpSessionId: sessionId,
-    message: {
-      type: 'system',
-      subtype: terminal ? 'task_notification' : 'task_started',
-      task_id: task.taskId,
-      description: task.description,
-      subagent_type:
-        task.subagentType === undefined ? 'Kimi subagent' : `Kimi ${task.subagentType}`,
-      task_type: 'subagent',
-      status: terminal ? taskStatus(task.status) : undefined,
-      summary: terminal ? bounded(output ?? task.stopReason, 2_000) : undefined,
-      error: terminal && task.status !== 'completed' ? task.stopReason : undefined,
+    update: {
+      sessionUpdate: terminal ? 'tool_call_update' : 'tool_call',
+      toolCallId: `task:${task.taskId}`,
+      title: task.description,
+      kind: 'think',
+      status,
+      _meta: { lody: { task: taskMeta } },
     },
   };
 }
 
-function taskStatus(status: AgentTaskInfo['status']): string {
+export function toLodySubagentTask(task: SubagentTaskInfo): LodySubagentTask {
+  return {
+    taskId: task.taskId,
+    description: task.description,
+    status: task.status,
+    ...(task.agentId === undefined ? {} : { agentId: task.agentId }),
+    ...(task.subagentType === undefined ? {} : { subagentType: task.subagentType }),
+    ...(task.model === undefined ? {} : { modelId: task.model }),
+    ...(task.thinkingEffort === undefined ? {} : { thinkingEffort: task.thinkingEffort }),
+    startedAtEpochSeconds: Math.floor(task.startedAt / 1_000),
+    endedAtEpochSeconds: task.endedAt === null ? null : Math.floor(task.endedAt / 1_000),
+    ...(task.stopReason === undefined ? {} : { stopReason: task.stopReason }),
+  };
+}
+
+function taskStatus(status: AgentTaskInfo['status']): LodyTaskMeta['status'] {
   return status === 'completed' ? 'completed' : 'failed';
 }
 
@@ -216,7 +225,7 @@ function bounded(value: string | undefined, max: number): string | undefined {
   return normalized.length <= max ? normalized : `${normalized.slice(0, max - 3)}...`;
 }
 
-function durationMinutes(
+function durationSeconds(
   window:
     | { readonly duration: number; readonly unit: 'minute' | 'hour' | 'day' | 'week' }
     | undefined,
@@ -224,13 +233,13 @@ function durationMinutes(
   if (window === undefined) return null;
   switch (window.unit) {
     case 'minute':
-      return window.duration;
-    case 'hour':
       return window.duration * 60;
+    case 'hour':
+      return window.duration * 60 * 60;
     case 'day':
-      return window.duration * 24 * 60;
+      return window.duration * 24 * 60 * 60;
     case 'week':
-      return window.duration * 7 * 24 * 60;
+      return window.duration * 7 * 24 * 60 * 60;
   }
 }
 

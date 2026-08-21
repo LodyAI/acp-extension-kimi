@@ -1,7 +1,6 @@
 /**
  * ACP interaction bridge — forwards the engine's blocking human-in-the-loop
- * requests (approval + ask-user) to the ACP client via
- * `session/request_permission`, and relays the client's decision back to the
+ * requests to ACP permission and elicitation primitives, and relays the client's decision back to the
  * `interaction` kernel.
  *
  * The engine's `AgentPermissionGate` and `AskUserQuestionTool` park requests on
@@ -9,7 +8,7 @@
  * bridge is a pure edge observer driven entirely by the klient facade: it
  * subscribes to the session's `interactions.changed` event (which pushes the
  * full pending set on every change), and for every newly-pending `approval` /
- * `question` interaction it calls `conn.requestPermission(...)`, maps the
+ * `question` interaction it calls ACP form elicitation, maps the
  * response through the pure mappers in `./approval` / `./question`, and
  * settles the parked request via `session.interactions.respond(id, ...)`.
  */
@@ -35,8 +34,6 @@ import { acpToolCallId } from './events-map';
 import { log } from './log';
 import {
   elicitationResponseToQuestionAnswers,
-  outcomeToQuestionAnswer,
-  questionItemToPermissionOptions,
   questionRequestToElicitationParams,
 } from './question';
 
@@ -52,9 +49,7 @@ export class AcpInteractionBridge {
     private readonly sessionId: string,
     /**
      * Whether the client advertised `elicitation.form` at `initialize`. When
-     * true, ask-user questions go through `elicitation/create` (native
-     * multi-question + multi-select); otherwise they degrade to the
-     * `request_permission` single-select bridge.
+     * true, ask-user questions go through `elicitation/create`.
      */
     private readonly elicitationForm = false,
   ) {
@@ -162,19 +157,8 @@ export class AcpInteractionBridge {
 
   /**
    * Bridge an engine {@link QuestionRequest} (the AskUserQuestion tool) to the
-   * client. Form-capable clients get the full question set through
-   * `elicitation/create` (native multi-question + multi-select); everyone
-   * else falls back to the `session/request_permission` surface approvals
-   * use, with its degradation rules:
-   *  - `questions.length > 1` → only the first question is asked (logged).
-   *  - `multiSelect === true` → still asked as single-select; the engine's
-   *    ask-user tool tolerates a single-key answer for a multi-select prompt.
-   *
-   * An `elicitation/create` RPC failure (e.g. a client that advertises the
-   * capability but rejects the method) falls back to the permission bridge
-   * for the same request. Any failure of the final attempt resolves with
-   * `null` so the tool takes its canonical "user dismissed" branch —
-   * strictly safer than fabricating an answer.
+   * client through ACP form elicitation. A client without that standard
+   * capability cannot service AskUserQuestion and the tool is dismissed.
    */
   private async handleQuestion(req: QuestionRequest): Promise<QuestionAnswers | null> {
     const questions = req.questions;
@@ -187,41 +171,14 @@ export class AcpInteractionBridge {
     const rawToolCallId = req.toolCallId ?? 'ask-user';
     const toolCallId =
       req.turnId !== undefined ? acpToolCallId(req.turnId, rawToolCallId) : rawToolCallId;
-    if (this.elicitationForm) {
-      try {
-        const response = await this.conn.createElicitation(
-          questionRequestToElicitationParams(questions, this.sessionId, toolCallId),
-        );
-        return elicitationResponseToQuestionAnswers(questions, response);
-      } catch (error) {
-        log.warn('acp: elicitation/create failed; falling back to request_permission', {
-          sessionId: this.sessionId,
-          toolCallId: req.toolCallId,
-          error: error instanceof Error ? error.message : String(error),
-        });
-      }
-    }
-    if (questions.length > 1) {
-      log.warn('acp: handleQuestion degrading to first question only', {
-        sessionId: this.sessionId,
-        dropped: questions.length - 1,
-      });
-    }
-    const q = questions[0]!;
-    const options = questionItemToPermissionOptions(q, 0);
+    if (!this.elicitationForm) return null;
     try {
-      const response = await this.conn.requestPermission({
-        sessionId: this.sessionId,
-        options: [...options],
-        toolCall: {
-          toolCallId,
-          title: 'AskUserQuestion',
-          content: [{ type: 'content', content: { type: 'text', text: q.question } }],
-        },
-      });
-      return outcomeToQuestionAnswer(q, response);
+      const response = await this.conn.createElicitation(
+        questionRequestToElicitationParams(questions, this.sessionId, toolCallId),
+      );
+      return elicitationResponseToQuestionAnswers(questions, response);
     } catch (error) {
-      log.warn('acp: requestPermission (question) failed; dismissing', {
+      log.warn('acp: elicitation/create failed; dismissing question', {
         sessionId: this.sessionId,
         toolCallId: req.toolCallId,
         error: error instanceof Error ? error.message : String(error),

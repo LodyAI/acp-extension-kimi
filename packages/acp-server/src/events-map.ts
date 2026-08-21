@@ -112,8 +112,8 @@ export function acpToolCallId(turnId: number, toolCallId: string): string {
  * card that has to read the cron expression out of `rawInput`, say) need the
  * canonical name on the wire. Provider-neutral by design — no vendor prefix.
  */
-export function toolNameMeta(name: string): { readonly toolName: string } {
-  return { toolName: name };
+export function toolNameMeta(name: string): { readonly lody: { readonly toolName: string } } {
+  return { lody: { toolName: name } };
 }
 
 /**

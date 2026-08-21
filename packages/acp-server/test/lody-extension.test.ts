@@ -59,14 +59,16 @@ describe('Lody ACP extension projections', () => {
         },
       }),
     ).toMatchObject({
-      schemaVersion: 2,
-      limitId: 'kimi',
-      fiveHour: 20,
-      sevenDay: 25,
-      extraUsage: { balanceCents: 1200, currency: 'CNY' },
-      windows: [
-        { usedPercent: 25, windowDurationMins: 10080 },
-        { usedPercent: 20, windowDurationMins: 300 },
+      rateLimits: [
+        {
+          limitId: 'kimi',
+          scope: { providerId: 'kimi' },
+          wallet: { balanceCents: 1200, currency: 'CNY' },
+          windows: [
+            { usedPercent: 25, windowDurationSeconds: 604800 },
+            { usedPercent: 20, windowDurationSeconds: 18000 },
+          ],
+        },
       ],
     });
   });
@@ -74,6 +76,7 @@ describe('Lody ACP extension projections', () => {
   it('aggregates main and subagent model usage into Lody token fields', () => {
     expect(
       toLodySessionUsage(
+        'session-1',
         {
           'kimi-for-coding': {
             inputOther: 100,
@@ -91,6 +94,7 @@ describe('Lody ACP extension projections', () => {
         262_144,
       ),
     ).toMatchObject({
+      sessionId: 'session-1',
       usage: {
         inputTokens: 140,
         outputTokens: 30,
@@ -114,12 +118,21 @@ describe('Lody ACP extension projections', () => {
     };
     expect(toLodyTaskLifecycle('session-1', 'terminated', task, 'Done')).toMatchObject({
       sessionId: 'session-1',
-      message: {
-        subtype: 'task_notification',
-        task_id: 'agent-1',
-        subagent_type: 'Kimi explore',
+      update: {
+        sessionUpdate: 'tool_call_update',
+        toolCallId: 'task:agent-1',
         status: 'completed',
-        summary: 'Done',
+        _meta: {
+          lody: {
+            task: {
+              version: 1,
+              taskId: 'agent-1',
+              kind: 'subagent',
+              actor: 'Kimi explore',
+              summary: 'Done',
+            },
+          },
+        },
       },
     });
   });

@@ -9,9 +9,9 @@
  * config surface (model / mode / thinking) are
  * wired to `klient.global.sessions`, `klient.session(id)` lifecycle +
  * interactions, and the per-session main agent handle (`klient.session(id).
- * agent('main')`). Slash commands, skills, approval / question bridging
- * (`session/request_permission`), and `session/load` history replay live in
- * `./session` / `./interaction-bridge`. ACP `mcpServers` on `session/new` /
+ * agent('main')`). Slash commands, skills, approval bridging
+ * (`session/request_permission`), question elicitation, and `session/load`
+ * history replay live in `./session` / `./interaction-bridge`. ACP `mcpServers` on `session/new` /
  * `/load` / `/resume` are converted to the engine's name-keyed record (see
  * `./convert`) and injected as ephemeral per-session MCP servers. When the
  * client advertises `clientCapabilities.terminal`, Bash executions reverse-RPC
@@ -65,6 +65,11 @@ import type {
 } from '@moonshot-ai/klient';
 import { ErrorCodes, isError2 } from '@moonshot-ai/agent-core-v2';
 import { RPCError } from '@moonshot-ai/klient';
+import {
+  LODY_EXTENSION_METHODS,
+  type RateLimitsGetRequest,
+  type RateLimitsGetResponse,
+} from 'acp-extension-core';
 
 import type { AcpClient } from './acp-client';
 import type { IAcpConnection } from './acp-fs';
@@ -73,10 +78,10 @@ import { acpMcpServersToConfigRecord } from './convert';
 import { log } from './log';
 import { isAcpModeId } from './modes';
 import {
-  LODY_FORK_AT_TURN_CAPABILITY,
-  LODY_KIMI_EXTENSION,
-  LODY_KIMI_METHODS,
+  LODY_EXTENSION_CAPABILITIES,
   readLodyForkTurnIndex,
+  toLodyRateLimits,
+  toLodySubagentTask,
 } from './lody-extension';
 import { AcpSession } from './session';
 import { negotiateVersion } from './version';
@@ -228,10 +233,7 @@ export class AcpServer {
       // is not supported (dropped with a warning — see `./convert`).
       mcpCapabilities: { http: true, sse: true },
       auth: { logout: {} },
-      _meta: {
-        'lody.ai/kimi': LODY_KIMI_EXTENSION,
-        lody: { forkAtTurn: LODY_FORK_AT_TURN_CAPABILITY },
-      },
+      _meta: { lody: LODY_EXTENSION_CAPABILITIES },
     };
 
     return {
@@ -541,8 +543,14 @@ export class AcpServer {
 
   async listSubagents(params: ListSubagentsParams): Promise<Record<string, unknown>> {
     return {
-      tasks: await this.requireAcpSession(params.sessionId).listSubagents(params.activeOnly),
+      tasks: (await this.requireAcpSession(params.sessionId).listSubagents(params.activeOnly)).map(
+        toLodySubagentTask,
+      ),
     };
+  }
+
+  async getRateLimits(_params: RateLimitsGetRequest): Promise<RateLimitsGetResponse> {
+    return toLodyRateLimits(await this.klient.global.auth.managedUsage());
   }
 
   async cancelSubagent(params: CancelSubagentParams): Promise<Record<string, unknown>> {
@@ -742,8 +750,9 @@ function parseSetSessionModelParams(params: unknown): SetSessionModelParams {
 }
 
 function parseListSubagentsParams(params: unknown): ListSubagentsParams {
-  const record = asRecord(params, LODY_KIMI_METHODS.subagentsList);
-  const sessionId = requiredString(record, 'sessionId', LODY_KIMI_METHODS.subagentsList);
+  const method = LODY_EXTENSION_METHODS.subagentsList;
+  const record = asRecord(params, method);
+  const sessionId = requiredString(record, 'sessionId', method);
   const activeOnly = record['activeOnly'];
   if (activeOnly !== undefined && typeof activeOnly !== 'boolean') {
     throw RequestError.invalidParams(params, 'activeOnly must be a boolean');
@@ -751,24 +760,36 @@ function parseListSubagentsParams(params: unknown): ListSubagentsParams {
   return { sessionId, activeOnly };
 }
 
-function parseCancelSubagentParams(params: unknown): CancelSubagentParams {
-  const record = asRecord(params, LODY_KIMI_METHODS.subagentsCancel);
+function parseRateLimitsGetParams(params: unknown): RateLimitsGetRequest {
+  const method = LODY_EXTENSION_METHODS.rateLimitsGet;
+  const record = params === undefined ? {} : asRecord(params, method);
   return {
-    sessionId: requiredString(record, 'sessionId', LODY_KIMI_METHODS.subagentsCancel),
-    taskId: requiredString(record, 'taskId', LODY_KIMI_METHODS.subagentsCancel),
-    reason: optionalString(record, 'reason', LODY_KIMI_METHODS.subagentsCancel),
+    sessionId: optionalString(record, 'sessionId', method),
+    accountId: optionalString(record, 'accountId', method),
+    modelId: optionalString(record, 'modelId', method),
+  };
+}
+
+function parseCancelSubagentParams(params: unknown): CancelSubagentParams {
+  const method = LODY_EXTENSION_METHODS.subagentsCancel;
+  const record = asRecord(params, method);
+  return {
+    sessionId: requiredString(record, 'sessionId', method),
+    taskId: requiredString(record, 'taskId', method),
+    reason: optionalString(record, 'reason', method),
   };
 }
 
 function parseSubagentOutputParams(params: unknown): SubagentOutputParams {
-  const record = asRecord(params, LODY_KIMI_METHODS.subagentsOutput);
+  const method = LODY_EXTENSION_METHODS.subagentsOutput;
+  const record = asRecord(params, method);
   const tail = record['tail'];
   if (tail !== undefined && (!Number.isInteger(tail) || (tail as number) < 0)) {
     throw RequestError.invalidParams(params, 'tail must be a non-negative integer');
   }
   return {
-    sessionId: requiredString(record, 'sessionId', LODY_KIMI_METHODS.subagentsOutput),
-    taskId: requiredString(record, 'taskId', LODY_KIMI_METHODS.subagentsOutput),
+    sessionId: requiredString(record, 'sessionId', method),
+    taskId: requiredString(record, 'taskId', method),
     tail: tail as number | undefined,
   };
 }
@@ -832,13 +853,18 @@ export function createAcpAgentApp(getServer: () => AcpServer): AgentApp {
     .onRequest(SET_SESSION_MODEL_METHOD, parseSetSessionModelParams, (ctx) =>
       getServer().setSessionModel(ctx.params),
     )
-    .onRequest(LODY_KIMI_METHODS.subagentsList, parseListSubagentsParams, (ctx) =>
+    .onRequest<RateLimitsGetRequest, RateLimitsGetResponse>(
+      LODY_EXTENSION_METHODS.rateLimitsGet,
+      parseRateLimitsGetParams,
+      (ctx) => getServer().getRateLimits(ctx.params),
+    )
+    .onRequest(LODY_EXTENSION_METHODS.subagentsList, parseListSubagentsParams, (ctx) =>
       getServer().listSubagents(ctx.params),
     )
-    .onRequest(LODY_KIMI_METHODS.subagentsCancel, parseCancelSubagentParams, (ctx) =>
+    .onRequest(LODY_EXTENSION_METHODS.subagentsCancel, parseCancelSubagentParams, (ctx) =>
       getServer().cancelSubagent(ctx.params),
     )
-    .onRequest(LODY_KIMI_METHODS.subagentsOutput, parseSubagentOutputParams, (ctx) =>
+    .onRequest(LODY_EXTENSION_METHODS.subagentsOutput, parseSubagentOutputParams, (ctx) =>
       getServer().subagentOutput(ctx.params),
     );
 }
