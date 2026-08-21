@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import type {
   IHostEnvironment,
@@ -6,7 +6,7 @@ import type {
   RuntimeProviderHost,
 } from '@moonshot-ai/agent-core-v2';
 
-import type { IAcpConnection } from '../src/acp-fs/acpConnection';
+import type { IAcpConnection, IAcpTerminalHandle } from '../src/acp-fs/acpConnection';
 import { AcpHostFileSystem } from '../src/acp-fs/acpFsService';
 import { AcpRuntimeProviderFactory } from '../src/acp-terminal/acpTerminalRunner';
 
@@ -41,7 +41,10 @@ function makeEnvironment(overrides: Partial<IHostEnvironment> = {}): IHostEnviro
   } as IHostEnvironment;
 }
 
-async function bindRuntime(environment: IHostEnvironment): Promise<Runtime> {
+async function bindRuntime(
+  environment: IHostEnvironment,
+  connection: IAcpConnection = makeConnection(),
+): Promise<Runtime> {
   const runtimes: Runtime[] = [];
   const host = {
     registerRuntime: (runtime: Runtime) => {
@@ -49,7 +52,7 @@ async function bindRuntime(environment: IHostEnvironment): Promise<Runtime> {
       return { remove: async () => {} };
     },
   } as unknown as RuntimeProviderHost;
-  const factory = new AcpRuntimeProviderFactory(makeConnection(), environment);
+  const factory = new AcpRuntimeProviderFactory(connection, environment);
   await factory.attach({ id: 'w1' } as never, host);
   factory.bindSession('w1', 's1', '/repo');
   const runtime = runtimes[0];
@@ -96,5 +99,55 @@ describe('AcpSessionRuntime', () => {
     expect(runtime.path.isAbsolute('C:\\repo')).toBe(true);
     expect(runtime.path.isAbsolute('repo')).toBe(false);
     expect(runtime.path.resolve('C:\\repo', 'src')).toBe('C:\\repo\\src');
+  });
+
+  it('forwards non-Bash processes without attaching them to a Bash tool card', async () => {
+    const handle: IAcpTerminalHandle = {
+      id: 'term-rg',
+      currentOutput: vi.fn(async () => ({ output: '', truncated: false })),
+      waitForExit: vi.fn(
+        () =>
+          new Promise<{ readonly exitCode?: number | null; readonly signal?: string | null }>(
+            () => {},
+          ),
+      ),
+      kill: vi.fn(async () => {}),
+      release: vi.fn(async () => {}),
+    };
+    const createTerminal = vi.fn(async () => handle);
+    const notifyTerminalCreated = vi.fn();
+    const connection: IAcpConnection = {
+      ...makeConnection(),
+      get: () => ({ createTerminal }) as never,
+      notifyTerminalCreated,
+    };
+    const runtime = await bindRuntime(
+      makeEnvironment({
+        osKind: 'Windows',
+        shellPath: 'C:\\Users\\test\\scoop\\apps\\git\\current\\bin\\bash.exe',
+        pathClass: 'win32',
+      }),
+      connection,
+    );
+    const rgPath = 'C:\\Users\\test\\AppData\\Local\\kimi\\rg.exe';
+
+    const process = await runtime.process!.spawn(rgPath, ['-c', 'printf should-not-attach'], {
+      cwd: 'C:\\repo',
+      env: { NO_COLOR: '1', TERM: 'dumb' },
+    });
+
+    expect(createTerminal).toHaveBeenCalledWith({
+      sessionId: 's1',
+      command: rgPath,
+      args: ['-c', 'printf should-not-attach'],
+      env: [
+        { name: 'NO_COLOR', value: '1' },
+        { name: 'TERM', value: 'dumb' },
+      ],
+      cwd: 'C:\\repo',
+      outputByteLimit: 4 * 1024 * 1024,
+    });
+    expect(notifyTerminalCreated).not.toHaveBeenCalled();
+    await process.dispose();
   });
 });
