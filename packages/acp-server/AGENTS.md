@@ -24,6 +24,9 @@ Package-local rules for `packages/acp-server`.
   `_meta.toolName`. Clients that treat specific tools specially (scheduling cards read
   the cron expression out of `rawInput`) must be able to identify the tool without
   parsing prose.
+- The ACP-backed process service forwards every executable/argument pair through
+  `terminal/*`; Glob and Grep need non-shell `rg` processes. Only a recognized Bash
+  tool invocation emits the terminal-created event used to attach a terminal tool card.
 - Fork positions are engine positions. The engine addresses `fork({ turnIndex })` by
   counting user-visible turns in the durable records, so the `_meta.lody.turnId` this
   server publishes IS that index, anchored per activation from `session.forkTurns()` and

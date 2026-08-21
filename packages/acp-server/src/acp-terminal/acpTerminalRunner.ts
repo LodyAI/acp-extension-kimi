@@ -24,8 +24,14 @@ const OUTPUT_BYTE_LIMIT = 4 * 1024 * 1024;
 const OUTPUT_POLL_MS = 250;
 let nextGeneration = 1;
 
-function isBashToolInvocation(args: readonly string[], options?: HostProcessOptions): boolean {
+function isBashToolInvocation(
+  command: string,
+  args: readonly string[],
+  options: HostProcessOptions | undefined,
+  shellPath: string,
+): boolean {
   return (
+    command === shellPath &&
     args.length === 2 &&
     args[0] === '-c' &&
     options?.env?.['NO_COLOR'] === '1' &&
@@ -47,6 +53,7 @@ class AcpProcessService implements IHostProcessService {
     private readonly sessionId: string,
     private readonly cwd: string,
     private readonly connection: IAcpConnection,
+    private readonly shellPath: string,
   ) {}
 
   async spawn(
@@ -57,9 +64,6 @@ class AcpProcessService implements IHostProcessService {
     if (!this.connection.terminalEnabled) {
       throw new Error('ACP terminal capability is unavailable');
     }
-    if (!isBashToolInvocation(args, options)) {
-      throw new Error('ACP runtime only supports interactive Bash tool processes');
-    }
 
     const handle = await this.connection.get().createTerminal({
       sessionId: this.sessionId,
@@ -69,11 +73,13 @@ class AcpProcessService implements IHostProcessService {
       cwd: options?.cwd ?? this.cwd,
       outputByteLimit: OUTPUT_BYTE_LIMIT,
     });
-    this.connection.notifyTerminalCreated({
-      sessionId: this.sessionId,
-      shellCommand: args[1] ?? '',
-      terminalId: handle.id,
-    });
+    if (isBashToolInvocation(command, args, options, this.shellPath)) {
+      this.connection.notifyTerminalCreated({
+        sessionId: this.sessionId,
+        shellCommand: args[1] ?? '',
+        terminalId: handle.id,
+      });
+    }
     return new AcpTerminalProcess(handle);
   }
 }
@@ -205,7 +211,7 @@ class AcpSessionRuntime implements Runtime {
       dirname: (p: string) => path.dirname(p),
     };
     this.fs = new AcpHostFileSystem({ sessionId } as unknown as ISessionContext, connection);
-    this.process = new AcpProcessService(sessionId, cwd, connection);
+    this.process = new AcpProcessService(sessionId, cwd, connection, environment.shellPath);
   }
 
   dispose(): void {}
