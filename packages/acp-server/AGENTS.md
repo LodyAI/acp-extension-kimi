@@ -4,8 +4,8 @@ Package-local rules for `packages/acp-server`.
 
 - Keep Lody integration at this ACP/Klient edge. Agent core services remain
   provider-neutral and must not import Lody contracts.
-- Advertise the versioned `lody.ai/kimi` capability before using any Lody extension.
-  Custom JSON-RPC method names begin with `_`; standard ACP remains the fallback.
+- Import shared Lody contracts from `acp-extension-core`, advertise each supported
+  feature under `_meta.lody`, and use `_lody/...` only where ACP has no standard method.
 - Usage notifications may contain token counters, quota windows, and wallet totals,
   but never credentials, authorization output, or unbounded task output.
 - Scope token totals to the current ACP activation. Establish a baseline on resume so
@@ -20,8 +20,8 @@ Package-local rules for `packages/acp-server`.
   the gap until the wake turn reporting a terminated one arrives. That is what reports
   the conversation as still working; only cancel, an auth failure, or a drained agent
   settles it early.
-- ACP `title` is human-facing, so the canonical tool name travels in a provider-neutral
-  `_meta.toolName`. Clients that treat specific tools specially (scheduling cards read
+- ACP `title` is human-facing, so the canonical tool name travels in
+  `_meta.lody.toolName`. Clients that treat specific tools specially (scheduling cards read
   the cron expression out of `rawInput`) must be able to identify the tool without
   parsing prose.
 - The ACP-backed process service forwards every executable/argument pair through

@@ -85,11 +85,20 @@ describe('acp-server initialize handshake', () => {
             mcpCapabilities: { http: true, sse: true },
             sessionCapabilities: { additionalDirectories: {}, delete: {}, fork: {} },
             _meta: {
-              'lody.ai/kimi': {
-                protocolVersion: 1,
-                features: { managedUsage: true, subagentManagement: true, tokenUsage: true },
+              lody: {
+                usage: { version: 1 },
+                rateLimits: { version: 1, query: true },
+                forkAtTurn: { version: 1 },
+                tasks: { version: 1, background: true },
+                subagents: {
+                  version: 1,
+                  lifecycle: true,
+                  list: true,
+                  cancel: true,
+                  output: true,
+                },
+                compaction: { version: 1 },
               },
-              lody: { forkAtTurn: { version: 1 } },
             },
           },
         });

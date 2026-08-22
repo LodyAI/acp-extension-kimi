@@ -769,7 +769,7 @@ describe('acp-server builtin slash commands (local execution, no LLM turn)', () 
     expect(chunk).toContain('Context compaction started');
   }, 30_000);
 
-  it('/compact reports the completion summary as a follow-up agent_message_chunk', async () => {
+  it('/compact reports token totals through the standard tool-call lifecycle', async () => {
     const c = await boot();
     const sessionId = await newSession(c);
 
@@ -788,31 +788,61 @@ describe('acp-server builtin slash commands (local execution, no LLM turn)', () 
     expect(stopReason).toBe('end_turn');
     expect(chunk).toContain('Context compaction started');
 
-    // The compaction lifecycle events subscribed at session scope push the
-    // terminal report as a follow-up chunk once the background task settles.
-    const completion = await waitForChunk(c, 'Compaction completed.');
-    expect(completion).toContain('Messages compacted:');
-    expect(completion).toContain('Tokens before:');
-    expect(completion).toContain('Tokens after:');
+    const completion = await waitForCompletedCompaction(c);
+    expect(completion).toMatchObject({
+      sessionUpdate: 'tool_call_update',
+      status: 'completed',
+      _meta: {
+        lody: {
+          activity: {
+            version: 1,
+            kind: 'context_compaction',
+            automatic: false,
+          },
+        },
+      },
+    });
+    expect(completion._meta.lody.activity.usedTokensBefore).toBeTypeOf('number');
+    expect(completion._meta.lody.activity.usedTokensAfter).toBeTypeOf('number');
   }, 30_000);
 
-  /**
-   * Poll the received `agent_message_chunk`s until one carries `needle`
-   * (the compaction report arrives asynchronously, after the prompt settled).
-   */
-  async function waitForChunk(c: TestClient, needle: string, timeoutMs = 10_000): Promise<string> {
-    type Update = { sessionUpdate?: string; content?: { text?: string } };
+  async function waitForCompletedCompaction(
+    c: TestClient,
+    timeoutMs = 10_000,
+  ): Promise<{
+    sessionUpdate: string;
+    status: string;
+    _meta: {
+      lody: {
+        activity: {
+          version: number;
+          kind: string;
+          automatic: boolean;
+          usedTokensBefore?: number;
+          usedTokensAfter?: number;
+        };
+      };
+    };
+  }> {
+    type CompactionUpdate = {
+      sessionUpdate?: string;
+      status?: string;
+      _meta?: { lody?: { activity?: { kind?: string } } };
+    };
     const deadline = Date.now() + timeoutMs;
     for (;;) {
       const hit = c
         .sessionUpdates()
-        .map((m) => (m.params as { update?: Update }).update)
+        .map((m) => (m.params as { update?: CompactionUpdate }).update)
         .find(
-          (u) => u?.sessionUpdate === 'agent_message_chunk' && u.content?.text?.includes(needle),
+          (u) =>
+            u?.sessionUpdate === 'tool_call_update' &&
+            u.status === 'completed' &&
+            u._meta?.lody?.activity?.kind === 'context_compaction',
         );
-      if (hit !== undefined) return hit.content?.text ?? '';
+      if (hit !== undefined) return hit as Awaited<ReturnType<typeof waitForCompletedCompaction>>;
       if (Date.now() > deadline) {
-        throw new Error(`timed out waiting for an agent_message_chunk containing '${needle}'`);
+        throw new Error('timed out waiting for a completed context-compaction tool call');
       }
       await new Promise((resolve) => setTimeout(resolve, 25));
     }

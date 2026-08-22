@@ -189,8 +189,14 @@ describe('AcpInteractionBridge', () => {
   it('forwards a question request and responds with the answer', async () => {
     const session = makeFakeSession();
     const { conn, calls } = makeFakeConn(() => ({
-      outcome: { outcome: 'selected', optionId: 'q0_opt_0' },
+      outcome: { outcome: 'cancelled' },
     }));
+    (conn as { createElicitation?: unknown }).createElicitation = async (
+      params: Record<string, unknown>,
+    ) => {
+      calls.push(params);
+      return { action: 'accept', content: { q0: 'A' } };
+    };
     const questionInteraction: Interaction = {
       id: 'question-1',
       kind: 'question',
@@ -203,11 +209,13 @@ describe('AcpInteractionBridge', () => {
       createdAt: 0,
     };
     session.setPending([questionInteraction]);
-    const bridge = new AcpInteractionBridge(conn, session.handle, SESSION_ID);
+    const bridge = new AcpInteractionBridge(conn, session.handle, SESSION_ID, true);
     await flush();
 
     expect(calls[0]).toMatchObject({
-      toolCall: { toolCallId: '5:tc_q', title: 'AskUserQuestion' },
+      sessionId: SESSION_ID,
+      toolCallId: '5:tc_q',
+      mode: 'form',
     });
     expect(session.responses).toEqual([{ id: 'question-1', response: { 'Pick one': 'A' } }]);
     bridge.dispose();
@@ -345,7 +353,7 @@ describe('AcpInteractionBridge', () => {
     bridge.dispose();
   });
 
-  it('falls back to request_permission when elicitation/create fails', async () => {
+  it('dismisses the question when elicitation/create fails', async () => {
     const session = makeFakeSession();
     const { conn, calls: permissionCalls } = makeFakeConn(() => ({
       outcome: { outcome: 'selected', optionId: 'q0_opt_1' },
@@ -357,12 +365,8 @@ describe('AcpInteractionBridge', () => {
     const bridge = new AcpInteractionBridge(conn, session.handle, SESSION_ID, true);
     await flush();
 
-    // The permission bridge degrades to the first question, single-select.
-    expect(permissionCalls).toHaveLength(1);
-    expect(permissionCalls[0]).toMatchObject({
-      toolCall: { toolCallId: '5:tc_q', title: 'AskUserQuestion' },
-    });
-    expect(session.responses).toEqual([{ id: 'question-el-1', response: { 'Pick one': 'B' } }]);
+    expect(permissionCalls).toHaveLength(0);
+    expect(session.responses).toEqual([{ id: 'question-el-1', response: null }]);
     bridge.dispose();
   });
 });
