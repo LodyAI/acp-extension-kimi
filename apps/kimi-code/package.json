@@ -1,6 +1,10 @@
 {
   "name": "@moonshot-ai/kimi-code",
   "version": "0.37.0",
+  "lodyManagedRuntime": {
+    "name": "kimi-code",
+    "compatibilityVersion": 1
+  },
   "description": "The Starting Point for Next-Gen Agents",
   "license": "MIT",
   "author": "Moonshot AI",
