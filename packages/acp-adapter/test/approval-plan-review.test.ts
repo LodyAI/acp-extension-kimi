@@ -24,8 +24,10 @@ import {
   PLAN_REJECT_AND_EXIT_OPTION_ID,
   PLAN_REVISE_OPTION_ID,
   approvalRequestToPermissionOptions,
+  buildPermissionToolCallUpdate,
   permissionResponseToApprovalResponse,
 } from '../src/approval';
+import { inferToolKind } from '../src/events-map';
 import { displayBlockToAcpContent } from '../src/convert';
 
 const planMd = '## Plan\n\n1. Land the bridge\n2. Cut a release';
@@ -221,5 +223,31 @@ describe('permissionResponseToApprovalResponse — plan_review branch', () => {
       outcome: { outcome: 'cancelled' },
     });
     expect(result).toEqual({ decision: 'cancelled' });
+  });
+});
+
+describe('plan_review tool kind', () => {
+  /**
+   * ACP clients key their plan surface on `kind: 'switch_mode'`, never on the
+   * tool name or the rendered title — those differ per agent. `ExitPlanMode`
+   * previously fell through to `'other'`, so a plan review reached the client
+   * as an ordinary tool call and was folded into the generic activity list
+   * instead of showing the plan and its decision.
+   */
+  it('maps ExitPlanMode to switch_mode', () => {
+    expect(inferToolKind('ExitPlanMode')).toBe('switch_mode');
+  });
+
+  it('leaves unrelated tools alone', () => {
+    expect(inferToolKind('Read')).toBe('read');
+    expect(inferToolKind('EnterPlanMode')).toBe('other');
+    expect(inferToolKind('SomeMcpTool')).toBe('other');
+  });
+
+  it('stamps the kind on the approval card too', () => {
+    // The approval can be the only update the client sees for this tool call.
+    const update = buildPermissionToolCallUpdate(7, makePlanReviewRequest());
+    expect(update.kind).toBe('switch_mode');
+    expect(update.title).toBe('ExitPlanMode');
   });
 });
