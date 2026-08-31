@@ -5,9 +5,11 @@ import {
   IAgentLifecycleService,
   IAgentPermissionModeService,
   IAgentProfileService,
+  IAgentRuntimeBindingService,
   IAgentToolPolicyService,
   IAgentPromptService,
-  IAgentSkillService,
+  agentContextOf,
+  AgentSkill,
   IAuthSummaryService,
   IEventBus,
   IEventService,
@@ -50,7 +52,9 @@ import { z } from 'zod';
 import { errEnvelope, okEnvelope } from '../envelope';
 import {
   assertPromptFileRefs,
+  assertPromptPathRefs,
   assertPromptSessionMediaRefs,
+  contentHasPathRefs,
   contentToCoreParts,
   resolvePromptMediaFiles,
   type PromptMediaPreparation,
@@ -58,7 +62,7 @@ import {
 import { requestLog } from '../lib/requestLog';
 import { defineRoute } from '../middleware/defineRoute';
 import { ensureMainAgent, MAIN_AGENT_ID } from '../transport/mainAgent';
-import { parseActionSuffix } from './action-suffix';
+import { type ActionTable, resolveActionTarget, runAction } from './action-dispatch';
 
 interface PromptRouteHost {
   get(
@@ -103,18 +107,19 @@ async function resolvePromptFromSession(session: ISessionScopeHandle, agentId?: 
   const agent =
     agentId === undefined || agentId === MAIN_AGENT_ID
       ? await ensureMainAgent(session)
-      : session.accessor.get(IAgentLifecycleService).get(agentId);
+      : session.accessor.get(IAgentLifecycleService).handleOf(agentId);
   if (agent === undefined) {
     throw new Error2('agent.not_found', `agent ${agentId} does not exist`);
   }
   return {
     prompt: agent.accessor.get(IAgentPromptService),
-    skill: agent.accessor.get(IAgentSkillService),
+    skill: agent.accessor.get(IAgentLifecycleService).resolve(agentContextOf(agent), AgentSkill),
     events: agent.accessor.get(IEventBus),
     auth: agent.accessor.get(IAuthSummaryService),
     profile: agent.accessor.get(IAgentProfileService),
     toolPolicy: agent.accessor.get(IAgentToolPolicyService),
     permissionMode: agent.accessor.get(IAgentPermissionModeService),
+    binding: agent.accessor.get(IAgentRuntimeBindingService),
   };
 }
 
@@ -200,6 +205,7 @@ export function registerPromptsRoutes(app: PromptRouteHost, core: Scope): void {
         [ErrorCode.AUTH_TOKEN_UNAUTHORIZED]: { detailsSchema: authProviderDetailsSchema },
         [ErrorCode.AUTH_MODEL_NOT_RESOLVED]: { detailsSchema: authModelDetailsSchema },
         [ErrorCode.SESSION_NOT_FOUND]: {},
+        [ErrorCode.FILE_NOT_FOUND]: {},
         [ErrorCode.PROMPT_ID_CONFLICT]: {},
         [ErrorCode.PROMPT_ALREADY_COMPLETED]: { dataSchema: z.object({ aborted: z.literal(false) }) },
       },
@@ -213,8 +219,19 @@ export function registerPromptsRoutes(app: PromptRouteHost, core: Scope): void {
       let reservation: PromptReservation | undefined;
       let enqueued = false;
       try {
-        await assertPromptFileRefs(req.body.content, core.accessor.get(IFileService));
         const session = await resolveSession(core, session_id);
+        let resolved: Awaited<ReturnType<typeof resolvePromptFromSession>> | undefined;
+        if (contentHasPathRefs(req.body.content)) {
+          resolved = await resolvePromptFromSession(session, req.body.agent_id);
+          if (resolved.binding.get().runtimeId !== 'local') {
+            throw new Error2(
+              ErrorCodes.REQUEST_INVALID,
+              'file attachments by server-local path require the local runtime',
+            );
+          }
+        }
+        await assertPromptFileRefs(req.body.content, core.accessor.get(IFileService));
+        await assertPromptPathRefs(req.body.content);
         if (req.body.skills !== undefined) {
           if (req.body.prompt_id !== undefined) {
             throw new Error2(
@@ -231,9 +248,15 @@ export function registerPromptsRoutes(app: PromptRouteHost, core: Scope): void {
           req.body.content,
           session.accessor.get(ISessionMediaStore),
         );
-        const resolved = await resolvePromptFromSession(session, req.body.agent_id);
+        resolved ??= await resolvePromptFromSession(session, req.body.agent_id);
         reservation = reservePrompt(resolved.prompt, req.body.prompt_id);
-        await resolved.auth.ensureReady();
+        const sessionModel = resolved.profile.getModel();
+        const switchingProfile =
+          req.body.profile !== undefined &&
+          req.body.profile !== resolved.profile.data().profileName;
+        await resolved.auth.ensureReady(
+          req.body.model ?? (switchingProfile ? undefined : sessionModel || undefined),
+        );
 
         const telemetry = core.accessor.get(ITelemetryService).withContext({ sessionId: session_id });
         preparedMedia = await resolvePromptMediaFiles(
@@ -255,6 +278,8 @@ export function registerPromptsRoutes(app: PromptRouteHost, core: Scope): void {
           },
         );
         const resolvedContent = preparedMedia.content;
+        const promptAttachments =
+          preparedMedia.attachments.length > 0 ? preparedMedia.attachments : undefined;
 
         let thinkingConsumed = false;
         if (req.body.profile !== undefined) {
@@ -295,6 +320,7 @@ export function registerPromptsRoutes(app: PromptRouteHost, core: Scope): void {
             result = await resolved.skill.promptWithSkills({
               input: parts,
               skills: req.body.skills,
+              attachments: promptAttachments,
             });
           } catch (error) {
             settlement.dispose();
@@ -325,7 +351,7 @@ export function registerPromptsRoutes(app: PromptRouteHost, core: Scope): void {
           role: 'user',
           content: parts,
           toolCalls: [],
-          origin: { kind: 'user' },
+          origin: { kind: 'user', attachments: promptAttachments },
         });
         enqueued = true;
         const staging = preparedMedia;
@@ -391,31 +417,55 @@ export function registerPromptsRoutes(app: PromptRouteHost, core: Scope): void {
     async (req, reply) => {
       try {
         const { session_id, tail } = req.params as { session_id: string; tail: string };
-        const parsed = parseActionSuffix({
+        const target = resolveActionTarget({
           tail,
-          allowedActions: ['abort', 'steer'] as const,
+          actions: promptActions,
           resourceLabel: 'prompt',
         });
-        if (parsed.kind !== 'action') {
-          const message = parsed.kind === 'invalid' ? parsed.reason : `unsupported action: ${tail}`;
-          reply.send(errEnvelope(ErrorCode.VALIDATION_FAILED, message, req.id));
+        if ('message' in target) {
+          reply.send(errEnvelope(ErrorCode.VALIDATION_FAILED, target.message, req.id));
           return;
         }
         const resolved = await resolvePrompt(core, session_id);
-        if (parsed.action === 'abort') {
-          resolved.prompt.abort(parsed.id);
-          requestLog(req)?.info({ session_id, prompt_id: parsed.id }, 'prompt aborted');
-          reply.send(okEnvelope({ aborted: true }, req.id));
-        } else {
-          await resolved.prompt.steer([parsed.id]);
-          reply.send(okEnvelope({ steered: true, prompt_ids: [parsed.id] }, req.id));
-        }
+        await runAction({
+          action: target.action,
+          id: target.id,
+          actions: promptActions,
+          extra: { resolved, session_id, req, reply },
+        });
       } catch (error) {
         sendMappedError(reply, req, error);
       }
     },
   );
   app.post(actionRoute.path, actionRoute.options, actionRoute.handler as Parameters<PromptRouteHost['post']>[2]);
+}
+
+type PromptActionExtra = {
+  readonly resolved: Awaited<ReturnType<typeof resolvePrompt>>;
+  readonly session_id: string;
+  readonly req: { readonly id: string };
+  readonly reply: { readonly send: (payload: unknown) => unknown };
+};
+
+type PromptActionCtx = PromptActionExtra & { readonly id: string; readonly body: unknown };
+
+const promptActions: ActionTable<'abort' | 'steer', PromptActionExtra> = {
+  abort: { handle: abortPromptAction },
+  steer: { handle: steerPromptAction },
+};
+
+async function abortPromptAction(ctx: PromptActionCtx): Promise<void> {
+  const { resolved, session_id, req, reply, id } = ctx;
+  resolved.prompt.abort(id);
+  requestLog(req)?.info({ session_id, prompt_id: id }, 'prompt aborted');
+  reply.send(okEnvelope({ aborted: true }, req.id));
+}
+
+async function steerPromptAction(ctx: PromptActionCtx): Promise<void> {
+  const { resolved, req, reply, id } = ctx;
+  await resolved.prompt.steer([id]);
+  reply.send(okEnvelope({ steered: true, prompt_ids: [id] }, req.id));
 }
 
 function projectPromptList(snapshot: PromptQueueSnapshot) {

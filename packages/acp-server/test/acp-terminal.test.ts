@@ -10,15 +10,17 @@ import type { IAcpConnection, IAcpTerminalHandle } from '../src/acp-fs/acpConnec
 import { AcpHostFileSystem } from '../src/acp-fs/acpFsService';
 import { AcpRuntimeProviderFactory } from '../src/acp-terminal/acpTerminalRunner';
 
-function makeConnection(): IAcpConnection {
+function makeConnection(
+  options: { terminalEnabled?: boolean; createTerminal?: () => IAcpTerminalHandle } = {},
+): IAcpConnection {
   return {
     _serviceBrand: undefined,
     bound: true,
     fsReadTextFile: true,
     fsWriteTextFile: true,
-    terminalEnabled: true,
+    terminalEnabled: options.terminalEnabled ?? true,
     bind: () => {},
-    get: () => ({}) as never,
+    get: () => ({ createTerminal: async () => options.createTerminal?.() }) as never,
     bindFsCapabilities: () => {},
     bindTerminalCapability: () => {},
     notifyTerminalCreated: () => {},

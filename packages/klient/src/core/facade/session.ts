@@ -15,7 +15,7 @@ import type {
 import type {
   Interaction,
   InteractionKind,
-} from '@moonshot-ai/agent-core-v2/session/interaction/interaction';
+} from '@moonshot-ai/agent-core-v2/features/interaction/interaction';
 import type {
   QuestionRequest,
   QuestionResult,
@@ -26,7 +26,7 @@ import type {
   SessionMetaPatch,
 } from '@moonshot-ai/agent-core-v2/session/sessionMetadata/sessionMetadata';
 import type { ForkTurnSummary } from '@moonshot-ai/agent-core-v2/workspace/sessionLifecycle/sessionLifecycle';
-import type { SkillSummary } from '@moonshot-ai/agent-core-v2/app/skillCatalog/types';
+import type { SkillSummary } from '@moonshot-ai/agent-core-v2/features/skill/catalog/types';
 
 import type { ScopeRef } from '../channel.js';
 import type { McpServerConfig } from '../../contract/mcp.js';

@@ -6,6 +6,62 @@ outline: 2
 
 本页记录 Kimi Code CLI 每个版本的变更内容。
 
+## 0.39.0（2026-08-27）
+
+### 新功能
+
+- 新增实验性远程控制功能：可远程访问本地的 web 会话，设置 `KIMI_CODE_EXPERIMENTAL_REMOTE_CONTROL=1` 后运行 `kimi rc`、`kimi web --remote-control` 或 `/remote-control` 启动。
+- 新增实验性 tower 多 Agent 编排模式：设置 `KIMI_CODE_EXPERIMENTAL_TOWER=1` 后运行 `/tower on` 和 `/tower <objective>` 启动。
+- subagent 与 swarm 工具新增可选 `fork` 参数，子 Agent 以调用方当前对话历史的快照启动；设置 `KIMI_CODE_EXPERIMENTAL_SUBAGENT_FORK=1` 或在 `config.toml` 的 `[experimental]` 下写 `subagent_fork = true` 启用。
+- web: 运行卡片新增 "转到后台" 按钮，可把正在前台运行的 Bash 命令或子 Agent 转为后台运行。
+- web: 移动端会话列表新增平铺/按工作区分组的切换标签。
+- 内置插件市场新增 Tencent CloudBase 插件，通过 `/plugins` 安装。
+- 新增 `[swarm] timeout_ms` 配置项（或环境变量 `KIMI_CODE_SWARM_TIMEOUT_MS`）。
+
+### 优化
+
+- web: 右侧边栏重构为多标签面板。
+- web: 优化输入框交互，包括文件、文件夹和媒体附件的展示。
+- web: 优化移动端 UI 样式。
+
+### 修复
+
+- 修复 Windows 上文件工具与 Shell 工作目录无法解析 Git Bash 路径（如 /c/Users、/tmp）的问题。
+- 修复了一些已知问题，并做了若干细节优化。更详细的变更记录见 [GitHub](https://github.com/MoonshotAI/kimi-code/blob/main/apps/kimi-code/CHANGELOG.md)。
+
+## 0.38.0（2026-08-20）
+
+### 新功能
+
+- 支持 kimi.ai 与 kimi.com 两种 OAuth 登录方式。
+- 新增 WaitFor 工具：Agent 可以在当前轮次内等待后台任务完成，无需结束轮次后再次被唤起。
+- 官方 Kimi Datasource 插件新增 13 个数据源：中国政府数据（NDA/NBS）与标准（GB/HB/DB/TT）、八个国际组织数据集（WHO、FAO、UNSD、ECB、Eurostat、UNICEF、OECD、FRED）、新华财经和财新。在 /plugins 的 Official 标签页中更新插件。
+- web: 聊天头部的更多菜单新增置顶操作。
+
+### 优化
+
+- Edit 和 Write 现在要求先读取已存在的文件再进行修改。
+<!-- - 子 Agent 默认不再派生自己的子 Agent；自定义 Agent 配置仍可显式允许。 -->
+- 折叠过长的 `!` Shell 命令输出，避免刷屏；按 ctrl+o 可与工具输出一起展开或折叠。
+
+### 修复
+
+- 修复 config.toml 在存在语法错误或在应用外被编辑时条目丢失的问题。
+- 修复了一些已知问题，并做了若干细节优化。更详细的变更记录见 [GitHub](https://github.com/MoonshotAI/kimi-code/blob/main/apps/kimi-code/CHANGELOG.md)。
+
+## 0.37.2（2026-08-19）
+
+### 优化
+
+- web: 设置页新增 「实验室」标签页，上线「多标签侧边栏开关」功能；开启后侧边栏显示 Open / Done / Workspaces 标签页。
+- 做了若干细节优化和内部改进。更详细的变更记录见 [GitHub](https://github.com/MoonshotAI/kimi-code/blob/main/apps/kimi-code/CHANGELOG.md)。
+
+## 0.37.1（2026-08-18）
+
+### 修复
+
+- 修复粘贴的图片和视频无法发送给模型的问题。
+
 ## 0.37.0（2026-08-18）
 
 ### 新功能

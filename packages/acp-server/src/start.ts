@@ -16,11 +16,13 @@ import { Readable, Writable } from 'node:stream';
 import { ndJsonStream, type AgentConnection, type Stream } from '@agentclientprotocol/sdk';
 import {
   bootstrap,
+  drainLogCloses,
   drainQueryStoreDisposals,
   drainSessionIndexMirror,
   drainSessionMetadataWrites,
   ensureMainAgent,
   getLiveSessionById,
+  IAgentLifecycleService,
   IAgentRuntimeBindingService,
   IAppendLogStore,
   IHostEnvironment,
@@ -155,8 +157,12 @@ export async function runAcpServerWithStream(
       const context = handle.accessor.get(ISessionContext);
       const runtimeId = acpRuntimeProvider.bindSession(context.workspaceId, sessionId, context.cwd);
       sessionWorkspaces.set(sessionId, context.workspaceId);
-      const agent = await ensureMainAgent(handle, { runtimeId });
-      agent.accessor.get(IAgentRuntimeBindingService).switch(runtimeId);
+      const agentContext = await ensureMainAgent(handle, { runtimeId });
+      handle.accessor
+        .get(IAgentLifecycleService)
+        .handleOf(agentContext.agentId)!
+        .accessor.get(IAgentRuntimeBindingService)
+        .switch(runtimeId);
     },
     unbindSessionRuntime: async (sessionId) => {
       const workspaceId = sessionWorkspaces.get(sessionId);
@@ -186,8 +192,9 @@ export async function runAcpServerWithStream(
       // Flush the append-log write-behind before disposing, so a clean shutdown
       // never races a pending drain against teardown (and doesn't drop the last
       // persisted ops). Best-effort: a flush failure must not block disposal.
+      const appendLogStore = core.accessor.get(IAppendLogStore);
       try {
-        await core.accessor.get(IAppendLogStore).flush();
+        await appendLogStore.flush();
       } catch {
         // ignore — disposal proceeds regardless
       }
@@ -201,10 +208,13 @@ export async function runAcpServerWithStream(
       // `core.dispose()` runs the mirror's and the query store's synchronous
       // `dispose()`, whose drains/closes are asynchronous — await them so an
       // embedding host that removes homeDir right after close() never races
-      // an in-flight shard close (ENOTEMPTY on teardown).
+      // an in-flight shard close (ENOTEMPTY on teardown). The same window
+      // exists for the append-log retirement flushes released by disposal.
+      await appendLogStore.drainRetirements();
       await drainSessionIndexMirror();
       await drainQueryStoreDisposals();
       await drainSessionMetadataWrites();
+      await drainLogCloses();
     })();
     return closePromise;
   };

@@ -229,6 +229,7 @@ export interface GoalChange {
 
 export type KimiErrorCode =
   | 'config.invalid'
+  | 'config.persist_blocked'
   | 'session.not_found'
   | 'session.already_exists'
   | 'session.id_invalid'
@@ -444,6 +445,12 @@ export interface ToolUpdate {
   readonly percent?: number;
   readonly customKind?: string;
   readonly customData?: unknown;
+  /**
+   * When true, hosts replace this tool call's previous live status block
+   * instead of appending a new row — for periodic "still working" updates
+   * whose predecessors are stale the moment they are emitted.
+   */
+  readonly replace?: boolean;
 }
 
 export const MCP_OAUTH_AUTHORIZATION_URL_TOOL_UPDATE = 'mcp.oauth.authorization_url';
@@ -541,6 +548,7 @@ export interface AgentStatusUpdatedEvent {
   readonly contextUsage?: number;
   readonly planMode?: boolean;
   readonly swarmMode?: boolean;
+  readonly towerMode?: boolean;
   readonly permission?: PermissionMode;
   readonly usage?: UsageStatus;
   readonly phase?: AgentPhase;
@@ -601,6 +609,20 @@ export interface ConfigChangedEvent {
   readonly type: 'event.config.changed';
   readonly changedFields: string[];
   readonly config: ConfigResponse;
+}
+
+export interface ConfigWarningItem {
+  readonly domain?: string;
+  readonly message: string;
+}
+
+/**
+ * Pushed when the daemon's config validation produces warnings (deprecated
+ * keys, unknown fields). Bare global fan-out alongside `event.config.changed`.
+ */
+export interface ConfigWarningEvent {
+  readonly type: 'event.config.warning';
+  readonly warnings: readonly ConfigWarningItem[];
 }
 
 /**
@@ -675,6 +697,17 @@ export interface WarningEvent {
   readonly code?: string;
 }
 
+/** A prompt-carried transcript attachment: a session-media reference or a typed file attachment. */
+export type TurnPromptAttachment =
+  | { readonly kind: 'image' | 'video' | 'audio'; readonly fileId: string }
+  | {
+      readonly kind: 'file';
+      readonly name: string;
+      readonly mediaType: string;
+      readonly size: number;
+      readonly path: string;
+    };
+
 export interface TurnStartedEvent {
   readonly type: 'turn.started';
   readonly turnId: number;
@@ -682,6 +715,8 @@ export interface TurnStartedEvent {
   readonly prompt?: string;
   /** The prompt record id when the turn was opened by a prompt submission. */
   readonly promptId?: string;
+  /** Session-media references and file attachments carried by the prompt (transcript attachments). */
+  readonly promptAttachments?: readonly TurnPromptAttachment[];
 }
 
 export interface TurnEndedEvent {
@@ -858,6 +893,11 @@ export interface SubagentSpawnedEvent {
   /** The child's effective thinking effort at spawn (same vocabulary as
    *  `agent.status.updated`). Optional for cross-version tolerance. */
   readonly thinkingEffort?: string;
+  /** Background-task id the run registered under in the caller's task store.
+   *  Emitted after task registration, so cancel/status actions can bind to
+   *  the task store without waiting for `task.started`. Optional for
+   *  cross-version tolerance (older producers never send it). */
+  readonly taskId?: string;
 }
 
 export interface SubagentStartedEvent {
@@ -1000,6 +1040,7 @@ export type AgentEvent =
   | SessionWorkChangedEvent
   | SessionStatusChangedEvent
   | ConfigChangedEvent
+  | ConfigWarningEvent
   | ModelCatalogChangedEvent
   | PluginChangedEvent
   | CapabilityChangedEvent
@@ -1246,6 +1287,7 @@ export const goalChangeSchema = z.object({
 
 export const kimiErrorCodeSchema = z.enum([
   'config.invalid',
+  'config.persist_blocked',
   'session.not_found',
   'session.already_exists',
   'session.id_invalid',
@@ -1444,6 +1486,7 @@ export const toolUpdateSchema = z.object({
   percent: z.number().optional(),
   customKind: z.string().optional(),
   customData: z.unknown().optional(),
+  replace: z.boolean().optional(),
 }) satisfies z.ZodType<ToolUpdate>;
 
 export const mcpOAuthAuthorizationUrlUpdateDataSchema = z.object({
@@ -1529,6 +1572,7 @@ export const agentStatusUpdatedEventSchema = z.object({
   contextUsage: z.number().optional(),
   planMode: z.boolean().optional(),
   swarmMode: z.boolean().optional(),
+  towerMode: z.boolean().optional(),
   permission: permissionModeSchema.optional(),
   usage: usageStatusSchema.optional(),
   phase: agentPhaseSchema.optional(),
@@ -1582,6 +1626,16 @@ export const configChangedEventSchema = z.object({
   changedFields: z.array(z.string()),
   config: configResponseSchema,
 }) satisfies z.ZodType<ConfigChangedEvent>;
+
+export const configWarningEventSchema = z.object({
+  type: z.literal('event.config.warning'),
+  warnings: z.array(
+    z.object({
+      domain: z.string().optional(),
+      message: z.string(),
+    }),
+  ),
+}) satisfies z.ZodType<ConfigWarningEvent>;
 
 export const modelCatalogChangedEventSchema = z.object({
   type: z.literal('event.model_catalog.changed'),
@@ -1647,6 +1701,20 @@ export const turnStartedEventSchema = z.object({
   origin: promptOriginSchema,
   prompt: z.string().optional(),
   promptId: z.string().optional(),
+  promptAttachments: z
+    .array(
+      z.union([
+        z.object({ kind: z.enum(['image', 'video', 'audio']), fileId: z.string() }),
+        z.object({
+          kind: z.literal('file'),
+          name: z.string(),
+          mediaType: z.string(),
+          size: z.number(),
+          path: z.string(),
+        }),
+      ]),
+    )
+    .optional(),
 }) satisfies z.ZodType<TurnStartedEvent>;
 
 export const turnEndedEventSchema = z.object({
@@ -1793,6 +1861,7 @@ export const subagentSpawnedEventSchema = z.object({
   runInBackground: z.boolean(),
   model: z.string().optional(),
   thinkingEffort: z.string().optional(),
+  taskId: z.string().optional(),
 }) satisfies z.ZodType<SubagentSpawnedEvent>;
 
 export const subagentStartedEventSchema = z.object({
@@ -1932,6 +2001,8 @@ export const agentEventSchema = z.discriminatedUnion('type', [
   workspaceDeletedEventSchema,
   sessionWorkChangedEventSchema,
   sessionStatusChangedEventSchema,
+  configChangedEventSchema,
+  configWarningEventSchema,
   modelCatalogChangedEventSchema,
   pluginChangedEventSchema,
   capabilityChangedEventSchema,
