@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.7.3
+
+### Patch Changes
+
+- [#3098](https://github.com/MoonshotAI/kimi-code/pull/3098) [`75550c5`](https://github.com/MoonshotAI/kimi-code/commit/75550c5686cb867c0cb34bc515997d5e6305fc94) Thanks [@LCZcn96](https://github.com/LCZcn96)! - Restore live context-window usage updates after switching to the v2 engine.
+
+- [#3276](https://github.com/MoonshotAI/kimi-code/pull/3276) [`f34b2ec`](https://github.com/MoonshotAI/kimi-code/commit/f34b2ecfb01dc194aaa3f209a00772991caad3f3) Thanks [@Grapedge](https://github.com/Grapedge)! - Fix streamed replies occasionally showing every character twice and tool calls appearing in duplicate.
+
+- Updated dependencies [[`75550c5`](https://github.com/MoonshotAI/kimi-code/commit/75550c5686cb867c0cb34bc515997d5e6305fc94), [`d723cc4`](https://github.com/MoonshotAI/kimi-code/commit/d723cc47ee43e5ca3c3c4ec2473f205d44acede2)]:
+  - @moonshot-ai/kimi-code-sdk@0.19.2
+
+## 0.7.2
+
+### Patch Changes
+
+- [#3079](https://github.com/MoonshotAI/kimi-code/pull/3079) [`35befdc`](https://github.com/MoonshotAI/kimi-code/commit/35befdcef2be344d931ea20063cb64113350dc4b) Thanks [@gaoyuan1223m](https://github.com/gaoyuan1223m)! - Fix multi-select questions jumping to the next question after only one answer is selected.
+
+- Updated dependencies [[`3d77620`](https://github.com/MoonshotAI/kimi-code/commit/3d7762003a4a35cbeb8571d471c6898a006152e6)]:
+  - @moonshot-ai/kimi-code-sdk@0.19.1
+
 ## 0.7.1
 
 ### Patch Changes

@@ -1,6 +1,7 @@
 /* oxlint-disable typescript-eslint/no-unsafe-declaration-merging, eslint-plugin-import/namespace -- Event2 class+payload-interface declaration merging is the sanctioned event-declaration idiom. */
 import type { PromptOrigin } from '#/agent/contextMemory/types';
-import { Event2 } from '#/app/event/event2';
+import { parseDaemonFileUrl } from '#/agent/media/mediaRef';
+import { AgentEvent2 } from '#/app/event/event2';
 import type { FinishReason } from '#/kosong/contract/provider';
 import type { ContentPart, TextPart } from '#/kosong/contract/message';
 import type { TokenUsage } from '#/kosong/contract/usage';
@@ -15,13 +16,27 @@ export type TurnInterruptReason =
   | 'filtered'
   | 'blocked';
 
+export interface TurnPromptAttachmentFile {
+  readonly kind: 'file';
+  readonly name: string;
+  readonly mediaType: string;
+  readonly size: number;
+  readonly path: string;
+}
+
+export type TurnPromptAttachment =
+  | { readonly kind: 'image' | 'video' | 'audio'; readonly fileId: string }
+  | TurnPromptAttachmentFile;
+
 export interface TurnStartedPayload {
+  readonly agentId: string;
   readonly turnId: number;
   readonly origin: PromptOrigin;
   readonly prompt?: string;
+  readonly promptAttachments?: readonly TurnPromptAttachment[];
 }
 
-export class TurnStarted extends Event2<TurnStartedPayload> {
+export class TurnStarted extends AgentEvent2<TurnStartedPayload> {
   static override readonly type = 'turn.started';
   static override readonly observable = true;
 }
@@ -40,8 +55,39 @@ export function turnPromptText(
   return text.length > 0 ? text : undefined;
 }
 
+export function turnPromptAttachments(
+  input: readonly ContentPart[],
+  origin?: PromptOrigin,
+): TurnStartedPayload['promptAttachments'] {
+  const attachments: TurnPromptAttachment[] = [];
+  const promptMediaFileId = (url: string, id: string | undefined): string | undefined => {
+    const fileId = parseDaemonFileUrl(url)?.fileId;
+    if (id === undefined) return fileId;
+    return fileId === id ? id : undefined;
+  };
+  for (const part of input) {
+    if (part.type === 'image_url') {
+      const fileId = promptMediaFileId(part.imageUrl.url, part.imageUrl.id);
+      if (fileId !== undefined) attachments.push({ kind: 'image', fileId });
+    } else if (part.type === 'video_url') {
+      const fileId = promptMediaFileId(part.videoUrl.url, part.videoUrl.id);
+      if (fileId !== undefined) attachments.push({ kind: 'video', fileId });
+    } else if (part.type === 'audio_url') {
+      const fileId = promptMediaFileId(part.audioUrl.url, part.audioUrl.id);
+      if (fileId !== undefined) attachments.push({ kind: 'audio', fileId });
+    }
+  }
+  if (origin?.kind === 'user' || origin?.kind === 'skill_activation') {
+    for (const attachment of origin.attachments ?? []) {
+      attachments.push({ kind: 'file', ...attachment });
+    }
+  }
+  return attachments.length > 0 ? attachments : undefined;
+}
+
 export function isDisplayablePromptOrigin(origin: PromptOrigin): boolean {
   if (origin.kind === 'user') return true;
+  if (origin.kind === 'system_trigger' && origin.name === 'subagent') return true;
   return (
     (origin.kind === 'skill_activation' || origin.kind === 'plugin_command') &&
     origin.trigger === 'user-slash'
@@ -49,18 +95,20 @@ export function isDisplayablePromptOrigin(origin: PromptOrigin): boolean {
 }
 
 export interface TurnStepStartedPayload {
+  readonly agentId: string;
   readonly turnId: number;
   readonly step: number;
   readonly stepId?: string;
 }
 
-export class TurnStepStarted extends Event2<TurnStepStartedPayload> {
+export class TurnStepStarted extends AgentEvent2<TurnStepStartedPayload> {
   static override readonly type = 'turn.step.started';
   static override readonly observable = true;
 }
 export interface TurnStepStarted extends TurnStepStartedPayload {}
 
 export interface TurnStepCompletedPayload {
+  readonly agentId: string;
   readonly turnId: number;
   readonly step: number;
   readonly stepId?: string;
@@ -76,13 +124,14 @@ export interface TurnStepCompletedPayload {
   readonly rawFinishReason?: string;
 }
 
-export class TurnStepCompleted extends Event2<TurnStepCompletedPayload> {
+export class TurnStepCompleted extends AgentEvent2<TurnStepCompletedPayload> {
   static override readonly type = 'turn.step.completed';
   static override readonly observable = true;
 }
 export interface TurnStepCompleted extends TurnStepCompletedPayload {}
 
 export interface TurnStepInterruptedPayload {
+  readonly agentId: string;
   readonly turnId: number;
   readonly step: number;
   readonly stepId?: string;
@@ -90,42 +139,45 @@ export interface TurnStepInterruptedPayload {
   readonly message?: string;
 }
 
-export class TurnStepInterrupted extends Event2<TurnStepInterruptedPayload> {
+export class TurnStepInterrupted extends AgentEvent2<TurnStepInterruptedPayload> {
   static override readonly type = 'turn.step.interrupted';
   static override readonly observable = true;
 }
 export interface TurnStepInterrupted extends TurnStepInterruptedPayload {}
 
 export interface AssistantDeltaPayload {
+  readonly agentId: string;
   readonly turnId: number;
   readonly delta: string;
 }
 
-export class AssistantDelta extends Event2<AssistantDeltaPayload> {
+export class AssistantDelta extends AgentEvent2<AssistantDeltaPayload> {
   static override readonly type = 'assistant.delta';
   static override readonly observable = true;
 }
 export interface AssistantDelta extends AssistantDeltaPayload {}
 
 export interface ThinkingDeltaPayload {
+  readonly agentId: string;
   readonly turnId: number;
   readonly delta: string;
 }
 
-export class ThinkingDelta extends Event2<ThinkingDeltaPayload> {
+export class ThinkingDelta extends AgentEvent2<ThinkingDeltaPayload> {
   static override readonly type = 'thinking.delta';
   static override readonly observable = true;
 }
 export interface ThinkingDelta extends ThinkingDeltaPayload {}
 
 export interface ToolCallDeltaPayload {
+  readonly agentId: string;
   readonly turnId: number;
   readonly toolCallId: string;
   readonly name?: string;
   readonly argumentsPart?: string;
 }
 
-export class ToolCallDelta extends Event2<ToolCallDeltaPayload> {
+export class ToolCallDelta extends AgentEvent2<ToolCallDeltaPayload> {
   static override readonly type = 'tool.call.delta';
   static override readonly observable = true;
 }

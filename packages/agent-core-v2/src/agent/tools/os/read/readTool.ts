@@ -2,7 +2,7 @@ import type { IHostFileSystem } from '#/os/interface/hostFileSystem';
 import { IAgentRuntimeService, inspectAgentRuntime } from '#/agent/runtimeBinding/agentRuntime';
 import { RuntimeWorkspaceView } from '#/runtime/runtimeWorkspaceView';
 import { unwrapErrorCause } from '#/_base/errors/errors';
-import { ISessionSkillCatalog } from '#/session/sessionSkillCatalog/skillCatalog';
+import { ISessionSkillCatalog } from '#/features/skill/session/skillCatalog';
 import { ISessionWorkspaceContext } from '#/session/workspaceContext/workspaceContext';
 import {
   ToolAccesses,
@@ -29,6 +29,7 @@ import {
   TRANSCODE_MAX_BYTES,
   type ReadInput,
 } from './read';
+import { IAgentToolResultTruncationService } from '#/agent/toolResultTruncation/toolResultTruncation';
 import readDescriptionTemplate from './read.md?raw';
 
 interface LineEndingFlags {
@@ -181,18 +182,14 @@ async function* decodedLines(lines: readonly string[]): AsyncGenerator<string> {
 }
 
 function notReadableFileOutput(path: string): string {
-  return (
-    `"${path}" is not readable as UTF-8 text. ` +
-    'If it is an image or video, use ReadMediaFile. ' +
-    'For other binary formats, use Bash or an MCP tool if available.'
-  );
+  return `"${path}" is not readable as UTF-8 text. Only text files can be read.`;
 }
 
 function notUtf8DecodableFileOutput(path: string): string {
   return (
     `"${path}" is not valid UTF-8 or UTF-16 text. ` +
     'Only UTF-8 and UTF-16 text files can be read; ' +
-    'for other encodings (e.g. GBK), convert the file to UTF-8 first (e.g. `iconv` via Bash).'
+    'for other encodings (e.g. GBK), convert the file to UTF-8 first (e.g. with `iconv`).'
   );
 }
 
@@ -211,6 +208,7 @@ export class ReadTool implements IReadTool {
     @IAgentRuntimeService private readonly runtime: IAgentRuntimeService,
     @ISessionWorkspaceContext private readonly workspaceCtx: ISessionWorkspaceContext,
     @ISessionSkillCatalog private readonly skillCatalog: ISessionSkillCatalog,
+    @IAgentToolResultTruncationService private readonly resultTruncation: IAgentToolResultTruncationService,
   ) {}
 
   private workspaceConfig(view: RuntimeWorkspaceView): WorkspaceConfig {
@@ -247,7 +245,10 @@ export class ReadTool implements IReadTool {
           if (lease.runtime.identity.generation !== inspected.identity.generation) {
             return { isError: true, output: 'Runtime changed before execution. Retry the tool call.' };
           }
-          return await this.execution(lease.runtime.fs!, args, path);
+          const result = await this.execution(lease.runtime.fs!, args, path);
+          return this.resultTruncation.isSpillFilePath(path)
+            ? { ...result, spillExempt: true as const }
+            : result;
         } finally {
           lease.dispose();
         }
@@ -275,7 +276,7 @@ export class ReadTool implements IReadTool {
       if (fileType.kind === 'image' || fileType.kind === 'video') {
         return {
           isError: true,
-          output: `"${args.path}" is a ${fileType.kind} file. Use ReadMediaFile to read image or video files.`,
+          output: `"${args.path}" is ${fileType.kind === 'image' ? 'an' : 'a'} ${fileType.kind} file. Only text files can be read.`,
         };
       }
 
@@ -289,7 +290,7 @@ export class ReadTool implements IReadTool {
             output:
               `"${args.path}" is ${encodingDisplayName(detection.encoding)} text but too large to transcode ` +
               `(${String(stat.size)} bytes > ${String(TRANSCODE_MAX_BYTES)}). ` +
-              'Convert it to UTF-8 first (e.g. `iconv` via Bash).',
+              'Convert it to UTF-8 first (e.g. with `iconv`).',
           };
         }
         const decoded = decodeUtfText(await fs.readBytes(safePath), detection.encoding);
@@ -516,7 +517,9 @@ export class ReadTool implements IReadTool {
       parts.push('End of file reached.');
     }
     if (input.truncatedLineNumbers.length > 0) {
-      parts.push(`Lines [${input.truncatedLineNumbers.join(', ')}] were truncated.`);
+      parts.push(
+        `Lines [${input.truncatedLineNumbers.join(', ')}] were truncated to ${String(MAX_LINE_LENGTH)} characters; use Bash (e.g. cut or sed) to read the elided content of those lines.`,
+      );
     }
     if (input.lineEndingStyle === 'mixed') {
       parts.push(
