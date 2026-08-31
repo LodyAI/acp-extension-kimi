@@ -7,7 +7,7 @@ import type {
 import type { ApprovalRequest, ApprovalResponse } from '@moonshot-ai/kimi-code-sdk';
 
 import { displayBlockToAcpContent } from './convert';
-import { acpToolCallId } from './events-map';
+import { acpToolCallId, inferToolKind } from './events-map';
 
 /**
  * Canonical option ids surfaced to the ACP client.
@@ -276,6 +276,11 @@ export function buildPermissionToolCallUpdate(
   return {
     toolCallId,
     title: req.toolName,
+    // Carry the kind here too: an approval can reach the client before the
+    // matching tool_call start (or as the only update for a tool that never
+    // starts), and a plan review that arrives without `switch_mode` renders
+    // as a generic tool call.
+    kind: inferToolKind(req.toolName),
     content,
   };
 }

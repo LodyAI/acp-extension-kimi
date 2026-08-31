@@ -120,6 +120,12 @@ export function inferToolKind(name: string): ToolKind {
       return 'fetch';
     case 'Think':
       return 'think';
+    case 'ExitPlanMode':
+      // ACP clients key their plan-review surface on this kind, not on the
+      // tool name or the rendered title (both vary per agent). Without it the
+      // plan approval arrives as an ordinary `other` tool call and the client
+      // folds it into the generic activity list instead of showing the plan.
+      return 'switch_mode';
     default:
       return 'other';
   }
