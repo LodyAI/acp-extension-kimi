@@ -31,6 +31,7 @@ export default defineConfig({
     [BUILT_IN_CATALOG_DEFINE]: builtInCatalogDefine(),
   },
   deps: {
+    alwaysBundle: ['qrcode', 'ws'],
     onlyBundle: false,
   },
   outputOptions: {
