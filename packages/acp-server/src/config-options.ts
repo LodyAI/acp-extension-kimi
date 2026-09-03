@@ -20,6 +20,7 @@
  */
 
 import type { SessionConfigOption, SessionConfigSelectOption } from '@agentclientprotocol/sdk';
+import { providerDisplayName } from '@moonshot-ai/kimi-code-oauth';
 
 import { ACP_MODES, type AcpModeId } from './modes';
 import type { AcpModelEntry } from './model-catalog';
@@ -35,7 +36,9 @@ export function buildModelOption(
   const options: SessionConfigSelectOption[] = models.map((model) => ({
     value: model.id,
     name: model.name,
-    ...(model.description !== undefined ? { description: model.description } : {}),
+    description:
+      model.description ??
+      (model.provider ? providerDisplayName(model.provider) || undefined : undefined),
   }));
   return {
     type: 'select',

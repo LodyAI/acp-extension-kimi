@@ -22,6 +22,7 @@ export interface AcpModelEntry {
   readonly id: string;
   readonly name: string;
   readonly description?: string | undefined;
+  readonly provider?: string;
   readonly thinkingSupported: boolean;
   /** Declared 'always_thinking' capability — thinking cannot be turned off. */
   readonly alwaysThinking?: boolean;
@@ -85,6 +86,7 @@ export function projectModelCatalog(
   return items.map((item) => ({
     id: item.model,
     name: item.display_name ?? item.model,
+    provider: item.provider || undefined,
     thinkingSupported: deriveThinkingSupported(item),
     alwaysThinking: deriveAlwaysThinking(item),
     defaultThinkingEffort: deriveDefaultThinkingEffort(item),
