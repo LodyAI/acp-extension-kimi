@@ -14,6 +14,7 @@
  */
 
 import type { ModelAlias } from '@moonshot-ai/kimi-code-sdk';
+import { providerDisplayName } from '@moonshot-ai/kimi-code-oauth';
 import {
   Container,
   Key,
@@ -27,7 +28,6 @@ import { renderTabStrip } from '#/tui/utils/tab-strip';
 
 import {
   ModelSelectorComponent,
-  providerDisplayName,
   type ModelSelection,
   type ModelSelectorOptions,
 } from './model-selector';

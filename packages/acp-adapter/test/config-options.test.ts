@@ -60,8 +60,23 @@ function makeHarnessWithModels(
 describe('buildModelOption', () => {
   it('emits exactly one option per catalog row (Phase 15: no inlined `,thinking` variant rows)', () => {
     const models: readonly AcpModelEntry[] = [
-      { id: 'alpha', name: 'Alpha', thinkingSupported: true, supportEfforts: [], defaultThinkingEffort: 'on' },
-      { id: 'beta', name: 'Beta', thinkingSupported: false, supportEfforts: [], defaultThinkingEffort: 'on' },
+      {
+        id: 'alpha',
+        name: 'Alpha',
+        description: 'Latest Kimi model',
+        provider: 'managed:kimi-code',
+        thinkingSupported: true,
+        supportEfforts: [],
+        defaultThinkingEffort: 'on',
+      },
+      {
+        id: 'beta',
+        name: 'Beta',
+        provider: 'managed:kimi-code',
+        thinkingSupported: false,
+        supportEfforts: [],
+        defaultThinkingEffort: 'on',
+      },
     ];
 
     const option = buildModelOption(models, 'alpha');
@@ -73,13 +88,9 @@ describe('buildModelOption', () => {
       throw new Error('expected a SessionConfigSelect option');
     }
     expect(option.currentValue).toBe('alpha');
-    expect(option.options).toHaveLength(2);
-    const projected = option.options.map((entry) =>
-      'value' in entry ? { value: entry.value, name: entry.name } : null,
-    );
-    expect(projected).toEqual([
-      { value: 'alpha', name: 'Alpha' },
-      { value: 'beta', name: 'Beta' },
+    expect(option.options).toEqual([
+      { value: 'alpha', name: 'Alpha', description: 'Latest Kimi model' },
+      { value: 'beta', name: 'Beta', description: 'Kimi Code' },
     ]);
   });
 

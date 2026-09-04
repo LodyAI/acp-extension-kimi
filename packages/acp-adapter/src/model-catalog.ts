@@ -44,6 +44,7 @@ export interface AcpModelEntry {
   readonly id: string;
   readonly name: string;
   readonly description?: string | undefined;
+  readonly provider?: string;
   readonly thinkingSupported: boolean;
   /** Declared 'always_thinking' capability — thinking cannot be turned off. */
   readonly alwaysThinking?: boolean;
@@ -155,6 +156,7 @@ export async function listModelsFromHarness(
     out.push({
       id,
       name: effective.displayName ?? effective.model ?? id,
+      provider: alias.provider ?? config.defaultProvider,
       thinkingSupported: deriveThinkingSupported(alias, providerType),
       alwaysThinking: deriveAlwaysThinking(alias, providerType),
       supportEfforts: deriveSupportEfforts(alias, providerType),

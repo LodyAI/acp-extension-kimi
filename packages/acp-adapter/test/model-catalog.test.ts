@@ -96,6 +96,7 @@ describe('listModelsFromHarness', () => {
       {
         id: 'custom',
         name: 'custom-claude-model',
+        provider: 'custom',
         thinkingSupported: true,
         alwaysThinking: false,
         supportEfforts: ['low', 'medium', 'high', 'xhigh', 'max'],
@@ -125,6 +126,7 @@ describe('listModelsFromHarness', () => {
       {
         id: 'custom',
         name: 'custom-anthropic-model',
+        provider: 'custom',
         thinkingSupported: false,
         alwaysThinking: false,
         supportEfforts: [],
@@ -179,6 +181,7 @@ describe('listModelsFromHarness', () => {
       {
         id: 'custom',
         name: 'custom-anthropic-model',
+        provider: 'managed:kimi-code',
         thinkingSupported: false,
         alwaysThinking: false,
         supportEfforts: [],
@@ -213,6 +216,7 @@ describe('listModelsFromHarness', () => {
       {
         id: 'custom',
         name: 'joint-claude-0714-vibe',
+        provider: 'compat',
         thinkingSupported: true,
         alwaysThinking: false,
         supportEfforts: ['low', 'medium', 'high', 'xhigh', 'max'],

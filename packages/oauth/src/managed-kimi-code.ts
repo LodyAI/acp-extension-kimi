@@ -10,8 +10,14 @@ import { isRecord } from './utils';
 
 export const KIMI_CODE_PLATFORM_ID = 'kimi-code';
 export const KIMI_CODE_PROVIDER_NAME = 'managed:kimi-code';
+export const KIMI_CODE_PRODUCT_NAME = 'Kimi Code';
 export const KIMI_CODE_OAUTH_KEY = 'oauth/kimi-code';
 const KIMI_CODE_SCOPED_OAUTH_KEY_PREFIX = 'oauth/kimi-code-env-';
+
+export function providerDisplayName(provider: string): string {
+  if (provider === KIMI_CODE_PROVIDER_NAME) return KIMI_CODE_PRODUCT_NAME;
+  return provider.startsWith('managed:') ? provider.slice('managed:'.length) : provider;
+}
 
 export type ManagedKimiCodeProtocol = 'kimi' | 'anthropic';
 

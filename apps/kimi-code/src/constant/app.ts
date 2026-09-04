@@ -1,8 +1,9 @@
 import { ErrorCodes } from '@moonshot-ai/kimi-code-sdk';
+import { KIMI_CODE_PRODUCT_NAME, KIMI_CODE_PROVIDER_NAME } from '@moonshot-ai/kimi-code-oauth';
 
 import { currentKimiProfile } from '#/utils/region';
 
-export const PRODUCT_NAME = 'Kimi Code';
+export const PRODUCT_NAME = KIMI_CODE_PRODUCT_NAME;
 export const CLI_COMMAND_NAME = 'kimi';
 export const PROCESS_NAME = 'kimi-code';
 
@@ -66,7 +67,7 @@ export const KIMI_CODE_BANNER_DIR_NAME = 'banner';
 export const KIMI_CODE_BANNER_STATE_FILE_NAME = 'state.json';
 
 // Managed Kimi auth provider key shared with OAuth/SDK config.
-export const DEFAULT_OAUTH_PROVIDER_NAME = 'managed:kimi-code';
+export const DEFAULT_OAUTH_PROVIDER_NAME = KIMI_CODE_PROVIDER_NAME;
 
 // SDK/core error code that tells the TUI to show a login-required startup
 // notice. Derived from sdk's ErrorCodes so a future rename in core

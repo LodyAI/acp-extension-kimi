@@ -4,6 +4,8 @@ import { join } from 'node:path';
 
 import { afterEach, describe, expect, it } from 'vitest';
 
+import { buildModelOption } from '../src/config-options';
+import type { AcpModelEntry } from '../src/model-catalog';
 import { AcpSession } from '../src/session';
 import { createTestClient, type TestClient } from './_helpers/acpClient';
 import { FAKE_MODEL_ALT_ID, writeFakeModelConfig } from './_helpers/fakeModelConfig';
@@ -11,7 +13,11 @@ import { FAKE_MODEL_ALT_ID, writeFakeModelConfig } from './_helpers/fakeModelCon
 interface ConfigOption {
   readonly id: string;
   readonly currentValue: string;
-  readonly options?: ReadonlyArray<{ readonly value: string; readonly name?: string }>;
+  readonly options?: ReadonlyArray<{
+    readonly value: string;
+    readonly name?: string;
+    readonly description?: string;
+  }>;
 }
 
 interface ModesState {
@@ -72,6 +78,23 @@ describe('acp-server config surface', () => {
     })) as NewSessionResult;
   }
 
+  it('keeps a model description when a provider is present', () => {
+    const models: readonly AcpModelEntry[] = [
+      {
+        id: 'alpha',
+        name: 'Alpha',
+        description: 'Latest Kimi model',
+        provider: 'managed:kimi-code',
+        thinkingSupported: false,
+        defaultThinkingEffort: 'on',
+      },
+    ];
+
+    const option = buildModelOption(models, 'alpha');
+    if (option.type !== 'select') throw new Error('expected SessionConfigSelect');
+    expect(option.options[0]).toMatchObject({ description: 'Latest Kimi model' });
+  });
+
   it(
     'session/new advertises mode + model pickers (no thinking without a model)',
     async () => {
@@ -83,6 +106,17 @@ describe('acp-server config surface', () => {
       expect(ids).not.toContain('thinking');
       const mode = configOptions.find((o) => o.id === 'mode')!;
       expect(mode.currentValue).toBe('default');
+    },
+    30_000,
+  );
+
+  it(
+    'session/new exposes the model provider as description',
+    async () => {
+      await boot({ fakeModel: true });
+      const { configOptions } = await newSession();
+      const model = configOptions.find((o) => o.id === 'model');
+      expect(model?.options?.[0]?.description).toBe('localhost');
     },
     30_000,
   );
