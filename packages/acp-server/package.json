@@ -2,7 +2,7 @@
   "name": "@moonshot-ai/acp-server",
   "version": "0.0.1",
   "private": true,
-  "description": "Agent Client Protocol (ACP) host backed directly by the DI × Scope agent engine (agent-core-v2)",
+  "description": "Agent Client Protocol (ACP) host backed directly by the DI \u00d7 Scope agent engine (agent-core-v2)",
   "license": "MIT",
   "author": "Moonshot AI",
   "type": "module",
@@ -24,6 +24,6 @@
     "@moonshot-ai/kimi-code-oauth": "workspace:^",
     "@moonshot-ai/klient": "workspace:^",
     "@moonshot-ai/protocol": "workspace:^",
-    "acp-extension-core": "0.1.0"
+    "acp-extension-core": "0.1.1"
   }
 }

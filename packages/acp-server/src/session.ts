@@ -103,7 +103,7 @@ import {
   withLodyTurnId,
 } from './lody-extension';
 import { projectModelCatalog } from './model-catalog';
-import { ACP_MODES, type AcpModeId, acpModeToToggles, DEFAULT_MODE_ID } from './modes';
+import { ACP_MODES, type AcpModeId, DEFAULT_MODE_ID } from './modes';
 import { projectHistoryToSessionUpdates } from './replay';
 import { buildAcpSkillSlashCommands, detectSlashIntent } from './slash';
 
@@ -233,6 +233,7 @@ export class AcpSession {
   private currentThinkingLevel: string = 'off';
   /** Current ACP mode. */
   private currentModeId: AcpModeId = DEFAULT_MODE_ID;
+  private planMode = false;
   /**
    * Cached session skill summaries — the backing data for slash-intent
    * detection and `availableCommands()`. Seeded in `init()` and refreshed on
@@ -400,6 +401,23 @@ export class AcpSession {
         });
         this.settleHeldPromptIfDrained();
       }),
+      events.on('agent.status.updated', (event) => {
+        let changed = false;
+        if (typeof event['planMode'] === 'boolean' && event['planMode'] !== this.planMode) {
+          this.planMode = event['planMode'];
+          changed = true;
+        }
+        if (
+          event['permissionMode'] === 'manual' ||
+          event['permissionMode'] === 'auto' ||
+          event['permissionMode'] === 'yolo'
+        ) {
+          this.currentModeId =
+            event['permissionMode'] === 'manual' ? 'default' : event['permissionMode'];
+          changed = true;
+        }
+        if (changed) void this.emitConfigOptionUpdate();
+      }),
       events.on('task.started', (event) => {
         if (event.info.kind === 'agent') {
           this.activeSubagentTasks.add(event.info.taskId);
@@ -462,6 +480,9 @@ export class AcpSession {
         error: error instanceof Error ? error.message : String(error),
       });
     }
+    const permission = await this.agent.getPermission();
+    this.currentModeId = permission === 'manual' ? 'default' : permission;
+    this.planMode = (await this.agent.getPlan()) !== null;
     // Awaited: the post-`session/new` `available_commands_update` must already
     // carry the skills (see `activateSession`).
     await this.refreshSkills();
@@ -1409,21 +1430,28 @@ export class AcpSession {
    */
   async configOptions(): Promise<SessionConfigOption[]> {
     const models = projectModelCatalog(await this.klient.global.kosong.listModels());
+    const permission = await this.agent.getPermission();
+    this.currentModeId = permission === 'manual' ? 'default' : permission;
+    this.planMode = (await this.agent.getPlan()) !== null;
     return buildSessionConfigOptions(
       models,
       this.currentModelId,
       this.currentThinkingLevel,
       this.currentModeId,
+      this.planMode,
     );
   }
 
   /**
    * The first-class `modes` ({@link SessionModeState}) snapshot for the
    * `session/new` / `session/load` / `session/resume` responses — the same
-   * taxonomy the `mode` config-option arm projects.
+   * permission choices the `permission_mode` config option projects.
    */
   modeState(): SessionModeState {
-    return { currentModeId: this.currentModeId, availableModes: [...ACP_MODES] };
+    return {
+      currentModeId: this.currentModeId,
+      availableModes: ACP_MODES.filter((mode) => mode.id !== 'plan'),
+    };
   }
 
   /**
@@ -1492,25 +1520,25 @@ export class AcpSession {
     return true;
   }
 
-  /** Switch the ACP mode (plan mode + permission mode). */
+  /** Legacy mode requests remain readable; new clients use independent config options. */
   async setMode(id: AcpModeId): Promise<void> {
-    const { plan, permission } = acpModeToToggles(id);
-    if (plan) {
-      await this.agent.enterPlan();
-    } else {
-      // KLIENT-GAP(plan): `exitPlan` (`planService.exit()`) is not on the
-      // klient surface; `cancelPlan` (`planModeCancel`) has the identical
-      // state effect (see `agent/plan/planOps.ts`) — only the persisted op
-      // name differs.
-      await this.agent.cancelPlan();
+    if(id === 'plan') {
+      await this.setPlanMode(true);
+      return;
     }
-    await this.agent.setPermission(permission);
+    await this.agent.setPermission(id === 'default' ? 'manual' : id);
     this.currentModeId = id;
-    // Both notifications fire: `current_mode_update` serves clients reading
-    // the first-class `modes` state, `config_option_update` serves clients
-    // reading the `mode` config-option arm. (Engine-side mode changes are not
-    // observable — klient exposes no permission/plan change event.)
     this.emit(currentModeUpdateNotification(this.sessionId, id));
+    await this.emitConfigOptionUpdate();
+  }
+
+  async setPlanMode(enabled: boolean): Promise<void> {
+    const active = (await this.agent.getPlan()) !== null;
+    if (active !== enabled) {
+      if (enabled) await this.agent.enterPlan();
+      else await this.agent.cancelPlan();
+    }
+    this.planMode = enabled;
     await this.emitConfigOptionUpdate();
   }
 
