@@ -95,16 +95,47 @@ describe('acp-server config surface', () => {
     expect(option.options[0]).toMatchObject({ description: 'Latest Kimi model' });
   });
 
+  it('keeps YOLO selected across boolean Plan switches and rejects string values', async () => {
+    await boot();
+    const { sessionId } = await newSession();
+    await client!.send('session/set_config_option', {
+      sessionId,
+      configId: 'permission_mode',
+      value: 'yolo',
+    });
+    for (const active of [true, false]) {
+      const response = (await client!.send('session/set_config_option', {
+        sessionId,
+        configId: 'plan_mode',
+        type: 'boolean',
+        value: active,
+      })) as { configOptions: Array<{ id: string; currentValue: unknown }> };
+      expect(response.configOptions.find((option) => option.id === 'plan_mode')?.currentValue).toBe(
+        active,
+      );
+      expect(
+        response.configOptions.find((option) => option.id === 'permission_mode')?.currentValue,
+      ).toBe('yolo');
+    }
+    await expect(
+      client!.send('session/set_config_option', {
+        sessionId,
+        configId: 'plan_mode',
+        value: 'true',
+      }),
+    ).rejects.toThrow();
+  });
+
   it(
     'session/new advertises mode + model pickers (no thinking without a model)',
     async () => {
       await boot();
       const { configOptions } = await newSession();
       const ids = configOptions.map((o) => o.id);
-      expect(ids).toContain('mode');
+      expect(ids).toContain('permission_mode');
       expect(ids).toContain('model');
       expect(ids).not.toContain('thinking');
-      const mode = configOptions.find((o) => o.id === 'mode')!;
+      const mode = configOptions.find((o) => o.id === 'permission_mode')!;
       expect(mode.currentValue).toBe('default');
     },
     30_000,
@@ -129,7 +160,6 @@ describe('acp-server config surface', () => {
       expect(modes?.currentModeId).toBe('default');
       expect(modes?.availableModes.map((m) => m.id)).toEqual([
         'default',
-        'plan',
         'auto',
         'yolo',
       ]);
@@ -156,7 +186,7 @@ describe('acp-server config surface', () => {
       const configUpdate = (
         configNotification.params as { update?: { configOptions?: readonly ConfigOption[] } }
       ).update;
-      expect(configUpdate?.configOptions?.find((o) => o.id === 'mode')?.currentValue).toBe('yolo');
+      expect(configUpdate?.configOptions?.find((o) => o.id === 'permission_mode')?.currentValue).toBe('yolo');
     },
     30_000,
   );
@@ -167,6 +197,7 @@ describe('acp-server config surface', () => {
       const session = Object.create(AcpSession.prototype) as AcpSession;
       const updates: unknown[] = [];
       const agent = {
+        getPlan: async () => null,
         enterPlan: async () => {
           throw new Error('plan toggle failed');
         },
@@ -187,20 +218,22 @@ describe('acp-server config surface', () => {
   );
 
   it(
-    'session/set_config_option mode also pushes current_mode_update',
+    'legacy plan selection updates Plan without changing permissions',
     async () => {
       await boot();
       const { sessionId } = await newSession();
-      const modeUpdatePromise = client!.waitForSessionUpdate('current_mode_update');
+      const updatePromise = client!.waitForSessionUpdate('config_option_update');
       await client!.send('session/set_config_option', {
         sessionId,
         configId: 'mode',
         value: 'plan',
       });
-      const modeNotification = await modeUpdatePromise;
-      const modeUpdate = (modeNotification.params as { update?: { currentModeId?: string } })
-        .update;
-      expect(modeUpdate?.currentModeId).toBe('plan');
+      const notification = await updatePromise;
+      const { update } = notification.params as {
+        update: { configOptions: Array<{ id: string; currentValue: unknown }> };
+      };
+      expect(update.configOptions.find((o) => o.id === 'plan_mode')?.currentValue).toBe(true);
+      expect(update.configOptions.find((o) => o.id === 'permission_mode')?.currentValue).toBe('default');
     },
     30_000,
   );
@@ -215,7 +248,7 @@ describe('acp-server config surface', () => {
         configId: 'mode',
         value: 'yolo',
       })) as { configOptions: readonly ConfigOption[] };
-      const mode = result.configOptions.find((o) => o.id === 'mode')!;
+      const mode = result.configOptions.find((o) => o.id === 'permission_mode')!;
       expect(mode.currentValue).toBe('yolo');
     },
     30_000,

@@ -3,7 +3,7 @@
  * `session/new` + `session/load` + `session/resume` and refreshed by
  * `config_option_update`.
  *
- * The surface has up to three options:
+ * The surface has up to four options:
  *   - `id: 'model'`    (`type: 'select'`, `category: 'model'`) — one row per
  *     {@link AcpModelEntry}. Thinking is an orthogonal axis (separate toggle).
  *   - `id: 'thinking'` (`type: 'select'`, `category: 'thought_level'`) —
@@ -15,12 +15,13 @@
  *     declared capability: a model with `supportEfforts` offers `off` plus
  *     every declared effort level; a boolean model keeps the plain
  *     `off` / `on` pair. `always_thinking` models drop the `off` entry.
- *   - `id: 'mode'`     (`type: 'select'`, `category: 'mode'`) — the locked
- *     4-mode taxonomy ({@link ACP_MODES}).
+ *   - `id: 'permission_mode'` — independent approval policy.
+ *   - Core `plan_mode` — boolean planning intent.
  */
 
 import type { SessionConfigOption, SessionConfigSelectOption } from '@agentclientprotocol/sdk';
 import { providerDisplayName } from '@moonshot-ai/kimi-code-oauth';
+import { createPlanModeConfigOption } from 'acp-extension-core';
 
 import { ACP_MODES, type AcpModeId } from './modes';
 import type { AcpModelEntry } from './model-catalog';
@@ -87,21 +88,21 @@ function thinkingOptionName(value: string): string {
 }
 
 /**
- * Project the locked 4-mode taxonomy ({@link ACP_MODES}) into the
- * `SessionConfigOption` `mode` arm. Order is preserved (default → plan → auto →
- * yolo).
+ * Project the permission choices; legacy Plan is not an approval policy.
  */
 export function buildModeOption(currentModeId: AcpModeId): SessionConfigOption {
-  const options: SessionConfigSelectOption[] = ACP_MODES.map((mode) => ({
-    value: mode.id,
-    name: mode.name,
-    description: mode.description,
-  }));
+  const options: SessionConfigSelectOption[] = ACP_MODES.filter((mode) => mode.id !== 'plan').map(
+    (mode) => ({
+      value: mode.id,
+      name: mode.name,
+      description: mode.description,
+    }),
+  );
   return {
     type: 'select',
-    id: 'mode',
-    name: 'Mode',
-    category: 'mode',
+    id: 'permission_mode',
+    name: 'Permission',
+    category: '_permission',
     currentValue: currentModeId,
     options,
   };
@@ -124,6 +125,7 @@ export function buildSessionConfigOptions(
   currentBaseModelId: string,
   currentThinkingLevel: string,
   currentModeId: AcpModeId,
+  planMode = false,
 ): SessionConfigOption[] {
   const currentModelEntry = models.find((m) => m.id === currentBaseModelId);
   const showThinking = currentModelEntry?.thinkingSupported === true;
@@ -135,6 +137,6 @@ export function buildSessionConfigOptions(
     const level = alwaysThinking && currentThinkingLevel === 'off' ? 'on' : currentThinkingLevel;
     out.push(buildThinkingOption(level, alwaysThinking, currentModelEntry?.supportEfforts));
   }
-  out.push(buildModeOption(currentModeId));
+  out.push(buildModeOption(currentModeId), createPlanModeConfigOption(planMode));
   return out;
 }

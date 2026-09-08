@@ -52,6 +52,7 @@ export const agentLoopContract = {
 } satisfies ServiceContract;
 
 export const agentPermissionModeContract = {
+  mode: { input: z.tuple([]), output: permissionModeSchema },
   setModeAndBroadcast: { input: z.tuple([permissionModeSchema]), output: noResult },
 } satisfies ServiceContract;
 

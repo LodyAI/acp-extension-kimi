@@ -509,8 +509,8 @@ importers:
         specifier: workspace:^
         version: link:../protocol
       acp-extension-core:
-        specifier: 0.1.0
-        version: 0.1.0
+        specifier: 0.1.1
+        version: 0.1.1
 
   packages/agent-core:
     dependencies:
@@ -4801,8 +4801,8 @@ packages:
     engines: {node: '>=0.4.0'}
     hasBin: true
 
-  acp-extension-core@0.1.0:
-    resolution: {integrity: sha512-otUAYPQQrHWk348jB+WW0/0XCajqFqqPRGh5BdhH3nc1Ayma1j3pFyscXXASgBekor4rlxsBRd98KSfn3ede8g==}
+  acp-extension-core@0.1.1:
+    resolution: {integrity: sha512-mZgd1T+GcA9uMZXL045Qmel4cbyB7IMsCPBS5s5EanDIMI3JAO5Pe3eaFb9lu5uWuNDhHzvbsYkGcYeYZIZayw==}
 
   agent-base@7.1.4:
     resolution: {integrity: sha512-MnA+YT8fwfJPgBx3m60MNqakm30XOkyIoH1y6huTQvC0PwZG7ki8NacLBcrPbNoo8vEZy7Jpuk7+jMO+CUovTQ==}
@@ -13669,7 +13669,7 @@ snapshots:
 
   acorn@8.17.0: {}
 
-  acp-extension-core@0.1.0: {}
+  acp-extension-core@0.1.1: {}
 
   agent-base@7.1.4: {}
 

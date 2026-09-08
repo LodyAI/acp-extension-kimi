@@ -54,6 +54,8 @@ function makeFakeKlient(forkTurns: readonly ForkTurnSummary[] = []): {
     },
     getModel: () => Promise.resolve('kimi-for-coding'),
     getThinking: () => Promise.resolve('off'),
+    getPermission: () => Promise.resolve('manual'),
+    getPlan: () => Promise.resolve(null),
     getUsage: () => Promise.resolve({}),
     getTasks: () => Promise.resolve([]),
   };

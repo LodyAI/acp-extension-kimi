@@ -18,6 +18,7 @@
  * through the client terminal (`./acp-terminal`).
  */
 
+import { LODY_PLAN_MODE_CONFIG_ID } from 'acp-extension-core';
 import {
   agent,
   type AgentApp,
@@ -494,7 +495,15 @@ export class AcpServer {
       case 'model':
         await acpSession.setModel(String(value));
         break;
+      case LODY_PLAN_MODE_CONFIG_ID:
+        if (typeof value !== 'boolean')
+          throw RequestError.invalidParams({ value }, 'Plan requires a boolean');
+        await acpSession.setPlanMode(value);
+        break;
+      case 'permission_mode':
       case 'mode': {
+        if (params.configId === 'permission_mode' && value === 'plan')
+          throw RequestError.invalidParams({ value }, 'Plan is not a permission mode');
         if (!isAcpModeId(value)) {
           throw RequestError.invalidParams({ modeId: value }, `Unknown modeId: ${String(value)}`);
         }
