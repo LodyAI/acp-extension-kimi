@@ -42,9 +42,41 @@ export function readLodyForkTurnIndex(meta: unknown): number | undefined {
  */
 export function withLodyTurnId<T extends SessionNotification | null>(
   notification: T,
-  turnId: string | undefined,
+  turnId: string | undefined
 ): T {
-  if (notification === null || turnId === undefined) return notification;
+  return withLodyTurnIdentity(notification, { turnId });
+}
+
+/**
+ * Attach a turn identity (`_meta.lody.turnId`, optionally
+ * `_meta.lody.turnOrigin` and the `turnEnded` marker) without disturbing any
+ * other `_meta` entry.
+ *
+ * The turn id is the fork position for user-visible turns; turns the engine
+ * opened itself (a cron fire, a task wake) carry a non-numeric `auto:<n>` id
+ * instead — it can never be parsed back into a fork position — plus the
+ * origin kind, so the client can route the update to its own turn entry
+ * instead of merging it into whichever client turn ran last. `turnEnded`
+ * marks the engine turn's end: the client owns finalization for turns it
+ * dispatches, but only this marker tells it an engine-opened turn is done.
+ * Notifications with no identity fields pass through untouched.
+ */
+export function withLodyTurnIdentity<T extends SessionNotification | null>(
+  notification: T,
+  identity: {
+    turnId?: string | undefined;
+    turnOrigin?: string | undefined;
+    turnEnded?: boolean | undefined;
+  }
+): T {
+  if (
+    notification === null ||
+    (identity.turnId === undefined &&
+      identity.turnOrigin === undefined &&
+      identity.turnEnded === undefined)
+  ) {
+    return notification;
+  }
   const update = notification.update as typeof notification.update & {
     _meta?: Record<string, unknown> | null;
   };
@@ -52,7 +84,18 @@ export function withLodyTurnId<T extends SessionNotification | null>(
   const lody = asRecord(meta['lody']) ?? {};
   return {
     ...notification,
-    update: { ...update, _meta: { ...meta, lody: { ...lody, turnId } } },
+    update: {
+      ...update,
+      _meta: {
+        ...meta,
+        lody: {
+          ...lody,
+          ...(identity.turnId === undefined ? {} : { turnId: identity.turnId }),
+          ...(identity.turnOrigin === undefined ? {} : { turnOrigin: identity.turnOrigin }),
+          ...(identity.turnEnded === undefined ? {} : { turnEnded: identity.turnEnded }),
+        },
+      },
+    },
   } as T;
 }
 
@@ -142,10 +185,7 @@ export function toLodySessionUsage(
   };
 }
 
-export function toLodyRateLimits(
-  result: ManagedUsageResult,
-  now = Date.now(),
-): RateLimitsSnapshot {
+export function toLodyRateLimits(result: ManagedUsageResult, now = Date.now()): RateLimitsSnapshot {
   if (result.kind === 'error') {
     return {
       rateLimits: [],
@@ -178,7 +218,7 @@ export function toLodyTaskLifecycle(
   sessionId: string,
   event: 'started' | 'terminated',
   task: SubagentTaskInfo,
-  output?: string,
+  output?: string
 ): SessionNotification {
   const terminal = event === 'terminated';
   const status = terminal ? taskStatus(task.status) : 'in_progress';
@@ -193,9 +233,7 @@ export function toLodyTaskLifecycle(
     actor: task.subagentType === undefined ? 'Kimi subagent' : `Kimi ${task.subagentType}`,
     ...(task.model === undefined ? {} : { modelId: task.model }),
     startedAtEpochSeconds: Math.floor(task.startedAt / 1_000),
-    ...(task.endedAt === null
-      ? {}
-      : { endedAtEpochSeconds: Math.floor(task.endedAt / 1_000) }),
+    ...(task.endedAt === null ? {} : { endedAtEpochSeconds: Math.floor(task.endedAt / 1_000) }),
     ...(summary === undefined ? {} : { summary }),
     ...(terminal && task.status !== 'completed' && task.stopReason
       ? { error: task.stopReason }
@@ -247,7 +285,7 @@ function bounded(value: string | undefined, max: number): string | undefined {
 function durationSeconds(
   window:
     | { readonly duration: number; readonly unit: 'minute' | 'hour' | 'day' | 'week' }
-    | undefined,
+    | undefined
 ): number | null {
   if (window === undefined) return null;
   switch (window.unit) {
