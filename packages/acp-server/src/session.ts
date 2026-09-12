@@ -100,7 +100,7 @@ import {
   toLodyRateLimits,
   toLodySessionUsage,
   toLodyTaskLifecycle,
-  withLodyTurnId,
+  withLodyTurnIdentity,
 } from './lody-extension';
 import { projectModelCatalog } from './model-catalog';
 import { ACP_MODES, type AcpModeId, DEFAULT_MODE_ID } from './modes';
@@ -112,6 +112,20 @@ function leadingText(blocks: readonly ContentBlock[]): string | undefined {
   const first = blocks[0];
   if (first !== undefined && first.type === 'text') return first.text;
   return undefined;
+}
+
+/**
+ * The origin kind of an engine-opened turn (`cron_job`, `task`, ...), stamped
+ * as `_meta.lody.turnOrigin`. Falls back to `engine` when the origin carries
+ * no readable kind — the marker's job is routing, not classification fidelity.
+ */
+function turnOriginKind(origin: unknown): string {
+  const fields =
+    typeof origin === 'object' && origin !== null && !Array.isArray(origin)
+      ? (origin as Record<string, unknown>)
+      : undefined;
+  const kind = fields?.['kind'];
+  return typeof kind === 'string' && kind.length > 0 ? kind : 'engine';
 }
 
 /**
@@ -259,6 +273,15 @@ export class AcpSession {
    */
   private readonly forkTurnIdByTurn = new Map<number, string>();
   /**
+   * Engine turn id → origin kind, for turns the engine opened itself (a cron
+   * fire, a task wake). Their updates are stamped with a non-fork identity
+   * (`_meta.lody.turnId = auto:<n>` plus `_meta.lody.turnOrigin`) so the client
+   * can render them as their own turn instead of merging their output into
+   * whichever client turn ran last. User-visible turns stay unmarked — the
+   * client dispatches and tracks those itself.
+   */
+  private readonly engineTurnOriginByTurn = new Map<number, string>();
+  /**
    * Index the next user-visible turn will take, anchored at activation from
    * the engine's own record-level count. Undefined when that read failed —
    * publishing a guessed position would fork the wrong turn, so we publish
@@ -339,7 +362,7 @@ export class AcpSession {
      * shared temp-dir fallback applies.
      */
     private readonly resolveOriginalsDir?: (sessionId: string) => string | undefined,
-    private readonly hostCommands: ReadonlyArray<AvailableCommand> | HostSlashCommandsSnapshot = [],
+    private readonly hostCommands: ReadonlyArray<AvailableCommand> | HostSlashCommandsSnapshot = []
   ) {
     this.klient = klient;
     this.session = klient.session(sessionId);
@@ -350,7 +373,7 @@ export class AcpSession {
       conn,
       this.session,
       sessionId,
-      elicitationForm,
+      elicitationForm
     );
   }
 
@@ -387,12 +410,32 @@ export class AcpSession {
       events.on('turn.started', (event) => {
         this.runningTurns.add(event.turnId);
         this.assignForkTurnIndex(event);
+        this.assignEngineTurnOrigin(event);
         // The awaited wake turn arrived: `runningTurns` now holds settlement.
         this.clearWakeTurnGrace();
       }),
       events.on('turn.ended', (event) => {
         this.runningTurns.delete(event.turnId);
         this.forkTurnIdByTurn.delete(event.turnId);
+        const engineTurnOrigin = this.engineTurnOriginByTurn.get(event.turnId);
+        this.engineTurnOriginByTurn.delete(event.turnId);
+        if (engineTurnOrigin !== undefined) {
+          // The client owns finalization for turns it dispatches; an
+          // engine-opened turn needs this marker or its entry streams forever.
+          this.emit(
+            withLodyTurnIdentity(
+              {
+                sessionId: this.sessionId,
+                update: { sessionUpdate: 'session_info_update' },
+              },
+              {
+                turnId: `auto:${event.turnId}`,
+                turnOrigin: engineTurnOrigin,
+                turnEnded: true,
+              }
+            )
+          );
+        }
         // Settlement stays turn-scoped (only this prompt's own turn resolves
         // it), but the drain check runs for every turn — an engine-opened
         // turn ending is what releases a held prompt.
@@ -448,20 +491,20 @@ export class AcpSession {
       }),
       events.on('compaction.blocked', () => {
         this.finishCompaction('Compaction is blocked by the current turn');
-      }),
+      })
     );
     // Session-scope stream: title changes surface as `session_info_update`.
     this.subscriptions.push(
       this.session.events.on('metadata.changed', (event) => {
         this.onMetadataChanged(event);
-      }),
+      })
     );
     // Skill catalog changes refresh the cache and re-push the available
     // commands so the client's slash menu tracks the live catalog.
     this.subscriptions.push(
       this.session.events.on('skills.changed', () => {
         void this.refreshSkills().then(() => this.emitAvailableCommandsUpdate());
-      }),
+      })
     );
     // Terminal correlation: the ACP-backed process runner (same process,
     // App-scope holder) announces every terminal it creates so this session
@@ -664,7 +707,7 @@ export class AcpSession {
    * parts otherwise.
    */
   private async preparePromptContent(
-    blocks: readonly ContentBlock[],
+    blocks: readonly ContentBlock[]
   ): Promise<readonly ContentPart[] | undefined> {
     const pending = { aborted: false };
     this.pendingPromptAborts.add(pending);
@@ -708,7 +751,7 @@ export class AcpSession {
   private driveSkillActivation(skillName: string, args: string): Promise<PromptResponse> {
     this.assertNoActiveTurn();
     return this.driveLaunch(
-      this.agent.activateSkill({ name: skillName, args: args.length > 0 ? args : undefined }),
+      this.agent.activateSkill({ name: skillName, args: args.length > 0 ? args : undefined })
     );
   }
 
@@ -721,7 +764,7 @@ export class AcpSession {
   private async driveBuiltinCommand(
     name: AcpBuiltinSlashCommandName,
     args: string,
-    availableCommands: readonly AvailableCommand[],
+    availableCommands: readonly AvailableCommand[]
   ): Promise<PromptResponse> {
     let text: string;
     try {
@@ -737,7 +780,7 @@ export class AcpSession {
           modeId: this.currentModeId,
           availableCommands,
         },
-        args,
+        args
       );
     } catch (error) {
       log.warn('acp: builtin slash command failed', {
@@ -779,7 +822,7 @@ export class AcpSession {
     if (this.driver !== undefined && !this.driver.settled) {
       throw RequestError.invalidRequest(
         { code: TURN_AGENT_BUSY_CODE },
-        'another turn is already in progress',
+        'another turn is already in progress'
       );
     }
   }
@@ -843,7 +886,7 @@ export class AcpSession {
           this.settleDriver(driver, () => {
             reject(mapPromptLaunchError(error, this.sessionId));
           });
-        },
+        }
       );
     });
   }
@@ -911,9 +954,27 @@ export class AcpSession {
     this.nextForkTurnIndex += 1;
   }
 
+  /**
+   * Mark a turn the engine opened itself so {@link emitForTurn} stamps it with
+   * a non-fork identity. Runs alongside {@link assignForkTurnIndex} — the two
+   * markers are mutually exclusive by origin.
+   */
+  private assignEngineTurnOrigin(event: AgentEventPayloads['turn.started']): void {
+    if (isUserVisibleTurnOrigin(event.origin)) return;
+    this.engineTurnOriginByTurn.set(event.turnId, turnOriginKind(event.origin));
+  }
+
   /** Emit a turn's update, carrying its fork position when it has one. */
   private emitForTurn(turnId: number, notification: SessionNotification | null): void {
-    this.emit(withLodyTurnId(notification, this.forkTurnIdByTurn.get(turnId)));
+    const engineTurnOrigin = this.engineTurnOriginByTurn.get(turnId);
+    this.emit(
+      withLodyTurnIdentity(notification, {
+        turnId:
+          this.forkTurnIdByTurn.get(turnId) ??
+          (engineTurnOrigin === undefined ? undefined : `auto:${turnId}`),
+        ...(engineTurnOrigin === undefined ? {} : { turnOrigin: engineTurnOrigin }),
+      })
+    );
   }
 
   private onAssistantDelta(event: AgentEventPayloads['assistant.delta']): void {
@@ -957,12 +1018,12 @@ export class AcpSession {
       event.turnId,
       lazyCreated
         ? toolCallStartedUpgradeToSessionUpdate(this.sessionId, mapped)
-        : toolCallStartToSessionUpdate(this.sessionId, mapped),
+        : toolCallStartToSessionUpdate(this.sessionId, mapped)
     );
     if (event.display !== undefined) {
       this.emitForTurn(
         event.turnId,
-        planFromDisplayBlock(this.sessionId, event.turnId, event.display as ToolInputDisplay),
+        planFromDisplayBlock(this.sessionId, event.turnId, event.display as ToolInputDisplay)
       );
     }
   }
@@ -994,7 +1055,7 @@ export class AcpSession {
     // and returns null for everything else, which `emit` drops.
     this.emitForTurn(
       event.turnId,
-      toolProgressToSessionUpdate(this.sessionId, event as unknown as ToolProgressEvent),
+      toolProgressToSessionUpdate(this.sessionId, event as unknown as ToolProgressEvent)
     );
   }
 
@@ -1025,7 +1086,7 @@ export class AcpSession {
     }
     this.emitForTurn(
       event.turnId,
-      toolResultToSessionUpdate(this.sessionId, event as unknown as ToolResultEvent, locations),
+      toolResultToSessionUpdate(this.sessionId, event as unknown as ToolResultEvent, locations)
     );
   }
 
@@ -1197,7 +1258,7 @@ export class AcpSession {
   /** Provider-neutral task snapshot used by Lody's subagent management UI. */
   async listSubagents(activeOnly = false): Promise<readonly SubagentTaskInfo[]> {
     return (await this.agent.getTasks({ activeOnly })).filter(
-      (task): task is SubagentTaskInfo => task.kind === 'agent',
+      (task): task is SubagentTaskInfo => task.kind === 'agent'
     );
   }
 
@@ -1211,7 +1272,7 @@ export class AcpSession {
 
   private async emitTaskLifecycle(
     event: 'started' | 'terminated',
-    task: AgentTaskInfo,
+    task: AgentTaskInfo
   ): Promise<void> {
     if (task.kind !== 'agent') return;
     let output: string | undefined;
@@ -1230,12 +1291,12 @@ export class AcpSession {
     try {
       await this.captureDetailedUsage(true);
       const contextWindow = (await this.klient.global.kosong.listModels()).find(
-        (item) => item.model === this.currentModelId,
+        (item) => item.model === this.currentModelId
       )?.max_context_size;
       const update = toLodySessionUsage(
         this.sessionId,
         Object.fromEntries(this.lodyUsageSinceActivation),
-        contextWindow,
+        contextWindow
       );
       if (update !== null) {
         await this.emitExtension(LODY_EXTENSION_METHODS.sessionUsageUpdate, { ...update });
@@ -1265,7 +1326,7 @@ export class AcpSession {
           if (!hasTokenUsage(delta)) continue;
           this.lodyUsageSinceActivation.set(
             model,
-            addTokenUsage(this.lodyUsageSinceActivation.get(model), delta),
+            addTokenUsage(this.lodyUsageSinceActivation.get(model), delta)
           );
         }
       } catch (error) {
@@ -1280,7 +1341,7 @@ export class AcpSession {
 
   private async usageByModel(
     handle: AgentHandle,
-    status: UsageStatus,
+    status: UsageStatus
   ): Promise<Readonly<Record<string, TokenUsage>>> {
     if (status.byModel !== undefined) return status.byModel;
     if (status.total === undefined) return {};
@@ -1293,7 +1354,7 @@ export class AcpSession {
       const usage = await this.klient.global.auth.managedUsage();
       await this.emitExtension(
         LODY_EXTENSION_METHODS.rateLimitsUpdate,
-        toLodyRateLimits(usage) as unknown as Record<string, unknown>,
+        toLodyRateLimits(usage) as unknown as Record<string, unknown>
       );
     } catch (error) {
       log.warn('acp: failed to push Lody managed usage', {
@@ -1325,7 +1386,7 @@ export class AcpSession {
   private async emitUsageUpdate(): Promise<void> {
     try {
       const size = (await this.klient.global.kosong.listModels()).find(
-        (item) => item.model === this.currentModelId,
+        (item) => item.model === this.currentModelId
       )?.max_context_size;
       if (size === undefined) return;
       const context = await this.agent.getContext();
@@ -1438,7 +1499,7 @@ export class AcpSession {
       this.currentModelId,
       this.currentThinkingLevel,
       this.currentModeId,
-      this.planMode,
+      this.planMode
     );
   }
 
@@ -1522,7 +1583,7 @@ export class AcpSession {
 
   /** Legacy mode requests remain readable; new clients use independent config options. */
   async setMode(id: AcpModeId): Promise<void> {
-    if(id === 'plan') {
+    if (id === 'plan') {
       await this.setPlanMode(true);
       return;
     }
@@ -1546,7 +1607,7 @@ export class AcpSession {
   private async emitConfigOptionUpdate(): Promise<void> {
     try {
       await this.conn.sessionUpdate(
-        configOptionUpdateNotification(this.sessionId, await this.configOptions()),
+        configOptionUpdateNotification(this.sessionId, await this.configOptions())
       );
     } catch (error) {
       log.warn('acp: failed to push config_option_update', {

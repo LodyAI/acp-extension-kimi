@@ -36,3 +36,11 @@ Package-local rules for `packages/acp-server`.
   records defining these positions stay, and a repeated or truncated prompt would match
   the wrong turn. A turn with no resolvable position is published without one; forking
   the wrong turn is worse than not offering the branch.
+- Turns the engine opens itself (a cron fire, a task wake) take no fork position, but
+  they still carry an identity: `_meta.lody.turnId = auto:<engineTurnId>` (non-numeric,
+  so it can never be parsed back into a fork position) plus `_meta.lody.turnOrigin` with
+  the origin kind. The client uses that pair to render the engine turn as its own turn
+  rather than folding its output into the client turn that ran last. `turn.ended` for
+  such a turn also emits a `session_info_update` carrying the same pair plus
+  `_meta.lody.turnEnded = true` — the client owns finalization for turns it dispatches,
+  so only this marker keeps the engine turn's entry from streaming forever.
