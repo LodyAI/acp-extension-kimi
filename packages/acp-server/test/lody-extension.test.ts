@@ -10,6 +10,27 @@ import {
 } from '../src/lody-extension';
 
 describe('Lody ACP extension projections', () => {
+  it('returns already-included deltas from the last emitted activation snapshot', () => {
+    const row = (inputOther: number) => ({
+      inputOther,
+      output: 10,
+      inputCacheRead: 20,
+      inputCacheCreation: 5,
+    });
+    const previous = { main: row(100) };
+    const current = { main: row(150), child: row(30) };
+    const update = toLodySessionUsage('s', current, 10000, previous);
+    expect(update?.usage.inputTokens).toBe(180);
+    expect(update?.delta?.usage.inputTokens).toBe(80);
+    expect(update?.delta?.usage.costUSD).toBeUndefined();
+    expect(update?.delta?.modelUsage.child.inputTokens).toBe(30);
+    expect(toLodySessionUsage('s', current, 10000, current)?.delta?.usage.inputTokens).toBe(0);
+    // If emission failed, the unchanged baseline includes both pending captures.
+    expect(
+      toLodySessionUsage('s', { main: row(180), child: row(30) }, 10000, previous)?.delta?.usage
+        .inputTokens,
+    ).toBe(110);
+  });
   it('subtracts activation baselines and tolerates a reset counter', () => {
     const previous = {
       inputOther: 10,

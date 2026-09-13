@@ -10,6 +10,8 @@ Package-local rules for `packages/acp-server`.
   but never credentials, authorization output, or unbounded task output.
 - Scope token totals to the current ACP activation. Establish a baseline on resume so
   historical Kimi usage is not billed again, while retaining per-model/subagent totals.
+- Usage delta is already included in activation totals. Serialize accounting emissions
+  and advance the delta baseline only after successful notification delivery.
 - Subagent mutation requests require a live ACP session and use the engine task registry
   as the authoritative source for list, cancellation, lifecycle, and bounded output.
 - `session/update` covers EVERY turn of the session's main agent, including turns the

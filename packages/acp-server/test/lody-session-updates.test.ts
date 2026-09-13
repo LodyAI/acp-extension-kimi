@@ -17,7 +17,10 @@ type Listener = (event: unknown) => void;
  * turn settlement make. Reads answer with empty/neutral data — the session
  * treats every one of them as best-effort.
  */
-function makeFakeKlient(forkTurns: readonly ForkTurnSummary[] = []): {
+function makeFakeKlient(
+  forkTurns: readonly ForkTurnSummary[] = [],
+  usage: () => unknown = () => ({}),
+): {
   readonly klient: Klient;
   emit(event: string, payload: unknown): void;
   readonly prompts: number[];
@@ -56,7 +59,7 @@ function makeFakeKlient(forkTurns: readonly ForkTurnSummary[] = []): {
     getThinking: () => Promise.resolve('off'),
     getPermission: () => Promise.resolve('manual'),
     getPlan: () => Promise.resolve(null),
-    getUsage: () => Promise.resolve({}),
+    getUsage: () => Promise.resolve(usage()),
     getTasks: () => Promise.resolve([]),
   };
   const forks: Array<Record<string, unknown> | undefined> = [];
@@ -144,6 +147,53 @@ const assistantText = (updates: readonly SessionNotification[]): string[] =>
     });
 
 describe('background subagent work and the client prompt', () => {
+  it('serializes accounting emissions and retries the unreported delta after failure', async () => {
+    let inputOther = 0;
+    const fake = makeFakeKlient([], () => ({
+      byModel: {
+        model: {
+          inputOther,
+          output: 0,
+          inputCacheRead: 0,
+          inputCacheCreation: 0,
+        },
+      },
+    }));
+    const entered = Promise.withResolvers<void>();
+    const blocked = Promise.withResolvers<void>();
+    const delivered: Record<string, unknown>[] = [];
+    let first = true;
+    const { conn } = makeFakeConn();
+    const connection = {
+      ...conn,
+      extensionNotification: async (_method: string, params: Record<string, unknown>) => {
+        if (!('modelUsage' in params)) return;
+        if (first) {
+          first = false;
+          entered.resolve();
+          await blocked.promise;
+        }
+        delivered.push(params);
+      },
+    } as AcpClient;
+    const session = new AcpSession(connection, fake.klient, SESSION_ID, acpConnection, false);
+    await session.init();
+    const accounting = session as unknown as { emitDetailedUsageUpdate(): Promise<void> };
+    inputOther = 100;
+    const firstEmission = accounting.emitDetailedUsageUpdate();
+    await entered.promise;
+    inputOther = 150;
+    const queued = accounting.emitDetailedUsageUpdate();
+    blocked.reject(new Error('synthetic delivery failure'));
+    await Promise.all([firstEmission, queued]);
+    expect(delivered).toHaveLength(1);
+    expect(delivered[0]).toMatchObject({
+      usage: { inputTokens: 150 },
+      delta: { usage: { inputTokens: 150 } },
+    });
+    await accounting.emitDetailedUsageUpdate();
+    expect(delivered[1]).toMatchObject({ delta: { usage: { inputTokens: 0 } } });
+  });
   it('keeps the prompt in flight until a detached subagent and its wake turn finish', async () => {
     const { fake, session, updates } = await startSession();
 
