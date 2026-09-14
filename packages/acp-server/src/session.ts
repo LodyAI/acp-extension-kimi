@@ -411,6 +411,24 @@ export class AcpSession {
         this.runningTurns.add(event.turnId);
         this.assignForkTurnIndex(event);
         this.assignEngineTurnOrigin(event);
+        const engineTurnOrigin = this.engineTurnOriginByTurn.get(event.turnId);
+        if (engineTurnOrigin !== undefined) {
+          // Publish ownership before the first content delta. A queued Goal
+          // action must observe the engine turn during its entire lifetime,
+          // not only after output happens to arrive.
+          this.emit(
+            withLodyTurnIdentity(
+              {
+                sessionId: this.sessionId,
+                update: { sessionUpdate: 'session_info_update' },
+              },
+              {
+                turnId: `auto:${event.turnId}`,
+                turnOrigin: engineTurnOrigin,
+              }
+            )
+          );
+        }
         // The awaited wake turn arrived: `runningTurns` now holds settlement.
         this.clearWakeTurnGrace();
       }),

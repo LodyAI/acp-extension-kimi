@@ -355,7 +355,7 @@ describe('fork positions on the wire', () => {
     }
   });
 
-  it('emits an end marker when an engine-opened turn ends, and only then', async () => {
+  it('emits start and end markers around an engine-opened turn only', async () => {
     const { fake, session, updates } = await startSession([{ turnIndex: 0, prompt: 'first' }]);
 
     void session.prompt([{ type: 'text', text: 'second' }]);
@@ -374,6 +374,9 @@ describe('fork positions on the wire', () => {
       .map(
         (update) => (update as { _meta?: { lody?: Record<string, unknown> } })._meta?.lody ?? {}
       );
-    expect(markers).toEqual([{ turnId: 'auto:1', turnOrigin: 'cron_job', turnEnded: true }]);
+    expect(markers).toEqual([
+      { turnId: 'auto:1', turnOrigin: 'cron_job' },
+      { turnId: 'auto:1', turnOrigin: 'cron_job', turnEnded: true },
+    ]);
   });
 });
