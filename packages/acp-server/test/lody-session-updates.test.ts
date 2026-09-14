@@ -33,7 +33,7 @@ function makeFakeKlient(forkTurns: readonly ForkTurnSummary[] = []): {
       dispose: () => {
         listeners.set(
           event,
-          (listeners.get(event) ?? []).filter((entry) => entry !== listener),
+          (listeners.get(event) ?? []).filter((entry) => entry !== listener)
         );
       },
     };
@@ -194,7 +194,7 @@ describe('background subagent work and the client prompt', () => {
         fake.emit('turn.started', { turnId: 1 });
         fake.emit('turn.ended', { turnId: 1, reason: 'completed' });
         return pending;
-      })(),
+      })()
     ).resolves.toEqual({ stopReason: 'end_turn' });
 
     // A cron fire (or any other engine-opened turn) once the session is idle.
@@ -312,10 +312,71 @@ describe('fork positions on the wire', () => {
         .map((update) => [
           (update as { content: { text?: string } }).content.text,
           lodyTurnId(update),
-        ]),
+        ])
     );
-    expect(byText.get('cron')).toBeUndefined();
-    expect(byText.get('wake')).toBeUndefined();
+    // Engine-opened turns carry a non-fork identity instead: numeric-looking
+    // fork positions stay exclusive to user-visible turns.
+    expect(byText.get('cron')).toBe('auto:1');
+    expect(byText.get('wake')).toBe('auto:2');
     expect(byText.get('user turn')).toBe('1');
+  });
+
+  it('stamps the origin kind on an engine-opened turn but never on a user turn', async () => {
+    const lodyTurnOrigin = (update: SessionNotification['update']): string | undefined =>
+      (update as { _meta?: { lody?: { turnOrigin?: string } } })._meta?.lody?.turnOrigin;
+    const { fake, session, updates } = await startSession([{ turnIndex: 0, prompt: 'first' }]);
+
+    void session.prompt([{ type: 'text', text: 'second' }]);
+    await flush();
+    fake.emit('turn.started', { turnId: 1, origin: { kind: 'cron_job' } });
+    fake.emit('assistant.delta', { turnId: 1, delta: 'cron' });
+    fake.emit('thinking.delta', { turnId: 1, delta: 'cron thinking' });
+    fake.emit('turn.ended', { turnId: 1, reason: 'completed' });
+    fake.emit('turn.started', { turnId: 2, origin: { kind: 'user' } });
+    fake.emit('assistant.delta', { turnId: 2, delta: 'user turn' });
+    await flush();
+
+    const chunks = updates
+      .map((entry) => entry.update)
+      .filter(
+        (update) =>
+          update.sessionUpdate === 'agent_message_chunk' ||
+          update.sessionUpdate === 'agent_thought_chunk'
+      );
+    const textOf = (update: SessionNotification['update']): string | undefined =>
+      (update as { content?: { text?: string } }).content?.text;
+    for (const chunk of chunks) {
+      const text = textOf(chunk) ?? '';
+      if (text.startsWith('cron')) {
+        expect(lodyTurnOrigin(chunk)).toBe('cron_job');
+      } else {
+        expect(lodyTurnOrigin(chunk)).toBeUndefined();
+      }
+    }
+  });
+
+  it('emits start and end markers around an engine-opened turn only', async () => {
+    const { fake, session, updates } = await startSession([{ turnIndex: 0, prompt: 'first' }]);
+
+    void session.prompt([{ type: 'text', text: 'second' }]);
+    await flush();
+    fake.emit('turn.started', { turnId: 1, origin: { kind: 'cron_job' } });
+    fake.emit('assistant.delta', { turnId: 1, delta: 'cron' });
+    fake.emit('turn.ended', { turnId: 1, reason: 'completed' });
+    fake.emit('turn.started', { turnId: 2, origin: { kind: 'user' } });
+    fake.emit('assistant.delta', { turnId: 2, delta: 'user turn' });
+    fake.emit('turn.ended', { turnId: 2, reason: 'completed' });
+    await flush();
+
+    const markers = updates
+      .map((entry) => entry.update)
+      .filter((update) => update.sessionUpdate === 'session_info_update')
+      .map(
+        (update) => (update as { _meta?: { lody?: Record<string, unknown> } })._meta?.lody ?? {}
+      );
+    expect(markers).toEqual([
+      { turnId: 'auto:1', turnOrigin: 'cron_job' },
+      { turnId: 'auto:1', turnOrigin: 'cron_job', turnEnded: true },
+    ]);
   });
 });
