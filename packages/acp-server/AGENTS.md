@@ -43,6 +43,8 @@ Package-local rules for `packages/acp-server`.
   so it can never be parsed back into a fork position) plus `_meta.lody.turnOrigin` with
   the origin kind. The client uses that pair to render the engine turn as its own turn
   rather than folding its output into the client turn that ran last. `turn.ended` for
-  such a turn also emits a `session_info_update` carrying the same pair plus
-  `_meta.lody.turnEnded = true` — the client owns finalization for turns it dispatches,
-  so only this marker keeps the engine turn's entry from streaming forever.
+  such a turn emits a metadata-only `session_info_update` with the same pair at
+  `turn.started`, and another carrying `_meta.lody.turnEnded = true` at end — the
+  client owns finalization for turns it dispatches, so the start marker closes the
+  admission race and the end marker keeps the engine turn's entry from streaming
+  forever.
