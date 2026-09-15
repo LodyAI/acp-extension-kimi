@@ -317,6 +317,8 @@ export class AcpSession {
   private readonly lodyUsageBaselines = new Map<string, TokenUsage>();
   /** Cumulative usage attributable only to this ACP activation. */
   private readonly lodyUsageSinceActivation = new Map<string, TokenUsage>();
+  private lodyUsageLastEmitted: Record<string, TokenUsage> = {};
+  private lodyUsageEmission: Promise<void> = Promise.resolve();
   /** Compaction tool-call correlation for the current background compaction. */
   private activeCompaction: { readonly id: string; readonly automatic: boolean } | undefined;
   /** Bridges engine approval / ask-user requests to the ACP client. */
@@ -1226,19 +1228,29 @@ export class AcpSession {
     await this.conn.sessionUpdate(params);
   }
 
-  private async emitDetailedUsageUpdate(): Promise<void> {
+  private emitDetailedUsageUpdate(): Promise<void> {
+    this.lodyUsageEmission = this.lodyUsageEmission.then(() => this.pushDetailedUsageUpdate());
+    return this.lodyUsageEmission;
+  }
+
+  private async pushDetailedUsageUpdate(): Promise<void> {
     try {
       await this.captureDetailedUsage(true);
       const contextWindow = (await this.klient.global.kosong.listModels()).find(
         (item) => item.model === this.currentModelId,
       )?.max_context_size;
+      const snapshot = Object.fromEntries(this.lodyUsageSinceActivation);
       const update = toLodySessionUsage(
         this.sessionId,
-        Object.fromEntries(this.lodyUsageSinceActivation),
+        snapshot,
         contextWindow,
+        this.lodyUsageLastEmitted,
       );
       if (update !== null) {
-        await this.emitExtension(LODY_EXTENSION_METHODS.sessionUsageUpdate, { ...update });
+        await this.conn.extensionNotification(LODY_EXTENSION_METHODS.sessionUsageUpdate, {
+          ...update,
+        });
+        this.lodyUsageLastEmitted = snapshot;
       }
     } catch (error) {
       log.warn('acp: failed to push Lody token usage', {

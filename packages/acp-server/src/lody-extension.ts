@@ -6,7 +6,6 @@ import type {
   LodyTaskMeta,
   ModelUsage,
   RateLimitsSnapshot,
-  SessionUsageUpdate,
 } from 'acp-extension-core';
 
 export const LODY_EXTENSION_CAPABILITIES = {
@@ -108,7 +107,8 @@ export function toLodySessionUsage(
   sessionId: string,
   byModel: Readonly<Record<string, TokenUsage>>,
   contextWindow?: number,
-): SessionUsageUpdate | null {
+  previousByModel?: Readonly<Record<string, TokenUsage>>,
+) {
   let total: TokenUsage | undefined;
   const modelUsage: Record<string, ModelUsage> = {};
   for (const [model, usage] of Object.entries(byModel)) {
@@ -116,10 +116,29 @@ export function toLodySessionUsage(
     modelUsage[model] = toLodyModelUsage(usage, contextWindow);
   }
   if (total === undefined) return null;
+  // Compare activation totals, not just the latest capture: a failed emission
+  // must leave its contribution in the next delta. The caller advances the
+  // baseline only after emitting. Delta is already included in modelUsage.
+  const deltaModels: Record<string, ModelUsage> = {};
+  let deltaTotal: TokenUsage | undefined;
+  if (previousByModel !== undefined) {
+    for (const [model, current] of Object.entries(byModel)) {
+      const difference = tokenUsageDelta(current, previousByModel[model]);
+      deltaModels[model] = toLodyModelUsage(difference);
+      deltaTotal = addTokenUsage(deltaTotal, difference);
+    }
+  }
   return {
     sessionId,
     usage: toLodyModelUsage(total, contextWindow),
     modelUsage,
+    delta:
+      deltaTotal === undefined
+        ? undefined
+        : {
+            usage: toLodyModelUsage(deltaTotal),
+            modelUsage: deltaModels,
+          },
   };
 }
 

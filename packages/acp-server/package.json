@@ -24,6 +24,6 @@
     "@moonshot-ai/kimi-code-oauth": "workspace:^",
     "@moonshot-ai/klient": "workspace:^",
     "@moonshot-ai/protocol": "workspace:^",
-    "acp-extension-core": "0.1.1"
+    "acp-extension-core": "0.1.5"
   }
 }
