@@ -66,16 +66,8 @@ export const authStatusSchema = z.object({
   provider: z.string().optional(),
 });
 
-const managedUsageWindowSchema = z.object({
-  duration: z.number(),
-  unit: z.enum(['minute', 'hour', 'day', 'week']),
-});
-
-const managedUsageRowSchema = z.object({
-  name: z.string().optional(),
-  window: managedUsageWindowSchema.optional(),
-  used: z.number(),
-  limit: z.number(),
+const managedQuotaEntrySchema = z.object({
+  usedRatio: z.number(),
   resetAt: z.string().optional(),
 });
 
@@ -91,9 +83,15 @@ const managedExtraUsageSchema = z.object({
 export const managedUsageResultSchema = z.discriminatedUnion('kind', [
   z.object({
     kind: z.literal('ok'),
-    summary: z.union([managedUsageRowSchema, z.null()]),
-    limits: z.array(managedUsageRowSchema),
-    extraUsage: z.union([managedExtraUsageSchema, z.null()]),
+    quota: z.object({
+      usages: z.object({
+        limit5h: managedQuotaEntrySchema.optional(),
+        limit7d: managedQuotaEntrySchema.optional(),
+        monthTotal: managedQuotaEntrySchema.optional(),
+        monthCode: managedQuotaEntrySchema.optional(),
+      }),
+      extraUsage: managedExtraUsageSchema.nullable(),
+    }),
   }),
   z.object({
     kind: z.literal('error'),

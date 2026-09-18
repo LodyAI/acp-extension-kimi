@@ -1,5 +1,5 @@
 import { createDecorator, type ServiceIdentifier } from '#/_base/di/instantiation';
-import type { ProviderCatalogItem } from '#/kosong/model/catalog';
+import type { ProviderCatalogItem } from '#/llm-adapter/model/catalog';
 
 export interface ModelsDevModelItem {
   readonly id: string;
@@ -38,11 +38,13 @@ export interface ImportModelsDevProviderResult {
 export interface ImportCustomRegistryOptions {
   readonly url: string;
   readonly apiKey?: string;
+  readonly setDefaultWhenUnset?: boolean;
 }
 
 export interface ImportCustomRegistryResult {
   readonly providers: readonly ProviderCatalogItem[];
   readonly modelsImported: number;
+  readonly credentialEnv: Readonly<Record<string, string>>;
 }
 
 export interface IModelsDevImportService {

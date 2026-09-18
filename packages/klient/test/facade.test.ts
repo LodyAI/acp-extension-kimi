@@ -94,7 +94,7 @@ describe('facade routing', () => {
       args: [undefined],
     });
 
-    const managedUsage = { kind: 'ok', summary: null, limits: [], extraUsage: null } as const;
+    const managedUsage = { kind: 'ok', quota: { usages: {}, extraUsage: null } } as const;
     channel.results.set('oauthService.getManagedUsage', managedUsage);
     await expect(klient.global.auth.managedUsage()).resolves.toEqual(managedUsage);
     expect(channel.calls[3]).toMatchObject({

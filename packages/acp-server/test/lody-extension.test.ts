@@ -23,7 +23,7 @@ describe('Lody ACP extension projections', () => {
     expect(update?.usage.inputTokens).toBe(180);
     expect(update?.delta?.usage.inputTokens).toBe(80);
     expect(update?.delta?.usage.costUSD).toBeUndefined();
-    expect(update?.delta?.modelUsage.child.inputTokens).toBe(30);
+    expect(update?.delta?.modelUsage['child']?.inputTokens).toBe(30);
     expect(toLodySessionUsage('s', current, 10000, current)?.delta?.usage.inputTokens).toBe(0);
     // If emission failed, the unchanged baseline includes both pending captures.
     expect(
@@ -56,27 +56,19 @@ describe('Lody ACP extension projections', () => {
     expect(
       toLodyRateLimits({
         kind: 'ok',
-        summary: {
-          used: 25,
-          limit: 100,
-          resetAt: '2026-08-19T00:00:00Z',
-          window: { duration: 1, unit: 'week' },
-        },
-        limits: [
-          {
-            used: 10,
-            limit: 50,
-            resetAt: '2026-08-12T05:00:00Z',
-            window: { duration: 5, unit: 'hour' },
+        quota: {
+          usages: {
+            limit7d: { usedRatio: 0.25, resetAt: '2026-08-19T00:00:00Z' },
+            limit5h: { usedRatio: 0.2, resetAt: '2026-08-12T05:00:00Z' },
           },
-        ],
-        extraUsage: {
-          balanceCents: 1200,
-          totalCents: 2500,
-          monthlyChargeLimitEnabled: true,
-          monthlyChargeLimitCents: 5000,
-          monthlyUsedCents: 300,
-          currency: 'CNY',
+          extraUsage: {
+            balanceCents: 1200,
+            totalCents: 2500,
+            monthlyChargeLimitEnabled: true,
+            monthlyChargeLimitCents: 5000,
+            monthlyUsedCents: 300,
+            currency: 'CNY',
+          },
         },
       }),
     ).toMatchObject({
@@ -92,6 +84,25 @@ describe('Lody ACP extension projections', () => {
         },
       ],
     });
+  });
+
+  it('preserves monthly quota labels without inventing a fixed month duration', () => {
+    const result = toLodyRateLimits({
+      kind: 'ok',
+      quota: {
+        usages: { monthTotal: { usedRatio: 0.4 }, monthCode: { usedRatio: 0.3 } },
+        extraUsage: null,
+      },
+    });
+    expect(result.rateLimits[0]?.windows).toEqual([
+      { label: 'Monthly total', usedPercent: 40, windowDurationSeconds: null, resetsAtEpochSeconds: null },
+      { label: 'Monthly code', usedPercent: 30, windowDurationSeconds: null, resetsAtEpochSeconds: null },
+    ]);
+  });
+
+  it('omits quota windows that the provider did not return', () => {
+    const result = toLodyRateLimits({ kind: 'ok', quota: { usages: {}, extraUsage: null } });
+    expect(result.rateLimits[0]?.windows).toEqual([]);
   });
 
   it('aggregates main and subagent model usage into Lody token fields', () => {

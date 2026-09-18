@@ -1,19 +1,20 @@
 import type { AgentTranscriptSnapshot } from '../ops/operation';
 import type { TranscriptAttachment } from '../model/attachment';
-import type { TranscriptFrame } from '../model/frame';
+import type { TranscriptFrame, TranscriptUserOrigin } from '../model/frame';
 import type { TranscriptItem, TranscriptMarker } from '../model/item';
 import type { TurnOrigin } from '../model/turn';
 import { daemonFileRefFromPairingPart } from '../contract/mediaRef';
+import { projectTranscriptUserOrigin, projectTranscriptUserTurnOrigin } from '../contract/origin';
 
 export type HistoryMediaSource =
   | { readonly kind: 'url'; readonly url: string }
   | { readonly kind: 'base64'; readonly media_type: string; readonly data: string }
-  | { readonly kind: 'file'; readonly file_id: string };
+  | { readonly kind: 'file' | 'session_media'; readonly file_id: string };
 
 export type HistoryContentPart =
   | { readonly type: 'text'; readonly text: string }
-  | { readonly type: 'think'; readonly think: string }
-  | { readonly type: 'image' | 'video' | 'audio'; readonly source: HistoryMediaSource }
+  | { readonly type: 'think'; readonly think: string; readonly hidden?: boolean }
+  | { readonly type: 'image' | 'video' | 'audio'; readonly source: HistoryMediaSource; readonly name?: string }
   | {
       readonly type: 'file';
       readonly file_id: string;
@@ -30,6 +31,7 @@ export interface HistoryToolCall {
 }
 
 export interface HistoryMessage {
+  readonly id?: string;
   readonly role: string;
   readonly content?: readonly HistoryContentPart[];
   readonly toolCalls?: readonly HistoryToolCall[];
@@ -41,6 +43,7 @@ export interface HistoryMessage {
 interface TurnDraft {
   turnId: string;
   ordinal: number;
+  triggerPromptId?: string;
   origin: TurnOrigin;
   prompt?: string;
   attachmentIds?: string[];
@@ -68,6 +71,8 @@ export function groupMessagesIntoSnapshot(
   options?: {
     readonly taskOriginTurnTaskIds?: ReadonlySet<string>;
     readonly steeredContents?: ReadonlyMap<string, ReadonlyMap<string, number>>;
+    readonly steeredByMessageId?: ReadonlyMap<string, readonly string[]>;
+    readonly turnPromptIds?: ReadonlySet<string>;
   },
 ): AgentTranscriptSnapshot {
   const items: TranscriptItem[] = [];
@@ -75,12 +80,14 @@ export function groupMessagesIntoSnapshot(
   const steeredContents = new Map(
     [...(options?.steeredContents ?? [])].map(([key, byKind]) => [key, new Map(byKind)]),
   );
+  const steeredByMessageId = new Map(options?.steeredByMessageId);
   let turn: TurnDraft | undefined;
   let pendingNotificationFrames: {
     text: string;
     taskId: string | undefined;
     attachmentIds?: string[];
     promptIds?: readonly string[];
+    origin?: TranscriptUserOrigin;
     steered?: boolean;
   }[] = [];
   let nextOrdinal = 0;
@@ -104,11 +111,12 @@ export function groupMessagesIntoSnapshot(
           attachmentId: `att_${attachments.length + 1}`,
           mediaType:
             source.kind === 'base64' ? source.media_type : `${part.type}/*`,
+          name: part.name,
           source:
             source.kind === 'url'
               ? { kind: 'url', url: source.url }
-              : source.kind === 'file'
-                ? { kind: 'file', fileId: source.file_id }
+              : source.kind === 'file' || source.kind === 'session_media'
+                ? { kind: source.kind, fileId: source.file_id }
                 : undefined,
         };
         attachments.push(entity);
@@ -132,6 +140,7 @@ export function groupMessagesIntoSnapshot(
         const entity: TranscriptAttachment = {
           attachmentId: `att_${attachments.length + 1}`,
           mediaType: `${ref.kind}/*`,
+          name: ref.name,
           source: { kind: 'session_media', fileId: ref.ref.fileId },
         };
         attachments.push(entity);
@@ -166,10 +175,16 @@ export function groupMessagesIntoSnapshot(
     if (leftovers.length === 0) return;
     pendingNotificationFrames = pendingNotificationFrames.filter((pending) => !pending.steered);
     for (const pending of leftovers) {
-      const lastStep = turn?.steps.at(-1);
-      if (turn === undefined || lastStep === undefined) {
-        startTurn({ kind: 'user' }, pending.text, pending.attachmentIds);
-        continue;
+      const targetTurn = turn ?? startTurn({ kind: 'user' });
+      let lastStep = targetTurn.steps.at(-1);
+      if (lastStep === undefined) {
+        const ordinal = targetTurn.steps.length + 1;
+        lastStep = {
+          stepId: `${targetTurn.turnId}.${ordinal}`,
+          ordinal,
+          frames: [],
+        };
+        targetTurn.steps.push(lastStep);
       }
       lastStep.frames.push({
         kind: 'text',
@@ -178,17 +193,23 @@ export function groupMessagesIntoSnapshot(
         text: pending.text,
         attachmentIds: pending.attachmentIds,
         promptIds: pending.promptIds,
+        origin: pending.origin,
       });
-      syncTurnItem(items, turn);
+      syncTurnItem(items, targetTurn);
     }
   };
 
-  const startTurn = (origin: TurnOrigin, prompt?: string, attachmentIds?: string[]): TurnDraft => {
+  const startTurn = (
+    origin: TurnOrigin,
+    prompt?: string,
+    attachmentIds?: string[],
+    triggerPromptId?: string,
+  ): TurnDraft => {
     flushSteeredLeftovers();
     const ordinal = nextOrdinal;
     nextOrdinal += 1;
     pendingNotificationFrames = [];
-    turn = { turnId: `t${ordinal}`, ordinal, origin, prompt, attachmentIds, steps: [] };
+    turn = { turnId: `t${ordinal}`, ordinal, triggerPromptId, origin, prompt, attachmentIds, steps: [] };
     items.push(draftToTurnItem(turn));
     return turn;
   };
@@ -226,10 +247,18 @@ export function groupMessagesIntoSnapshot(
       }
       const contentKey = JSON.stringify(message.content ?? []);
       const steerKind = originKind ?? 'user';
-      const steeredByKind = steeredContents.get(contentKey);
+      const opensAsTurnPrompt =
+        message.id !== undefined && options?.turnPromptIds?.has(message.id) === true;
+      const steeredPromptIds =
+        !opensAsTurnPrompt && message.id !== undefined
+          ? steeredByMessageId.get(message.id)
+          : undefined;
+      const steeredById = steeredPromptIds !== undefined;
+      if (steeredById && message.id !== undefined) steeredByMessageId.delete(message.id);
+      const steeredByKind = opensAsTurnPrompt || steeredById ? undefined : steeredContents.get(contentKey);
       const steeredRemaining = steeredByKind?.get(steerKind) ?? 0;
-      if (steeredByKind !== undefined && steeredRemaining > 0) {
-        steeredByKind.set(steerKind, steeredRemaining - 1);
+      if (steeredById || (steeredByKind !== undefined && steeredRemaining > 0)) {
+        if (!steeredById) steeredByKind!.set(steerKind, steeredRemaining - 1);
         const bundled = bundledSkillActivations(message);
         const parts = message.content ?? [];
         bundled.forEach((activation, index) => {
@@ -244,6 +273,11 @@ export function groupMessagesIntoSnapshot(
           text: opening.text,
           taskId: undefined,
           attachmentIds: opening.attachmentIds,
+          origin: projectTranscriptUserOrigin(message.origin),
+          promptIds:
+            steeredPromptIds !== undefined && steeredPromptIds.length > 0
+              ? steeredPromptIds
+              : undefined,
           steered: true,
         });
         continue;
@@ -252,7 +286,7 @@ export function groupMessagesIntoSnapshot(
         const opening = isUserSlashPrompt(message) ? foldTurnOpeningInput(message) : undefined;
         pushMarker(markerKey, { text: opening?.text ?? textOf(message), origin: message.origin });
         if (opening !== undefined) {
-          startTurn(mapOrigin(message), opening.text, opening.attachmentIds);
+          startTurn(mapOrigin(message), opening.text, opening.attachmentIds, triggerPromptIdOf(message));
         }
         continue;
       }
@@ -284,11 +318,11 @@ export function groupMessagesIntoSnapshot(
         });
         const callerMessage = { ...message, content: parts.slice(bundled.length) };
         const opening = foldTurnOpeningInput(callerMessage);
-        startTurn(mapOrigin(message), opening.text, opening.attachmentIds);
+        startTurn(mapOrigin(message), opening.text, opening.attachmentIds, triggerPromptIdOf(message));
         continue;
       }
       const opening = foldTurnOpeningInput(message);
-      startTurn(mapOrigin(message), opening.text, opening.attachmentIds);
+      startTurn(mapOrigin(message), opening.text, opening.attachmentIds, triggerPromptIdOf(message));
       continue;
     }
 
@@ -315,13 +349,14 @@ export function groupMessagesIntoSnapshot(
           taskId: pending.taskId,
           attachmentIds: pending.attachmentIds,
           promptIds: pending.promptIds,
+          origin: pending.origin,
         });
       }
       pendingNotificationFrames = [];
       for (const part of message.content ?? []) {
         if (part.type === 'text' && 'text' in part && typeof part.text === 'string' && part.text.length > 0) {
           step.frames.push({ kind: 'text', frameId: nextFrameId(), role: 'assistant', text: part.text });
-        } else if (part.type === 'think' && 'think' in part && typeof part.think === 'string' && part.think.length > 0) {
+        } else if (part.type === 'think' && 'think' in part && typeof part.think === 'string' && part.think.length > 0 && part.hidden !== true) {
           step.frames.push({ kind: 'thinking', frameId: nextFrameId(), text: part.think });
         }
       }
@@ -383,7 +418,11 @@ function notificationFrameText(text: string): string {
   const bodyLines = lines.slice(bodyStart);
   const childStart = bodyLines.findIndex((line) => {
     const trimmed = line.trimStart();
-    return trimmed.startsWith('<output-file') || trimmed.startsWith('<output-preview');
+    return (
+      trimmed.startsWith('<output-file') ||
+      trimmed.startsWith('<output-preview') ||
+      trimmed.startsWith('<answer')
+    );
   });
   const body = (childStart === -1 ? bodyLines : bodyLines.slice(0, childStart)).join('\n').trim();
   if (title.length > 0 && body.length > 0) return `${title}\n${body}`;
@@ -407,6 +446,18 @@ function isUserSlashPrompt(message: HistoryMessage): boolean {
   );
 }
 
+function triggerPromptIdOf(message: HistoryMessage): string | undefined {
+  if (typeof message.id !== 'string' || message.id.length === 0) return undefined;
+  const origin = message.origin as { kind?: unknown; trigger?: unknown } | undefined;
+  if (origin?.kind === undefined || origin.kind === 'user') return message.id;
+  return (
+    (origin.kind === 'skill_activation' || origin.kind === 'plugin_command') &&
+    origin.trigger === 'user-slash'
+  )
+    ? message.id
+    : undefined;
+}
+
 function mapOrigin(message: HistoryMessage): TurnOrigin {
   const origin = message.origin;
   switch (origin?.kind) {
@@ -427,6 +478,7 @@ function mapOrigin(message: HistoryMessage): TurnOrigin {
     case 'shell_command':
       return { kind: 'user', payload: origin };
     case 'user':
+      return projectTranscriptUserTurnOrigin(origin);
     case undefined:
       return { kind: 'user' };
     default:
@@ -498,6 +550,7 @@ function draftToTurnItem(draft: TurnDraft): TranscriptItem {
   return {
     kind: 'turn',
     turnId: draft.turnId,
+    triggerPromptId: draft.triggerPromptId,
     ordinal: draft.ordinal,
     state: 'completed',
     origin: draft.origin,

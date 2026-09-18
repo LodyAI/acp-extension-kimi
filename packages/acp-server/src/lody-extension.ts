@@ -153,12 +153,20 @@ export function toLodyRateLimits(
     };
   }
 
-  const rows = [...(result.summary === null ? [] : [result.summary]), ...result.limits];
-  const windows = rows.map((row) => ({
-    usedPercent: row.limit <= 0 ? 0 : Math.min(100, Math.max(0, (row.used / row.limit) * 100)),
-    windowDurationSeconds: durationSeconds(row.window),
-    resetsAtEpochSeconds: resetEpochSeconds(row.resetAt),
-  }));
+  const entries = [
+    { quota: result.quota.usages.limit7d, duration: 604800, label: undefined },
+    { quota: result.quota.usages.limit5h, duration: 18000, label: undefined },
+    { quota: result.quota.usages.monthTotal, duration: null, label: 'Monthly total' },
+    { quota: result.quota.usages.monthCode, duration: null, label: 'Monthly code' },
+  ];
+  const windows = entries.flatMap(({ quota, duration, label }) =>
+    quota === undefined ? [] : [{
+      label,
+      usedPercent: Math.min(100, Math.max(0, quota.usedRatio * 100)),
+      windowDurationSeconds: duration,
+      resetsAtEpochSeconds: resetEpochSeconds(quota.resetAt),
+    }],
+  );
 
   return {
     rateLimits: [
@@ -167,7 +175,7 @@ export function toLodyRateLimits(
         scope: { providerId: 'kimi' },
         planName: 'Kimi Code',
         windows,
-        wallet: result.extraUsage,
+        wallet: result.quota.extraUsage,
       },
     ],
     fetchedAtEpochSeconds: Math.floor(now / 1_000),
@@ -242,24 +250,6 @@ function bounded(value: string | undefined, max: number): string | undefined {
   const normalized = value?.trim();
   if (!normalized) return undefined;
   return normalized.length <= max ? normalized : `${normalized.slice(0, max - 3)}...`;
-}
-
-function durationSeconds(
-  window:
-    | { readonly duration: number; readonly unit: 'minute' | 'hour' | 'day' | 'week' }
-    | undefined,
-): number | null {
-  if (window === undefined) return null;
-  switch (window.unit) {
-    case 'minute':
-      return window.duration * 60;
-    case 'hour':
-      return window.duration * 60 * 60;
-    case 'day':
-      return window.duration * 24 * 60 * 60;
-    case 'week':
-      return window.duration * 7 * 24 * 60 * 60;
-  }
 }
 
 function resetEpochSeconds(value: string | undefined): number | null {

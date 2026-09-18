@@ -1,15 +1,20 @@
+import { readFileSync } from 'node:fs';
+
+import { join, normalize } from 'pathe';
+import { parse as parseToml } from 'smol-toml';
+
 import { type CollectionView } from '#/_base/di/collection';
 import { Disposable } from '#/_base/di/lifecycle';
 import { LifecycleScope } from '#/app/scopes';
 import { ScopeActivation, registerScopedService } from '#/_base/di/scope';
 import { Emitter, type Event } from '#/_base/event';
+import { TimeoutTimer } from '#/_base/utils/timer';
 import { BugIndicatingError, Error2, ErrorCodes, onUnexpectedError } from '#/errors';
 import { IBootstrapService } from '#/app/bootstrap/bootstrap';
 import { ILogService } from '#/_base/log/log';
-import {
-  IAtomicTomlDocumentStore,
-  type IAtomicDocumentStore,
-} from '#/persistence/interface/atomicDocumentStore';
+import { IAtomicTomlDocumentStore } from '#/persistence/interface/atomicDocumentStore';
+import { setWatchEnabled, watchCandidates } from '#human/utils/watch';
+import { WATCH_SECTION, type WatchConfig } from '#/app/watch/configSection';
 
 import {
   type AnyEnvBindings,
@@ -20,6 +25,7 @@ import {
   type ConfigInspectValue,
   type ConfigMerge,
   type ConfigOverlayRegisteredEvent,
+  type ConfigReplaceSectionsOptions,
   type ConfigSchema,
   type ConfigSection,
   type ConfigSectionRegisteredEvent,
@@ -39,7 +45,6 @@ import {
 } from './configSectionContributions';
 import { getConfigOverlayContributions } from './configOverlayContributions';
 import { collectKeyDeprecations } from './deprecations';
-import { migrateThinkingEffortMaxToHigh } from './migrations';
 import {
   applySectionToToml,
   camelToSnake,
@@ -48,8 +53,10 @@ import {
   TomlError,
   transformTomlData,
 } from './toml';
+import { planConfigWriteback } from './tomlWriteback';
 
 const CONFIG_SCOPE = '';
+const WATCH_DEBOUNCE_MS = 150;
 
 type GetEnv = (name: string) => string | undefined;
 
@@ -57,6 +64,19 @@ type OnDeprecatedEnv = (oldName: string, newName: string) => void;
 
 function isEnvBinding(value: unknown): value is EnvBinding {
   return typeof value === 'string' || (isPlainObject(value) && 'env' in value);
+}
+
+function mergeExactEntries(
+  current: unknown,
+  submitted: Record<string, unknown>,
+  exact: readonly string[],
+): Record<string, unknown> {
+  const merged = isPlainObject(current) ? { ...current } : {};
+  for (const key of exact) {
+    delete merged[key];
+    if (Object.hasOwn(submitted, key)) merged[key] = submitted[key];
+  }
+  return merged;
 }
 
 function parseBoundRaw(binding: EnvBinding, raw: string): unknown {
@@ -118,7 +138,7 @@ function applyEnvBindings(
   }
 }
 
-function applySectionEnv(
+export function applySectionEnv(
   base: unknown,
   env: AnyEnvBindings,
   getEnv: GetEnv,
@@ -146,7 +166,8 @@ function isSameSection(
     existing.fromToml === options.fromToml &&
     existing.toToml === options.toToml &&
     deepEqual(existing.defaultValue, options.defaultValue) &&
-    deepEqual(existing.deprecations, options.deprecations)
+    deepEqual(existing.deprecations, options.deprecations) &&
+    existing.collectDiagnostics === options.collectDiagnostics
   );
 }
 
@@ -244,6 +265,7 @@ export class ConfigRegistry extends Disposable implements IConfigRegistry {
       fromToml: options.fromToml,
       toToml: options.toToml,
       deprecations: options.deprecations,
+      collectDiagnostics: options.collectDiagnostics,
     });
     this._onDidRegisterSection.fire({ domain });
   }
@@ -299,6 +321,7 @@ export class ConfigService extends Disposable implements IConfigService {
   readonly ready: Promise<void>;
 
   private stateChain: Promise<unknown> = Promise.resolve();
+  private readonly watchDebounce = this._register(new TimeoutTimer());
 
   private rawSnake: ResolvedConfig = {};
   private raw: ResolvedConfig = {};
@@ -315,7 +338,7 @@ export class ConfigService extends Disposable implements IConfigService {
     @IConfigRegistry private readonly registry: IConfigRegistry,
     @IBootstrapService private readonly bootstrap: IBootstrapService,
     @ILogService private readonly log: ILogService,
-    @IAtomicTomlDocumentStore private readonly documentStore: IAtomicDocumentStore,
+    @IAtomicTomlDocumentStore private readonly documentStore: IAtomicTomlDocumentStore,
   ) {
     super();
     this.configKey = this.bootstrap.configKey;
@@ -324,13 +347,18 @@ export class ConfigService extends Disposable implements IConfigService {
     this._register(this.registry.onDidRegisterOverlay(() => this.reapplyOverlays()));
     const { configKey } = this;
     const { homeDir } = this.bootstrap;
-    this.ready = (async () => {
-      await migrateThinkingEffortMaxToHigh(this.documentStore, configKey, homeDir);
-      await this.load('load');
-    })();
+    this.seedInitialLoad();
+    this.applyWatchEnabled();
+    this.ready = this.load('load');
+    const configFile = join(homeDir, configKey);
+    const handle = watchCandidates(homeDir, [configFile]);
+    this._register(handle);
     this._register(
-      this.documentStore.watch(CONFIG_SCOPE, this.configKey)(() => {
-        void this.reload();
+      handle.onDidChange((change) => {
+        if (normalize(change.path) !== normalize(configFile)) return;
+        this.watchDebounce.cancelAndSet(() => {
+          void this.reload();
+        }, WATCH_DEBOUNCE_MS);
       }),
     );
   }
@@ -451,19 +479,26 @@ export class ConfigService extends Disposable implements IConfigService {
   async replaceSections(
     sections: Readonly<Record<string, unknown>>,
     target: ConfigTarget = ConfigTarget.User,
+    options: ConfigReplaceSectionsOptions = {},
   ): Promise<void> {
     await this.ready;
     const domains = Object.keys(sections);
     if (domains.length === 0) return;
     if (target === ConfigTarget.Memory) {
+      this.assertExpectedValues(this.memory, options.expectedValues);
       const staged: ResolvedConfig = { ...this.memory };
       for (const domain of domains) {
-        const value = sections[domain];
-        if (value === undefined || value === null) {
+        const submitted = sections[domain];
+        if (submitted === undefined || submitted === null) {
           delete staged[domain];
-        } else {
-          staged[domain] = this.registry.validate(domain, value);
+          continue;
         }
+        const exact = options.exactKeys?.[domain];
+        const value =
+          exact === undefined || !isPlainObject(submitted)
+            ? submitted
+            : mergeExactEntries(staged[domain], submitted, exact);
+        staged[domain] = this.registry.validate(domain, value);
       }
       this.memory = staged;
       this.commit('set', domains);
@@ -471,19 +506,57 @@ export class ConfigService extends Disposable implements IConfigService {
     }
     await this.enqueueStateTransition(async () => {
       this.assertPersistable();
-      await this.persistDomains(domains, (stagedRaw, stagedRawSnake) => {
-        for (const domain of domains) {
-          const value = sections[domain] === null ? undefined : sections[domain];
-          const stripped = this.stripEnv(domain, value, stagedRaw, stagedRawSnake);
-          if (stripped === undefined) {
-            delete stagedRaw[domain];
-          } else {
-            stagedRaw[domain] = this.registry.validate(domain, stripped);
+      await this.persistDomains(
+        domains,
+        (stagedRaw, stagedRawSnake) => {
+          for (const domain of domains) {
+            const submitted = sections[domain] === null ? undefined : sections[domain];
+            const exact = options.exactKeys?.[domain];
+            const value =
+              exact === undefined || !isPlainObject(submitted)
+                ? submitted
+                : mergeExactEntries(stagedRaw[domain], submitted, exact);
+            const stripped = this.stripEnv(domain, value, stagedRaw, stagedRawSnake);
+            if (stripped === undefined) {
+              delete stagedRaw[domain];
+            } else {
+              stagedRaw[domain] = this.registry.validate(domain, stripped);
+            }
           }
-        }
-      });
+        },
+        options.preserveUnknown !== false,
+        options.exactKeys,
+        options.expectedValues,
+      );
       this.rebuildEffective('set', domains);
     });
+  }
+
+  private assertExpectedValues(
+    current: ResolvedConfig,
+    expectedValues: Readonly<Record<string, unknown>> | undefined,
+  ): void {
+    if (expectedValues === undefined) return;
+    const changed: string[] = [];
+    for (const [domain, rawExpected] of Object.entries(expectedValues)) {
+      const expected = rawExpected === null ? undefined : rawExpected;
+      const currentValue = current[domain];
+      const normalizedCurrent =
+        currentValue === undefined && isPlainObject(expected)
+          ? this.registry.validate(domain, {})
+          : currentValue === undefined
+            ? undefined
+            : this.registry.validate(domain, currentValue);
+      const normalizedExpected =
+        expected === undefined ? undefined : this.registry.validate(domain, expected);
+      if (!deepEqual(normalizedCurrent, normalizedExpected)) changed.push(domain);
+    }
+    if (changed.length === 0) return;
+    throw new Error2(
+      ErrorCodes.CONFIG_INVALID,
+      'Configuration changed while this update was being prepared; retry the operation.',
+      { details: { domains: changed } },
+    );
   }
 
   private stripEnv(
@@ -521,6 +594,25 @@ export class ConfigService extends Disposable implements IConfigService {
     return run;
   }
 
+  private seedInitialLoad(): void {
+    let fileData: ResolvedConfig;
+    try {
+      const text = readFileSync(this.bootstrap.configPath, 'utf8');
+      const data: unknown = text.trim().length === 0 ? {} : parseToml(text);
+      if (!isPlainObject(data)) return;
+      fileData = data;
+    } catch {
+      return;
+    }
+    this.rawSnake = cloneRecord(fileData);
+    this.raw = transformTomlData(fileData, this.registry);
+    this.validated = this.buildValidated(this.raw);
+    const next = { ...this.validated };
+    this.applySectionEnvBindings(next, true);
+    this.applyEnvOverlay(next);
+    this.effective = next;
+  }
+
   private async load(source: ConfigChangeSource): Promise<void> {
     this.diagnosticsList.length = 0;
     let fileData: ResolvedConfig = {};
@@ -547,6 +639,13 @@ export class ConfigService extends Disposable implements IConfigService {
     for (const diagnostic of collectKeyDeprecations(nextRawSnake, this.registry.listSections())) {
       this.pushDiagnostic(diagnostic);
     }
+    for (const section of this.registry.listSections()) {
+      if (section.collectDiagnostics === undefined) continue;
+      const rawSection = nextRawSnake[camelToSnake(section.domain)];
+      for (const diagnostic of section.collectDiagnostics(rawSection)) {
+        this.pushDiagnostic(diagnostic);
+      }
+    }
     if (source !== 'load' && JSON.stringify(nextRawSnake) === JSON.stringify(this.rawSnake)) {
       const scratch = { ...this.validated };
       this.applySectionEnvBindings(scratch, true);
@@ -569,6 +668,7 @@ export class ConfigService extends Disposable implements IConfigService {
     this.applySectionEnvBindings(next, true);
     this.applyEnvOverlay(next);
     this.effective = next;
+    this.applyWatchEnabled();
 
     const candidates = new Set(
       domains ?? [...Object.keys(previous), ...Object.keys(next)],
@@ -578,6 +678,10 @@ export class ConfigService extends Disposable implements IConfigService {
     }
     this.commit(source, [...candidates]);
     this.emitDiagnosticsIfChanged();
+  }
+
+  private applyWatchEnabled(): void {
+    setWatchEnabled(this.get<WatchConfig | undefined>(WATCH_SECTION)?.enabled ?? true);
   }
 
   private deliveredValue(domain: string): unknown {
@@ -766,6 +870,9 @@ export class ConfigService extends Disposable implements IConfigService {
   private async persistDomains(
     domains: readonly string[],
     rebase: (stagedRaw: ResolvedConfig, stagedRawSnake: ResolvedConfig) => void,
+    preserveUnknown = true,
+    exactKeys?: Readonly<Record<string, readonly string[]>>,
+    expectedValues?: Readonly<Record<string, unknown>>,
   ): Promise<void> {
     this.assertPersistable();
     let onDisk: ResolvedConfig = {};
@@ -789,13 +896,56 @@ export class ConfigService extends Disposable implements IConfigService {
         { cause: error },
       );
     }
+    let onDiskText: string | undefined;
+    try {
+      onDiskText = await this.documentStore.getText(CONFIG_SCOPE, this.configKey);
+    } catch {
+      onDiskText = undefined;
+    }
     const stagedRawSnake = cloneRecord(onDisk);
     const stagedRaw = transformTomlData(onDisk, this.registry);
+    this.assertExpectedValues(stagedRaw, expectedValues);
+    const previousSnake: ResolvedConfig = {};
+    for (const domain of domains) {
+      const snakeKey = camelToSnake(domain);
+      previousSnake[snakeKey] = stagedRawSnake[snakeKey];
+    }
     rebase(stagedRaw, stagedRawSnake);
+    if (!preserveUnknown) {
+      for (const domain of domains) {
+        const snakeDomain = camelToSnake(domain);
+        const keys = exactKeys?.[domain];
+        const rawDomain = stagedRawSnake[snakeDomain];
+        if (keys !== undefined && isPlainObject(rawDomain)) {
+          for (const key of keys) delete rawDomain[key];
+        } else {
+          delete stagedRawSnake[snakeDomain];
+        }
+      }
+    }
     for (const domain of domains) {
       applySectionToToml(stagedRawSnake, domain, stagedRaw[domain], this.registry);
     }
-    await this.documentStore.set(CONFIG_SCOPE, this.configKey, stagedRawSnake);
+    const plannedText =
+      onDiskText === undefined
+        ? undefined
+        : planConfigWriteback(
+            onDiskText,
+            domains.map((domain) => {
+              const snakeKey = camelToSnake(domain);
+              return {
+                snakeKey,
+                previousValue: previousSnake[snakeKey],
+                nextValue: stagedRawSnake[snakeKey],
+              };
+            }),
+            stagedRawSnake,
+          );
+    if (plannedText === undefined) {
+      await this.documentStore.set(CONFIG_SCOPE, this.configKey, stagedRawSnake);
+    } else if (plannedText !== onDiskText) {
+      await this.documentStore.setText(CONFIG_SCOPE, this.configKey, plannedText);
+    }
     this.rawSnake = stagedRawSnake;
     this.raw = stagedRaw;
   }

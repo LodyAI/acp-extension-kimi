@@ -5,6 +5,7 @@ import { ScopeActivation, registerScopedService, type ISessionScopeHandle } from
 import { LifecycleScope } from '#/app/scopes';
 import { Error2, ErrorCodes } from '#/errors';
 import { ISessionIndex, type SessionSummary } from '#/app/sessionIndex/sessionIndex';
+import type { SessionMeta } from '#/session/sessionMetadata/sessionMetadata';
 import {
   type CreateChildSessionOptions,
   type ForkSessionOptions,
@@ -50,6 +51,8 @@ export class SessionManager implements ISessionManager {
   readonly onWillCloseSession = this.willCloseEmitter.event;
   private readonly didCloseEmitter = new Emitter<SessionClosedEvent>();
   readonly onDidCloseSession = this.didCloseEmitter.event;
+  private readonly willDeleteEmitter = new Emitter<{ readonly sessionId: string } & IWaitUntil>();
+  readonly onWillDeleteSession = this.willDeleteEmitter.event;
   private readonly didArchiveEmitter = new Emitter<SessionArchivedEvent>();
   readonly onDidArchiveSession = this.didArchiveEmitter.event;
   private readonly didForkEmitter = new Emitter<SessionForkedEvent>();
@@ -66,9 +69,9 @@ export class SessionManager implements ISessionManager {
         ? { root: options.workDir }
         : { workspaceId: options.workspaceId, root: options.workDir },
     );
-    const controller = this.controllerForWorkspace(workspace.id);
-    if (options.sessionId === undefined) return controller.create(options);
-    return this.serializeLifecycle(options.sessionId, () => controller.create(options));
+    const create = () => this.controllerForWorkspace(workspace.id).create(options);
+    if (options.sessionId === undefined) return create();
+    return this.serializeLifecycle(options.sessionId, create);
   }
 
   async resume(sessionId: string, options?: ResumeSessionOptions): Promise<ISessionScopeHandle | undefined> {
@@ -169,6 +172,20 @@ export class SessionManager implements ISessionManager {
       if (controller === undefined) {
         throw new Error2(ErrorCodes.SESSION_NOT_FOUND, `session ${sessionId} does not exist`);
       }
+      await controller.close(sessionId);
+      const cleanups: Promise<unknown>[] = [];
+      this.willDeleteEmitter.fire({
+        sessionId,
+        signal: new AbortController().signal,
+        waitUntil: (cleanup) => {
+          if (Object.isFrozen(cleanups)) throw new Error('waitUntil must be called synchronously');
+          cleanups.push(cleanup);
+        },
+      });
+      void Object.freeze(cleanups);
+      const settled = await Promise.allSettled(cleanups);
+      const failed = settled.find((result) => result.status === 'rejected');
+      if (failed?.status === 'rejected') throw failed.reason;
       await controller.delete(sessionId);
     });
   }
@@ -181,7 +198,7 @@ export class SessionManager implements ISessionManager {
     return controller.listForkTurns(sourceSessionId);
   }
 
-  async fork(options: ForkSessionOptions): Promise<ISessionScopeHandle> {
+  async fork(options: ForkSessionOptions): Promise<SessionMeta> {
     return this.serializeLifecycleForKeys(
       this.lifecycleKeys(options.sourceSessionId, options.newSessionId),
       async () => {
@@ -197,7 +214,7 @@ export class SessionManager implements ISessionManager {
     );
   }
 
-  async createChild(options: CreateChildSessionOptions): Promise<ISessionScopeHandle> {
+  async createChild(options: CreateChildSessionOptions): Promise<SessionMeta> {
     return this.serializeLifecycleForKeys(
       this.lifecycleKeys(options.sourceSessionId, options.newSessionId),
       async () => {
@@ -226,6 +243,7 @@ export class SessionManager implements ISessionManager {
     this.didCreateEmitter.dispose();
     this.willCloseEmitter.dispose();
     this.didCloseEmitter.dispose();
+    this.willDeleteEmitter.dispose();
     this.didArchiveEmitter.dispose();
     this.didForkEmitter.dispose();
   }
