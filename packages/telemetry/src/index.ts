@@ -1,6 +1,8 @@
 import {
   flushSync,
+  getSink,
   setContext,
+  setEnabled,
   shutdown,
   track as trackEvent,
   withContext,
@@ -14,6 +16,21 @@ export function track(event: string, properties: TelemetryPropertiesType = {}): 
 
 export function setTelemetryContext(patch: TelemetryContextIds): void {
   setContext(patch);
+}
+
+/**
+ * Reconcile the attached sink's model after the real session model is known
+ * (e.g. a resumed session whose stored model differs from the configured
+ * default). Applies to events accepted after the call; a no-op when undefined
+ * or when no sink is attached (telemetry disabled or not yet initialized).
+ */
+export function setTelemetryModel(model: string | undefined): void {
+  if (model === undefined) return;
+  getSink()?.setModel(model);
+}
+
+export function setTelemetryEnabled(enabled: boolean): void {
+  setEnabled(enabled);
 }
 
 export function withTelemetryContext(patch: TelemetryContextIds): TelemetryClient {
@@ -30,7 +47,7 @@ export async function shutdownTelemetry(
   await shutdown(options);
 }
 
-export { initializeTelemetry } from './bootstrap';
+export { initializeTelemetry, isTelemetryDisabledByEnv, shouldEnableTelemetry } from './bootstrap';
 export type { TelemetryBootstrapOptions } from './bootstrap';
 
 export { installCrashHandlers, setCrashPhase } from './crash';

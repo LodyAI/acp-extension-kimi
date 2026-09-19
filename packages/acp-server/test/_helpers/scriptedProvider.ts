@@ -19,18 +19,23 @@
  */
 
 import {
-  type FinishReason,
   IProtocolAdapterRegistry,
   type IProtocolAdapterRegistry as IProtocolAdapterRegistryType,
   type Message,
+  type Model,
   ProtocolAdapterRegistry,
   type ProtocolAdapterConfig,
   type StreamedMessagePart,
   type TokenUsage,
   type Tool,
 } from '@moonshot-ai/agent-core-v2';
+import type { FinishReason } from '@moonshot-ai/agent-core-v2/human/llm/finish-reason';
+import { fromLlmMessage } from '@moonshot-ai/agent-core-v2/llm-adapter/contract/message';
+import type { LlmRequester } from '@moonshot-ai/agent-core-v2/human/llm/requester/requester';
 
 interface ScriptedResponse {
+  readonly beforeResponse?: () => Promise<void>;
+  readonly usage?: TokenUsage;
   readonly parts: readonly StreamedMessagePart[];
   readonly finishReason?: FinishReason | null;
   readonly rawFinishReason?: string | null;
@@ -67,7 +72,7 @@ class ScriptedStream {
     }
     const hasToolCall = this.parts.some((p) => p.type === 'function');
     this.id = `scripted-${String(this.index)}`;
-    this.usage = { ...ZERO_USAGE, output: this.parts.length };
+    this.usage = this.response.usage ?? { ...ZERO_USAGE, output: this.parts.length };
     this.finishReason =
       this.response.finishReason ?? (hasToolCall ? 'tool_calls' : 'completed');
     this.rawFinishReason =
@@ -100,6 +105,7 @@ class ScriptedChatProvider {
       );
     }
     this.calls.push(history);
+    await response.beforeResponse?.();
     return new ScriptedStream(response.parts, response, this.calls.length);
   }
 
@@ -121,6 +127,8 @@ export interface ScriptedProvider {
   mockNextResponse(...parts: StreamedMessagePart[]): void;
   /** Push a response with an explicit finish reason. */
   mockNextProviderResponse(response: {
+    readonly beforeResponse?: () => Promise<void>;
+    readonly usage?: TokenUsage;
     readonly parts?: readonly StreamedMessagePart[];
     readonly finishReason?: FinishReason | null;
     readonly rawFinishReason?: string | null;
@@ -137,11 +145,47 @@ export function createScriptedProvider(): ScriptedProvider {
   // Single shared provider so every ModelImpl in the process (main agent,
   // sub-agents) draws from the same FIFO queue.
   const provider = new ScriptedChatProvider(queue, calls);
-  // Identity/capability resolution delegates to the real registry (the
+  const requester: LlmRequester = {
+    async generate(config, content, control) {
+      control.onEvent?.({ type: 'llm.sent' });
+      try {
+        const stream = await provider.generate(
+          config.systemPrompt ?? '',
+          [...(config.tools ?? [])],
+          content.messages.map(fromLlmMessage),
+          { signal: control.signal },
+        );
+        for await (const part of stream) {
+          control.onEvent?.({ type: 'llm.streaming.part', part });
+          control.signal.throwIfAborted();
+        }
+        control.onEvent?.({ type: 'llm.streaming.usage', usage: stream.usage ?? ZERO_USAGE });
+        control.onEvent?.({
+          type: 'llm.streaming.finish',
+          finish: {
+            finishReason: stream.finishReason,
+            rawFinishReason: stream.rawFinishReason,
+          },
+        });
+        if (stream.id !== null) {
+          control.onEvent?.({ type: 'llm.streaming.message_id', messageId: stream.id });
+        }
+        control.onEvent?.({ type: 'llm.done' });
+      } catch (error) {
+        control.onEvent?.({
+          type: 'llm.failed.remote',
+          error: {
+            kind: 'unknown',
+            message: error instanceof Error ? error.message : String(error),
+          },
+        });
+      }
+    },
+  };
+  // Identity/capability/model resolution delegates to the real registry (the
   // interface grew `resolveAdapterIdentity` / `resolveProviderBaseId` /
-  // `resolveCapability` / `explainCapability` — delegating keeps the stub
-  // truthful and immune to further growth); only `createChatProvider` is
-  // scripted.
+  // `resolveCapability` / `resolve` — delegating keeps the
+  // stub truthful and immune to further growth); only the requester is scripted.
   const real = new ProtocolAdapterRegistry();
   const registry: IProtocolAdapterRegistryType = {
     _serviceBrand: undefined,
@@ -149,7 +193,7 @@ export function createScriptedProvider(): ScriptedProvider {
     resolveAdapterIdentity: real.resolveAdapterIdentity.bind(real),
     resolveProviderBaseId: real.resolveProviderBaseId.bind(real),
     resolveCapability: real.resolveCapability.bind(real),
-    explainCapability: real.explainCapability.bind(real),
+    resolve: (model: Model) => ({ ...real.resolve(model), requester }),
     // `createChatProvider` is called by `ModelImpl` (a package-internal method
     // not on the public interface); present at runtime, cast for the type gap.
     createChatProvider: (_input: ProtocolAdapterConfig) => provider,
@@ -165,6 +209,8 @@ export function createScriptedProvider(): ScriptedProvider {
     },
     mockNextProviderResponse: (response) => {
       queue.push({
+        usage: response.usage,
+        beforeResponse: response.beforeResponse,
         parts: structuredClone(response.parts ?? []),
         finishReason: response.finishReason,
         rawFinishReason: response.rawFinishReason,

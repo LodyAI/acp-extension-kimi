@@ -19,10 +19,12 @@ export function providerDisplayName(provider: string): string {
   return provider.startsWith('managed:') ? provider.slice('managed:'.length) : provider;
 }
 
-export type ManagedKimiCodeProtocol = 'kimi' | 'anthropic';
+export type ManagedKimiCodeProtocol = 'kimi' | 'anthropic' | 'openai_responses';
 
 export function parseModelProtocol(value: unknown): ManagedKimiCodeProtocol | undefined {
-  return value === 'anthropic' ? 'anthropic' : undefined;
+  if (value === 'anthropic') return 'anthropic';
+  if (value === 'response') return 'openai_responses';
+  return undefined;
 }
 
 /**
@@ -41,6 +43,7 @@ export interface ManagedKimiCodeModelInfo {
   readonly supportsImageIn: boolean;
   readonly supportsVideoIn: boolean;
   readonly supportsToolUse?: boolean;
+  readonly supportsDynamicTools?: boolean;
   readonly supportsThinkingType?: SupportsThinkingType;
   readonly supportEfforts?: readonly string[];
   readonly defaultEffort?: string;
@@ -137,6 +140,7 @@ export interface ManagedKimiProviderConfig {
   type: ManagedKimiCodeProtocol;
   baseUrl?: string | undefined;
   apiKey?: string | undefined;
+  apiKeyEnv?: string;
   oauth?: ManagedKimiOAuthRef | undefined;
   readonly [key: string]: unknown;
 }
@@ -253,6 +257,7 @@ function capabilitiesForModel(model: ManagedKimiCodeModelInfo): string[] | undef
   if (model.supportsImageIn) caps.add('image_in');
   if (model.supportsVideoIn) caps.add('video_in');
   if (model.supportsToolUse ?? true) caps.add('tool_use');
+  if (model.supportsDynamicTools === true) caps.add('dynamically_loaded_tools');
   return caps.size > 0 ? [...caps] : undefined;
 }
 
@@ -318,9 +323,9 @@ export function kimiCodeEnvOAuthHost(env: ManagedKimiEnv = process.env): string 
 }
 
 // Base URLs that share the default `oauth/kimi-code` credential slot.
-const SHARED_DEFAULT_BASE_URLS: readonly string[] = [
+const SHARED_DEFAULT_BASE_URLS: ReadonlySet<string> = new Set([
   normalizeEndpoint(DEFAULT_KIMI_CODE_BASE_URL),
-];
+]);
 
 export function resolveKimiCodeOAuthKey(options: {
   readonly oauthHost?: string | undefined;
@@ -330,7 +335,7 @@ export function resolveKimiCodeOAuthKey(options: {
   const baseUrl = defaultBaseUrl(options.baseUrl);
   const defaultOauthHost = normalizeEndpoint(DEFAULT_KIMI_CODE_OAUTH_HOST);
 
-  if (oauthHost === defaultOauthHost && SHARED_DEFAULT_BASE_URLS.includes(baseUrl)) {
+  if (oauthHost === defaultOauthHost && SHARED_DEFAULT_BASE_URLS.has(baseUrl)) {
     return KIMI_CODE_OAUTH_KEY;
   }
 
@@ -442,6 +447,7 @@ function toModelInfo(item: unknown): ManagedKimiCodeModelInfo | undefined {
     supportsImageIn: Boolean(item['supports_image_in']),
     supportsVideoIn: Boolean(item['supports_video_in']),
     supportsToolUse,
+    supportsDynamicTools: item['supports_dynamic_tools'] === true,
     supportsThinkingType: parseSupportsThinkingType(item['supports_thinking_type']),
     supportEfforts: thinkEfforts.supportEfforts,
     defaultEffort: thinkEfforts.defaultEffort,

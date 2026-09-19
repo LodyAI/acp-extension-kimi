@@ -3,6 +3,7 @@ import type { ISessionScopeHandle } from '#/_base/di/scope';
 import { type Event, type IWaitUntil } from '#/_base/event';
 import type { BindAgentInput } from '#/agent/profile/profile';
 import type { McpServerConfig } from '#/mcpCore/config-schema';
+import type { SessionMeta } from '#/session/sessionMetadata/sessionMetadata';
 
 
 export type SessionCreateSource = 'startup' | 'resume' | 'fork';
@@ -17,25 +18,12 @@ export interface CreateSessionOptions {
   readonly mcpServers?: Readonly<Record<string, McpServerConfig>>;
 }
 
-/**
- * One fork-addressable turn. `turnIndex` is what `fork({ turnIndex })` takes;
- * `messageId` is the durable id of the prompt that opened it, which is how a
- * caller lines these up against a rendered history whose head has been
- * compacted away. `prompt` is the same prompt metadata a fork records, kept
- * for diagnostics only — never match on it, it is sanitized and truncated.
- */
 export interface ForkTurnSummary {
   readonly turnIndex: number;
   readonly messageId?: string;
   readonly prompt?: string;
 }
 
-/**
- * Whether a prompt origin opens a turn `fork({ turnIndex })` counts. The fork
- * index space is defined by this predicate, so anything that publishes or
- * resolves a fork position classifies origins through it rather than restating
- * the rule.
- */
 export function isUserVisibleTurnOrigin(origin: unknown): boolean {
   const fields =
     typeof origin === 'object' && origin !== null && !Array.isArray(origin)
@@ -98,7 +86,6 @@ export interface SessionArchivedEvent {
 export interface SessionForkedEvent {
   readonly sourceSessionId: string;
   readonly sessionId: string;
-  readonly handle: ISessionScopeHandle;
 }
 
 export interface SessionWillCreateEvent {
@@ -125,15 +112,9 @@ export interface ISessionLifecycleService {
   archive(sessionId: string): Promise<void>;
   restore(sessionId: string, opts?: ResumeSessionOptions): Promise<ISessionScopeHandle | undefined>;
   delete(sessionId: string): Promise<void>;
-  /**
-   * The turns `fork({ turnIndex })` can address, in record order. A rendered
-   * history is not a reliable index source — compaction drops messages from
-   * context while the records that define these indices stay — so a client
-   * that offers "fork from here" resolves its position against this list.
-   */
   listForkTurns(sourceSessionId: string): Promise<ForkTurnSummary[]>;
-  fork(opts: ForkSessionOptions): Promise<ISessionScopeHandle>;
-  createChild(opts: CreateChildSessionOptions): Promise<ISessionScopeHandle>;
+  fork(opts: ForkSessionOptions): Promise<SessionMeta>;
+  createChild(opts: CreateChildSessionOptions): Promise<SessionMeta>;
 }
 
 export const ISessionLifecycleService: ServiceIdentifier<ISessionLifecycleService> =

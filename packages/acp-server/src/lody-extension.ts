@@ -70,6 +70,10 @@ export function addTokenUsage(left: TokenUsage | undefined, right: TokenUsage): 
   return {
     inputOther: left.inputOther + right.inputOther,
     output: left.output + right.output,
+    reasoningOutput:
+      left.reasoningOutput === undefined && right.reasoningOutput === undefined
+        ? undefined
+        : (left.reasoningOutput ?? 0) + (right.reasoningOutput ?? 0),
     inputCacheRead: left.inputCacheRead + right.inputCacheRead,
     inputCacheCreation: left.inputCacheCreation + right.inputCacheCreation,
   };
@@ -79,6 +83,10 @@ export function tokenUsageDelta(current: TokenUsage, previous: TokenUsage | unde
   return {
     inputOther: counterDelta(current.inputOther, previous?.inputOther),
     output: counterDelta(current.output, previous?.output),
+    reasoningOutput:
+      current.reasoningOutput === undefined
+        ? undefined
+        : counterDelta(current.reasoningOutput, previous?.reasoningOutput),
     inputCacheRead: counterDelta(current.inputCacheRead, previous?.inputCacheRead),
     inputCacheCreation: counterDelta(current.inputCacheCreation, previous?.inputCacheCreation),
   };
@@ -88,6 +96,7 @@ export function hasTokenUsage(usage: TokenUsage): boolean {
   return (
     usage.inputOther > 0 ||
     usage.output > 0 ||
+    (usage.reasoningOutput ?? 0) > 0 ||
     usage.inputCacheRead > 0 ||
     usage.inputCacheCreation > 0
   );
@@ -96,7 +105,8 @@ export function hasTokenUsage(usage: TokenUsage): boolean {
 export function toLodyModelUsage(usage: TokenUsage, contextWindow?: number): ModelUsage {
   return {
     inputTokens: usage.inputOther,
-    outputTokens: usage.output,
+    outputTokens: usage.output - (usage.reasoningOutput ?? 0),
+    reasoningOutputTokens: usage.reasoningOutput,
     cacheReadInputTokens: usage.inputCacheRead,
     cacheCreationInputTokens: usage.inputCacheCreation,
     ...(contextWindow === undefined ? {} : { contextWindow }),
@@ -153,12 +163,20 @@ export function toLodyRateLimits(
     };
   }
 
-  const rows = [...(result.summary === null ? [] : [result.summary]), ...result.limits];
-  const windows = rows.map((row) => ({
-    usedPercent: row.limit <= 0 ? 0 : Math.min(100, Math.max(0, (row.used / row.limit) * 100)),
-    windowDurationSeconds: durationSeconds(row.window),
-    resetsAtEpochSeconds: resetEpochSeconds(row.resetAt),
-  }));
+  const entries = [
+    { quota: result.quota.usages.limit7d, duration: 604800, label: undefined },
+    { quota: result.quota.usages.limit5h, duration: 18000, label: undefined },
+    { quota: result.quota.usages.monthTotal, duration: null, label: 'Monthly total' },
+    { quota: result.quota.usages.monthCode, duration: null, label: 'Monthly code' },
+  ];
+  const windows = entries.flatMap(({ quota, duration, label }) =>
+    quota === undefined ? [] : [{
+      label,
+      usedPercent: Math.min(100, Math.max(0, quota.usedRatio * 100)),
+      windowDurationSeconds: duration,
+      resetsAtEpochSeconds: resetEpochSeconds(quota.resetAt),
+    }],
+  );
 
   return {
     rateLimits: [
@@ -167,7 +185,7 @@ export function toLodyRateLimits(
         scope: { providerId: 'kimi' },
         planName: 'Kimi Code',
         windows,
-        wallet: result.extraUsage,
+        wallet: result.quota.extraUsage,
       },
     ],
     fetchedAtEpochSeconds: Math.floor(now / 1_000),
@@ -242,24 +260,6 @@ function bounded(value: string | undefined, max: number): string | undefined {
   const normalized = value?.trim();
   if (!normalized) return undefined;
   return normalized.length <= max ? normalized : `${normalized.slice(0, max - 3)}...`;
-}
-
-function durationSeconds(
-  window:
-    | { readonly duration: number; readonly unit: 'minute' | 'hour' | 'day' | 'week' }
-    | undefined,
-): number | null {
-  if (window === undefined) return null;
-  switch (window.unit) {
-    case 'minute':
-      return window.duration * 60;
-    case 'hour':
-      return window.duration * 60 * 60;
-    case 'day':
-      return window.duration * 24 * 60 * 60;
-    case 'week':
-      return window.duration * 7 * 24 * 60 * 60;
-  }
 }
 
 function resetEpochSeconds(value: string | undefined): number | null {
