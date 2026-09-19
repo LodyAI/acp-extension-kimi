@@ -364,11 +364,14 @@ export function parseOpenAIResponsesUsage(usage: RawObject | null | undefined): 
   }
   const inputTokens = readNumberField(usage, 'input_tokens') ?? 0;
   const outputTokens = readNumberField(usage, 'output_tokens') ?? 0;
+  const outputDetails = readObjectField(usage, 'output_tokens_details');
   const details = readObjectField(usage, 'input_tokens_details');
   const cached = details === undefined ? 0 : (readNumberField(details, 'cached_tokens') ?? 0);
   return {
     inputOther: inputTokens - cached,
     output: outputTokens,
+    reasoningOutput:
+      outputDetails === undefined ? undefined : readNumberField(outputDetails, 'reasoning_tokens'),
     inputCacheRead: cached,
     inputCacheCreation: 0,
     raw: usage,

@@ -34,6 +34,8 @@ import { fromLlmMessage } from '@moonshot-ai/agent-core-v2/llm-adapter/contract/
 import type { LlmRequester } from '@moonshot-ai/agent-core-v2/human/llm/requester/requester';
 
 interface ScriptedResponse {
+  readonly beforeResponse?: () => Promise<void>;
+  readonly usage?: TokenUsage;
   readonly parts: readonly StreamedMessagePart[];
   readonly finishReason?: FinishReason | null;
   readonly rawFinishReason?: string | null;
@@ -70,7 +72,7 @@ class ScriptedStream {
     }
     const hasToolCall = this.parts.some((p) => p.type === 'function');
     this.id = `scripted-${String(this.index)}`;
-    this.usage = { ...ZERO_USAGE, output: this.parts.length };
+    this.usage = this.response.usage ?? { ...ZERO_USAGE, output: this.parts.length };
     this.finishReason =
       this.response.finishReason ?? (hasToolCall ? 'tool_calls' : 'completed');
     this.rawFinishReason =
@@ -103,6 +105,7 @@ class ScriptedChatProvider {
       );
     }
     this.calls.push(history);
+    await response.beforeResponse?.();
     return new ScriptedStream(response.parts, response, this.calls.length);
   }
 
@@ -124,6 +127,8 @@ export interface ScriptedProvider {
   mockNextResponse(...parts: StreamedMessagePart[]): void;
   /** Push a response with an explicit finish reason. */
   mockNextProviderResponse(response: {
+    readonly beforeResponse?: () => Promise<void>;
+    readonly usage?: TokenUsage;
     readonly parts?: readonly StreamedMessagePart[];
     readonly finishReason?: FinishReason | null;
     readonly rawFinishReason?: string | null;
@@ -204,6 +209,8 @@ export function createScriptedProvider(): ScriptedProvider {
     },
     mockNextProviderResponse: (response) => {
       queue.push({
+        usage: response.usage,
+        beforeResponse: response.beforeResponse,
         parts: structuredClone(response.parts ?? []),
         finishReason: response.finishReason,
         rawFinishReason: response.rawFinishReason,

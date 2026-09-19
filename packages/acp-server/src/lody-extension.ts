@@ -70,6 +70,10 @@ export function addTokenUsage(left: TokenUsage | undefined, right: TokenUsage): 
   return {
     inputOther: left.inputOther + right.inputOther,
     output: left.output + right.output,
+    reasoningOutput:
+      left.reasoningOutput === undefined && right.reasoningOutput === undefined
+        ? undefined
+        : (left.reasoningOutput ?? 0) + (right.reasoningOutput ?? 0),
     inputCacheRead: left.inputCacheRead + right.inputCacheRead,
     inputCacheCreation: left.inputCacheCreation + right.inputCacheCreation,
   };
@@ -79,6 +83,10 @@ export function tokenUsageDelta(current: TokenUsage, previous: TokenUsage | unde
   return {
     inputOther: counterDelta(current.inputOther, previous?.inputOther),
     output: counterDelta(current.output, previous?.output),
+    reasoningOutput:
+      current.reasoningOutput === undefined
+        ? undefined
+        : counterDelta(current.reasoningOutput, previous?.reasoningOutput),
     inputCacheRead: counterDelta(current.inputCacheRead, previous?.inputCacheRead),
     inputCacheCreation: counterDelta(current.inputCacheCreation, previous?.inputCacheCreation),
   };
@@ -88,6 +96,7 @@ export function hasTokenUsage(usage: TokenUsage): boolean {
   return (
     usage.inputOther > 0 ||
     usage.output > 0 ||
+    (usage.reasoningOutput ?? 0) > 0 ||
     usage.inputCacheRead > 0 ||
     usage.inputCacheCreation > 0
   );
@@ -96,7 +105,8 @@ export function hasTokenUsage(usage: TokenUsage): boolean {
 export function toLodyModelUsage(usage: TokenUsage, contextWindow?: number): ModelUsage {
   return {
     inputTokens: usage.inputOther,
-    outputTokens: usage.output,
+    outputTokens: usage.output - (usage.reasoningOutput ?? 0),
+    reasoningOutputTokens: usage.reasoningOutput,
     cacheReadInputTokens: usage.inputCacheRead,
     cacheCreationInputTokens: usage.inputCacheCreation,
     ...(contextWindow === undefined ? {} : { contextWindow }),

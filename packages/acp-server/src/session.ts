@@ -404,6 +404,7 @@ export class AcpSession {
         this.settleHeldPromptIfDrained();
       }),
       events.on('agent.status.updated', (event) => {
+        if (event['usage'] !== undefined) void this.emitDetailedUsageUpdate();
         let changed = false;
         if (typeof event['planMode'] === 'boolean' && event['planMode'] !== this.planMode) {
           this.planMode = event['planMode'];
@@ -428,6 +429,7 @@ export class AcpSession {
       }),
       events.on('task.terminated', (event) => {
         if (event.info.kind === 'agent') {
+          void this.emitDetailedUsageUpdate();
           this.activeSubagentTasks.delete(event.info.taskId);
           if (this.activeSubagentTasks.size === 0 && expectsWakeTurn(event.info)) {
             this.startWakeTurnGrace();
@@ -1129,6 +1131,11 @@ export class AcpSession {
   }
 
   private onTurnEnded(event: AgentEventPayloads['turn.ended']): void {
+    void Promise.all([
+      this.emitUsageUpdate(),
+      this.emitDetailedUsageUpdate(),
+      this.emitManagedUsage(),
+    ]);
     const driver = this.driverFor(event.turnId);
     if (driver === undefined) return;
     const error = event.error as { readonly code: string; readonly message?: string } | undefined;
@@ -1143,11 +1150,6 @@ export class AcpSession {
       driver.pendingStopReason = turnEndReasonToStopReason(event.reason, error);
       this.settleHeldPromptIfDrained();
     }
-    void Promise.all([
-      this.emitUsageUpdate(),
-      this.emitDetailedUsageUpdate(),
-      this.emitManagedUsage(),
-    ]);
   }
 
   /**

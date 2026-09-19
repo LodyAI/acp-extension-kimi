@@ -121,6 +121,7 @@ export const setPermissionPayloadSchema = z.object({
 export const tokenUsageSchema = z.object({
   inputOther: z.number(),
   output: z.number(),
+  reasoningOutput: z.number().optional(),
   inputCacheRead: z.number(),
   inputCacheCreation: z.number(),
 });

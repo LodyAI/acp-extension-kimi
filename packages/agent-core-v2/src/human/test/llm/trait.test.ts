@@ -861,6 +861,24 @@ describe('buildParams', () => {
 });
 
 describe('extractUsage', () => {
+  it('preserves reasoning detail from the Responses protocol', async () => {
+    const client = stubResponsesClient([{
+      type: 'response.completed',
+      response: { id: 'response-1', status: 'completed', usage: { input_tokens: 10, output_tokens: 30, output_tokens_details: { reasoning_tokens: 12 } } },
+    }]);
+    const usage = await generateAndCollectUsage(createOpenAIResponsesRequester({ clientFactory: client.clientFactory }));
+    expect(usage).toMatchObject({ output: 30, reasoningOutput: 12 });
+  });
+
+  it('preserves reasoning detail without changing the total completion count', async () => {
+    const client = stubOpenAIClient([{
+      ...chatCompletionChunks[0],
+      usage: { prompt_tokens: 10, completion_tokens: 30, completion_tokens_details: { reasoning_tokens: 12 } },
+    }]);
+    const usage = await generateAndCollectUsage(createOpenAIRequester({ clientFactory: client.clientFactory }));
+    expect(usage).toMatchObject({ output: 30, reasoningOutput: 12 });
+  });
+
   it('reads usage from choices when the top level is absent', async () => {
     const client = stubOpenAIClient([
       {

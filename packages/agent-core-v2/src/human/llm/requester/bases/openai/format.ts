@@ -131,6 +131,7 @@ export function parseOpenAIUsage(usage: OpenAIRawUsage | null | undefined): Toke
   return {
     inputOther: promptTokens - cached,
     output: usage.completion_tokens ?? 0,
+    reasoningOutput: usage.completion_tokens_details?.reasoning_tokens,
     inputCacheRead: cached,
     inputCacheCreation: 0,
     raw: usage as Record<string, unknown>,

@@ -37,7 +37,7 @@ describe('openAIFormat stream usage', () => {
     };
     openAIFormat.createStreamParser()({ usage: raw }, sink);
     expect(usages).toEqual([
-      { inputOther: 120, output: 50, inputCacheRead: 80, inputCacheCreation: 0, raw },
+      { inputOther: 120, output: 50, reasoningOutput: 12, inputCacheRead: 80, inputCacheCreation: 0, raw },
     ]);
   });
 

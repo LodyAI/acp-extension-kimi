@@ -16,7 +16,8 @@ import { fileURLToPath } from 'node:url';
 
 import { getLiveSessionById, IAgentLifecycleService, IEventBus } from '@moonshot-ai/agent-core-v2';
 import { ToolProgress } from '@moonshot-ai/agent-core-v2/agent/toolExecutor/toolExecutorEvents';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import type { SessionUsageUpdate } from 'acp-extension-core';
 
 import { mapPromptLaunchError } from '../src/session';
 import { createTestClient, type TestClient } from './_helpers/acpClient';
@@ -28,6 +29,12 @@ import { createScriptedProvider, type ScriptedProvider } from './_helpers/script
 const STDIO_MCP_FIXTURE = fileURLToPath(
   new URL('../../agent-core-v2/test/mcpCore/fixtures/mock-stdio-server.mjs', import.meta.url),
 );
+
+function usageUpdates(client: TestClient): SessionUsageUpdate[] {
+  return client.received
+    .filter((message) => message.method === '_lody/session/usage_update')
+    .map((message) => message.params as SessionUsageUpdate);
+}
 
 describe('acp-server real prompt turn (scripted LLM)', () => {
   let homeDir: string | undefined;
@@ -104,6 +111,65 @@ describe('acp-server real prompt turn (scripted LLM)', () => {
     expect(usageUpdate?.used).toBeGreaterThan(0);
     expect(usageUpdate?.cost).toBeUndefined();
   }, 30_000);
+
+  it('reports usage for an engine-initiated turn without an ACP prompt', async () => {
+    const c = await boot();
+    const { sessionId } = await c.send('session/new', { cwd: homeDir, mcpServers: [] }) as { sessionId: string };
+    scripted!.mockNextText('background reply');
+    await c.server.klient.session(sessionId).agent('main').prompt({ input: [{ type: 'text', text: 'background work' }] });
+    await vi.waitFor(() => {
+      const updates = usageUpdates(c);
+      const usage = updates.at(-1);
+      expect(usage?.usage.outputTokens).toBe(1);
+      expect(updates.reduce((total, update) => total + (update.delta?.usage.outputTokens ?? 0), 0)).toBe(1);
+    });
+  });
+
+  it('keeps reasoning separate across multiple requests and cumulative usage updates', async () => {
+    const c = await boot();
+    const { sessionId } = await c.send('session/new', { cwd: homeDir, mcpServers: [] }) as { sessionId: string };
+    for (let turn = 0; turn < 2; turn++) {
+      scripted!.mockNextProviderResponse({
+        parts: [{ type: 'text', text: 'answer' }],
+        usage: { inputOther: 10, output: 30, reasoningOutput: 12, inputCacheRead: 0, inputCacheCreation: 0 },
+      });
+      await c.send('session/prompt', { sessionId, prompt: [{ type: 'text', text: 'hello' }] });
+    }
+    await vi.waitFor(() => {
+      const updates = usageUpdates(c);
+      expect(updates.at(-1)?.usage).toMatchObject({ outputTokens: 36, reasoningOutputTokens: 24 });
+      expect(updates.reduce((sum, update) => sum + (update.delta?.usage.reasoningOutputTokens ?? 0), 0)).toBe(24);
+    });
+    expect(await c.server.klient.session(sessionId).agent('main').getUsage()).toMatchObject({
+      total: { output: 60, reasoningOutput: 24 },
+    });
+  });
+
+  it('reports a detached subagent contribution before its wake response completes', async () => {
+    const c = await boot();
+    const { sessionId } = await c.send('session/new', { cwd: homeDir, mcpServers: [] }) as { sessionId: string };
+    const child = Promise.withResolvers<void>();
+    const wake = Promise.withResolvers<void>();
+    scripted!.mockNextResponse({ type: 'function', id: 'spawn-1', name: 'Agent', arguments: JSON.stringify({ prompt: 'reply briefly', description: 'background task', run_in_background: true }) });
+    scripted!.mockNextProviderResponse({ parts: [{ type: 'text', text: 'child done' }], beforeResponse: () => child.promise });
+    scripted!.mockNextText('launched');
+    scripted!.mockNextProviderResponse({ parts: [{ type: 'text', text: 'wake done' }], beforeResponse: () => wake.promise });
+    const prompt = c.send('session/prompt', { sessionId, prompt: [{ type: 'text', text: 'delegate' }] });
+    try {
+      await vi.waitFor(() => {
+        expect(scripted!.callCount()).toBe(3);
+      }, { timeout: 5000 });
+      child.resolve();
+      await vi.waitFor(() => {
+        const usage = usageUpdates(c).at(-1);
+        expect(usage?.usage.outputTokens).toBe(3);
+      }, { timeout: 5000 });
+    } finally {
+      child.resolve();
+      wake.resolve();
+      await prompt;
+    }
+  }, 15000);
 
   it('runs a tool call and bridges the approval request to the client', async () => {
     const c = await boot({ terminal: true });
@@ -770,6 +836,20 @@ describe('acp-server builtin slash commands (local execution, no LLM turn)', () 
     expect(stopReason).toBe('end_turn');
     expect(chunk).toContain('Context compaction started');
   }, 30_000);
+
+  it('/compact reports its additional usage without another user turn', async () => {
+    const c = await boot();
+    const sessionId = await newSession(c);
+    scripted!.mockNextText('turn reply');
+    await c.send('session/prompt', { sessionId, prompt: [{ type: 'text', text: 'hello' }] });
+    scripted!.mockNextText('summary');
+    await runSlash(c, sessionId, '/compact');
+    await waitForCompletedCompaction(c);
+    await vi.waitFor(() => {
+      const usage = usageUpdates(c).at(-1);
+      expect(usage?.usage.outputTokens).toBe(2);
+    });
+  });
 
   it('/compact reports token totals through the standard tool-call lifecycle', async () => {
     const c = await boot();
