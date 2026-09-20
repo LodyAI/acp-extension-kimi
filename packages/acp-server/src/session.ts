@@ -1061,6 +1061,12 @@ export class AcpSession {
 
   /** Represent compaction through the standard ACP tool-call lifecycle. */
   private onCompactionStarted(event: AgentEventPayloads['compaction.started']): void {
+    // The runtime can re-announce a compaction that is already in flight.
+    // History merges tool calls by id, so minting a fresh one per announcement
+    // renders a single compaction as n stacked "Compacting context" rows — and
+    // only the last id is still correlated when the terminal event lands,
+    // leaving every earlier row spinning forever.
+    if (this.activeCompaction !== undefined) return;
     const id = `context-compaction:${randomUUID()}`;
     const automatic = event.trigger === 'auto';
     this.activeCompaction = { id, automatic };

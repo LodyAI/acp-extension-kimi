@@ -369,3 +369,55 @@ describe('fork positions on the wire', () => {
     expect(byText.get('user turn')).toBe('1');
   });
 });
+
+describe('context compaction tool calls', () => {
+  const compactionUpdates = (updates: readonly SessionNotification[]) =>
+    updates
+      .map((entry) => entry.update)
+      .filter(
+        (update) =>
+          (update as { _meta?: { lody?: { activity?: { kind?: string } } } })._meta?.lody?.activity
+            ?.kind === 'context_compaction',
+      ) as Array<{ sessionUpdate: string; toolCallId: string; status: string }>;
+
+  it('keeps one tool call when a compaction already in flight is re-announced', async () => {
+    // History merges tool calls by id, so a fresh id per announcement rendered
+    // one compaction as n stacked "Compacting context" rows, and only the last
+    // id was still correlated when the terminal event landed.
+    const { fake, updates } = await startSession();
+
+    fake.emit('compaction.started', { trigger: 'auto' });
+    fake.emit('compaction.started', { trigger: 'auto' });
+    fake.emit('compaction.started', { trigger: 'auto' });
+    fake.emit('compaction.completed', { result: { tokensBefore: 900, tokensAfter: 300 } });
+    await flush();
+
+    const compaction = compactionUpdates(updates);
+    expect(compaction).toHaveLength(2);
+    expect(compaction[0]).toMatchObject({ sessionUpdate: 'tool_call', status: 'in_progress' });
+    expect(compaction[1]).toMatchObject({
+      sessionUpdate: 'tool_call_update',
+      status: 'completed',
+      toolCallId: compaction[0]?.toolCallId,
+    });
+  });
+
+  it('opens a new tool call for the compaction that follows a settled one', async () => {
+    const { fake, updates } = await startSession();
+
+    fake.emit('compaction.started', { trigger: 'auto' });
+    fake.emit('compaction.blocked', {});
+    fake.emit('compaction.started', { trigger: 'auto' });
+    fake.emit('compaction.completed', { result: { tokensBefore: 900, tokensAfter: 300 } });
+    await flush();
+
+    const compaction = compactionUpdates(updates);
+    expect(compaction.map((update) => update.status)).toEqual([
+      'in_progress',
+      'failed',
+      'in_progress',
+      'completed',
+    ]);
+    expect(compaction[2]?.toolCallId).not.toBe(compaction[0]?.toolCallId);
+  });
+});
