@@ -5,16 +5,12 @@ import { join } from 'node:path';
 import { RequestError } from '@agentclientprotocol/sdk';
 import { afterEach, describe, expect, it } from 'vitest';
 
-import { AcpHostFileSystem } from '../src/acp-fs/acpFsService';
 import type { IAcpConnection } from '../src/acp-fs/acpConnection';
+import { AcpHostFileSystem } from '../src/acp-fs/acpFsService';
 
 interface FakeClient {
   readTextFile: (params: { sessionId: string; path: string }) => Promise<{ content: string }>;
-  writeTextFile: (params: {
-    sessionId: string;
-    path: string;
-    content: string;
-  }) => Promise<unknown>;
+  writeTextFile: (params: { sessionId: string; path: string; content: string }) => Promise<unknown>;
 }
 
 function makeConnection(
@@ -56,6 +52,22 @@ describe('AcpHostFileSystem', () => {
     }
   });
 
+  it('exposes client resource-not-found as a native missing-file error', async () => {
+    const failure = RequestError.resourceNotFound('/missing-plan.md');
+    const fs = makeFileSystem({
+      readTextFile: async () => {
+        throw failure;
+      },
+      writeTextFile: async () => {},
+    });
+
+    await expect(fs.readText('/missing-plan.md')).rejects.toMatchObject({
+      code: 'ENOENT',
+      path: '/missing-plan.md',
+      cause: failure,
+    });
+  });
+
   it('bridges append through client read-modify-write', async () => {
     const writes: string[] = [];
     const fs = makeFileSystem({
@@ -86,9 +98,12 @@ describe('AcpHostFileSystem', () => {
     expect(writes).toEqual(['fresh']);
   });
 
-  it('does not write after a non-not-found client read failure', async () => {
+  it.each([
+    new Error('transport failed'),
+    new RequestError(-32603, 'Internal error'),
+    new RequestError(-32603, 'ENOENT in an unstructured error message'),
+  ])('preserves non-not-found client read failures without writing: %s', async (failure) => {
     const writes: string[] = [];
-    const failure = new Error('transport failed');
     const fs = makeFileSystem({
       readTextFile: async () => {
         throw failure;
@@ -98,6 +113,7 @@ describe('AcpHostFileSystem', () => {
       },
     });
 
+    await expect(fs.readText('/buffer.txt')).rejects.toBe(failure);
     await expect(fs.appendText('/buffer.txt', 'new')).rejects.toBe(failure);
     expect(writes).toEqual([]);
   });

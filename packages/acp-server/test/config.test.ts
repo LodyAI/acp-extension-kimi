@@ -1,7 +1,8 @@
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
+import { RequestError } from '@agentclientprotocol/sdk';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import { buildModelOption } from '../src/config-options';
@@ -47,6 +48,7 @@ describe('acp-server config surface', () => {
   });
 
   async function boot(opts?: {
+    clientFs?: boolean;
     fakeModel?: boolean;
     thinking?: boolean;
     supportEfforts?: readonly string[];
@@ -67,7 +69,26 @@ describe('acp-server config surface', () => {
       });
     }
     client = await createTestClient({ homeDir });
-    await client.send('initialize', { protocolVersion: 1, clientCapabilities: {} });
+    client.onRequest('fs/read_text_file', async (params) => {
+      const { path } = params as { path: string };
+      try {
+        return { content: await readFile(path, 'utf8') };
+      } catch (error) {
+        if (
+          typeof error === 'object' &&
+          error !== null &&
+          'code' in error &&
+          error.code === 'ENOENT'
+        ) {
+          throw RequestError.resourceNotFound(path);
+        }
+        throw error;
+      }
+    });
+    await client.send('initialize', {
+      protocolVersion: 1,
+      clientCapabilities: opts?.clientFs ? { fs: { readTextFile: true } } : {},
+    });
     return client;
   }
 
@@ -95,36 +116,39 @@ describe('acp-server config surface', () => {
     expect(option.options[0]).toMatchObject({ description: 'Latest Kimi model' });
   });
 
-  it('keeps YOLO selected across boolean Plan switches and rejects string values', async () => {
-    await boot();
-    const { sessionId } = await newSession();
-    await client!.send('session/set_config_option', {
-      sessionId,
-      configId: 'permission_mode',
-      value: 'yolo',
-    });
-    for (const active of [true, false]) {
-      const response = (await client!.send('session/set_config_option', {
+  it.each([false, true])(
+    'keeps YOLO across repeatable Plan switches with client fs=%s',
+    async (clientFs) => {
+      await boot({ clientFs });
+      const { sessionId } = await newSession();
+      await client!.send('session/set_config_option', {
         sessionId,
-        configId: 'plan_mode',
-        type: 'boolean',
-        value: active,
-      })) as { configOptions: Array<{ id: string; currentValue: unknown }> };
-      expect(response.configOptions.find((option) => option.id === 'plan_mode')?.currentValue).toBe(
-        active,
-      );
-      expect(
-        response.configOptions.find((option) => option.id === 'permission_mode')?.currentValue,
-      ).toBe('yolo');
-    }
-    await expect(
-      client!.send('session/set_config_option', {
-        sessionId,
-        configId: 'plan_mode',
-        value: 'true',
-      }),
-    ).rejects.toThrow();
-  });
+        configId: 'permission_mode',
+        value: 'yolo',
+      });
+      for (const active of [true, true, false, false, true, false]) {
+        const response = (await client!.send('session/set_config_option', {
+          sessionId,
+          configId: 'plan_mode',
+          type: 'boolean',
+          value: active,
+        })) as { configOptions: Array<{ id: string; currentValue: unknown }> };
+        expect(
+          response.configOptions.find((option) => option.id === 'plan_mode')?.currentValue,
+        ).toBe(active);
+        expect(
+          response.configOptions.find((option) => option.id === 'permission_mode')?.currentValue,
+        ).toBe('yolo');
+      }
+      await expect(
+        client!.send('session/set_config_option', {
+          sessionId,
+          configId: 'plan_mode',
+          value: 'true',
+        }),
+      ).rejects.toThrow();
+    },
+  );
 
   it(
     'session/new advertises mode + model pickers (no thinking without a model)',

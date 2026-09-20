@@ -1,8 +1,12 @@
 import { PassThrough, Readable, Writable } from 'node:stream';
 
-import { ndJsonStream } from '@agentclientprotocol/sdk';
+import { ndJsonStream, RequestError } from '@agentclientprotocol/sdk';
 
-import { runAcpServerWithStream, type RunningAcpServer, type RunAcpServerOptions } from '../../src/start';
+import {
+  runAcpServerWithStream,
+  type RunningAcpServer,
+  type RunAcpServerOptions,
+} from '../../src/start';
 
 interface RpcMessage {
   readonly id?: number;
@@ -71,11 +75,7 @@ export async function createTestClient(opts: {
   }> = [];
   let buffer = '';
 
-  async function handleIncomingRequest(
-    id: number,
-    method: string,
-    params: unknown,
-  ): Promise<void> {
+  async function handleIncomingRequest(id: number, method: string, params: unknown): Promise<void> {
     const handler = requestHandlers.get(method);
     try {
       if (handler === undefined) {
@@ -86,7 +86,15 @@ export async function createTestClient(opts: {
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       toAgent.write(
-        `${JSON.stringify({ jsonrpc: '2.0', id, error: { code: -32603, message } })}\n`,
+        `${JSON.stringify({
+          jsonrpc: '2.0',
+          id,
+          error: {
+            code: error instanceof RequestError ? error.code : -32603,
+            message,
+            data: error instanceof RequestError ? error.data : undefined,
+          },
+        })}\n`,
       );
     }
   }
