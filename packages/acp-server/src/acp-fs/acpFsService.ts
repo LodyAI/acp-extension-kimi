@@ -71,10 +71,23 @@ export class AcpHostFileSystem implements IHostFileSystem {
     }
     // ACP `fs.readTextFile` returns already-decoded UTF-8 text, so the
     // `encoding`/`errors` decode options are a no-op here.
-    const { content } = await this.connection
-      .get()
-      .readTextFile({ sessionId: this.ctx.sessionId, path });
-    return content;
+    try {
+      const { content } = await this.connection
+        .get()
+        .readTextFile({ sessionId: this.ctx.sessionId, path });
+      return content;
+    } catch (error) {
+      if (!isResourceNotFound(error)) throw error;
+      // Engine filesystem consumers use native error codes, not ACP codes.
+      throw Object.assign(
+        new Error(`ENOENT: no such file or directory, open '${path}'`, { cause: error }),
+        {
+          code: 'ENOENT',
+          syscall: 'open',
+          path,
+        },
+      );
+    }
   }
 
   async writeText(path: string, data: string): Promise<void> {
@@ -100,7 +113,7 @@ export class AcpHostFileSystem implements IHostFileSystem {
     try {
       existing = await this.readText(path);
     } catch (error) {
-      if (!isResourceNotFound(error)) throw error;
+      if (!(error instanceof Error && 'code' in error && error.code === 'ENOENT')) throw error;
     }
     await this.writeText(path, existing + data);
   }

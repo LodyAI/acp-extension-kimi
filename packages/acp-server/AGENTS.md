@@ -4,6 +4,8 @@ Package-local rules for `packages/acp-server`.
 
 - Keep Lody integration at this ACP/Klient edge. Agent core services remain
   provider-neutral and must not import Lody contracts.
+- Translate ACP resource-not-found file reads to native `ENOENT` at the filesystem
+  edge. Preserve other errors; never infer missing files from error-message text.
 - Import shared Lody contracts from `acp-extension-core`, advertise each supported
   feature under `_meta.lody`, and use `_lody/...` only where ACP has no standard method.
 - Usage notifications may contain token counters, quota windows, and wallet totals,
