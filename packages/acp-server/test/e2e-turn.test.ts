@@ -9,15 +9,15 @@
  * `assistant.delta` → ACP `session/update` translation, and turn settlement.
  */
 
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { getLiveSessionById, IAgentLifecycleService, IEventBus } from '@moonshot-ai/agent-core-v2';
 import { ToolProgress } from '@moonshot-ai/agent-core-v2/agent/toolExecutor/toolExecutorEvents';
-import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { SessionUsageUpdate } from 'acp-extension-core';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { mapPromptLaunchError } from '../src/session';
 import { createTestClient, type TestClient } from './_helpers/acpClient';
@@ -230,6 +230,96 @@ describe('acp-server real prompt turn (scripted LLM)', () => {
     expect(terminal).toBeDefined();
     expect(JSON.stringify(scripted!.callHistory()[1])).toContain('hello_from_bash');
   }, 30_000);
+
+  it.each([
+    { supportsPlan: true, permissionMode: 'default', decision: 'plan_approve' },
+    { supportsPlan: false, permissionMode: 'default', decision: 'plan_approve' },
+    { supportsPlan: true, permissionMode: 'default', decision: 'plan_revise' },
+    { supportsPlan: true, permissionMode: 'default', decision: 'plan_reject_and_exit' },
+    { supportsPlan: true, permissionMode: 'auto', decision: undefined },
+  ])(
+    'presents plan markdown: $supportsPlan / $permissionMode / $decision',
+    async ({ supportsPlan, permissionMode, decision }) => {
+      const c = await boot(supportsPlan ? { plan: {} } : {});
+      const { sessionId } = (await c.send('session/new', {
+        cwd: homeDir,
+        mcpServers: [],
+      })) as { sessionId: string };
+      await c.send('session/set_config_option', {
+        sessionId,
+        configId: 'permission_mode',
+        value: permissionMode,
+      });
+      await c.send('session/set_config_option', {
+        sessionId,
+        configId: 'plan_mode',
+        type: 'boolean',
+        value: true,
+      });
+      const plan = await c.server.klient.session(sessionId).agent('main').getPlan();
+      expect(plan).not.toBeNull();
+      const markdown = '# Proposed change\n\n- Add a regression test.\n- Fix the adapter.\n';
+      await mkdir(dirname(plan!.path), { recursive: true });
+      await writeFile(plan!.path, markdown);
+      let approval: unknown;
+      c.onRequest('session/request_permission', (params) => {
+        approval = params;
+        return { outcome: { outcome: 'selected', optionId: decision } };
+      });
+      scripted!.mockNextResponse({
+        type: 'function',
+        id: 'submit_plan',
+        name: 'ExitPlanMode',
+        arguments: '{}',
+      });
+      scripted!.mockNextText('Plan approved.');
+      await c.send('session/prompt', {
+        sessionId,
+        prompt: [{ type: 'text', text: 'Submit the plan.' }],
+      });
+      if (decision === undefined) expect(approval).toBeUndefined();
+      else
+        expect(approval).toMatchObject({
+          toolCall: {
+            content: expect.arrayContaining([
+              {
+                type: 'content',
+                content: { type: 'text', text: expect.stringContaining(markdown) },
+              },
+            ]),
+          },
+        });
+      const updates = c
+        .sessionUpdates()
+        .map((m) => (m.params as { update: { sessionUpdate: string } }).update);
+      expect(updates).toContainEqual(
+        expect.objectContaining({
+          toolCallId: expect.stringContaining('submit_plan'),
+          kind: 'switch_mode',
+        }),
+      );
+      const plans = updates.filter((update) => update.sessionUpdate === 'plan_update');
+      expect(plans).toEqual(
+        supportsPlan
+          ? [
+              expect.objectContaining({
+                sessionUpdate: 'plan_update',
+                plan: {
+                  type: 'markdown',
+                  planId: expect.stringContaining('submit_plan'),
+                  content: markdown,
+                },
+                _meta: { lody: { turnId: '0' } },
+              }),
+            ]
+          : [],
+      );
+      expect(updates.some((update) => update.sessionUpdate === 'plan_removed')).toBe(false);
+      const finalPlan = await c.server.klient.session(sessionId).agent('main').getPlan();
+      if (decision === 'plan_revise') expect(finalPlan?.content).toBe(markdown);
+      else expect(finalPlan).toBeNull();
+    },
+  );
 
   it('bridges AskUserQuestion through elicitation/create for form-capable clients', async () => {
     const c = await boot({ elicitation: { form: {} } });

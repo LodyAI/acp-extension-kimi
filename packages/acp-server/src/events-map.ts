@@ -10,7 +10,6 @@ import type {
   ToolCallLocation,
   ToolKind,
 } from '@agentclientprotocol/sdk';
-import type { ToolResultEvent } from '@moonshot-ai/agent-core-v2/events';
 import type {
   AssistantDeltaEvent,
   ThinkingDeltaEvent,
@@ -21,6 +20,7 @@ import type {
   ToolCallStartedEvent,
   ToolProgressEvent,
 } from '@moonshot-ai/agent-core-v2/agent/toolExecutor/toolExecutorEvents';
+import type { ToolResultEvent } from '@moonshot-ai/agent-core-v2/events';
 import type { ToolInputDisplay } from '@moonshot-ai/agent-core-v2/tool/toolInputDisplay';
 
 import { displayBlockToAcpContent, toolResultToAcpContent } from './convert';
@@ -141,6 +141,8 @@ export function inferToolKind(name: string): ToolKind {
       return 'fetch';
     case 'Think':
       return 'think';
+    case 'ExitPlanMode':
+      return 'switch_mode';
     default:
       return 'other';
   }
@@ -445,15 +447,29 @@ function mapTodoStatus(status: string): PlanEntryStatus {
 }
 
 /**
- * If the given {@link ToolInputDisplay} carries a TodoList payload, project it
- * into an ACP `plan` session update. Returns `null` for every other display
- * kind.
+ * Project task lists and submitted plan documents into their ACP surfaces.
+ * Markdown updates require the client's experimental `plan` capability.
  */
 export function planFromDisplayBlock(
   sessionId: string,
   turnId: number,
   display: ToolInputDisplay,
+  toolCallId: string,
+  supportsPlan: boolean,
 ): SessionNotification | null {
+  if (display.kind === 'plan_review' && supportsPlan && display.plan.trim()) {
+    return {
+      sessionId,
+      update: {
+        sessionUpdate: 'plan_update',
+        plan: {
+          type: 'markdown',
+          planId: acpToolCallId(turnId, toolCallId),
+          content: display.plan,
+        },
+      },
+    };
+  }
   if (display.kind !== 'todo_list') return null;
   return todoListToSessionUpdate(sessionId, turnId, display.items);
 }

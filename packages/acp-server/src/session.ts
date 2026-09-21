@@ -342,6 +342,7 @@ export class AcpSession {
      */
     private readonly resolveOriginalsDir?: (sessionId: string) => string | undefined,
     private readonly hostCommands: ReadonlyArray<AvailableCommand> | HostSlashCommandsSnapshot = [],
+    private readonly supportsPlan = false,
   ) {
     this.klient = klient;
     this.session = klient.session(sessionId);
@@ -966,7 +967,13 @@ export class AcpSession {
     if (event.display !== undefined) {
       this.emitForTurn(
         event.turnId,
-        planFromDisplayBlock(this.sessionId, event.turnId, event.display as ToolInputDisplay),
+        planFromDisplayBlock(
+          this.sessionId,
+          event.turnId,
+          event.display as ToolInputDisplay,
+          event.toolCallId,
+          this.supportsPlan,
+        ),
       );
     }
   }
