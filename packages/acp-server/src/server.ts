@@ -633,6 +633,7 @@ export class AcpServer {
       Boolean(this.clientCapabilities?.elicitation?.form),
       this.resolveOriginalsDir,
       hostCommands,
+      Boolean(this.clientCapabilities?.plan),
     );
     await acpSession.init();
     return acpSession;
