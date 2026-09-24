@@ -1240,7 +1240,11 @@ export class AgentLoopService extends Disposable implements IAgentLoopService {
       nudge.consumed = true;
       if (nudge.contextMessage !== undefined && nudge.contextMessage.content.length > 0) {
         this.materializeMessage(nudge.contextMessage);
-        if (nudge.promptIds !== undefined && nudge.promptIds.length > 0) {
+        if (
+          nudge.promptIds !== undefined &&
+          nudge.promptIds.length > 0 &&
+          nudge.contextMessage.id !== this.active?.prompt.message.id
+        ) {
           void this.dispatcher.dispatch(
             new TurnSteer({
               agentId: this.scopeContext.agentId,
@@ -1426,6 +1430,7 @@ export class AgentLoopService extends Disposable implements IAgentLoopService {
               encrypted: delta.encrypted,
               detailsIndex: delta.detailsIndex,
               hidden: delta.hidden,
+              reasoningKey: delta.reasoningKey,
             });
             if (part?.type === 'think' && part.hidden === true) return;
             void this.dispatcher.dispatch(
@@ -2053,6 +2058,7 @@ export class AgentLoopService extends Disposable implements IAgentLoopService {
         durationMs,
         interruptReason,
         stopReason: result.type === 'completed' ? result.stopReason : undefined,
+        traceId,
       }),
     );
     if (error !== undefined) {

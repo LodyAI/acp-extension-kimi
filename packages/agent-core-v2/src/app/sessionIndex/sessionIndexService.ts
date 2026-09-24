@@ -360,6 +360,8 @@ export class FileSessionIndex extends Disposable implements ISessionIndex {
   }
 
   async remove(id: string): Promise<void> {
+    await this.prepareFlight;
+    await this.projectFlight;
     await this.mirror.evict(id);
     await this.withReadModel(
       async (generation) => {

@@ -22,3 +22,13 @@ repeated Plan switches with client file access and unchanged YOLO permissions.
 
 Build the runtime with the matching `acp-extension-core` package before updating
 Lody's checksummed managed-runtime manifest.
+
+## Session titles
+
+With a configured managed Kimi OAuth provider, initialize advertises Core 0.1.7's
+`_meta.lody.sessionTitle: { version: 1 }`. Accepted prompts request the engine's
+native title service without delaying the turn. The service deduplicates requests
+and preserves generated/custom titles; failure leaves the current title intact.
+ACP title updates carry `titleSource`: generated, explicit (custom), fallback
+(replaceable preview), or unset. API-key-only configurations do not advertise
+title generation, so clients can retain their own generator.
