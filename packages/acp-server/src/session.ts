@@ -814,6 +814,14 @@ export class AcpSession {
       this.driver = driver;
       launch.then(
         (launched) => {
+          if (launched !== undefined) {
+            void this.session.generateTitle().catch((error) => {
+              log.warn('acp: title generation failed', {
+                sessionId: this.sessionId,
+                error: error instanceof Error ? error.message : String(error),
+              });
+            });
+          }
           if (driver.settled) return;
           if (launched === undefined) {
             // No turn will emit `turn.ended`, so settle gracefully. The engine
@@ -1366,7 +1374,7 @@ export class AcpSession {
   }
 
   private onMetadataChanged(event: SessionEventPayloads['metadata.changed']): void {
-    if (!event.changed.includes('title')) return;
+    if (!event.changed.includes('title') && !event.changed.includes('titleKind')) return;
     void this.emitSessionInfoUpdate();
   }
 
@@ -1374,7 +1382,7 @@ export class AcpSession {
   private async emitSessionInfoUpdate(): Promise<void> {
     try {
       const meta = await this.session.get();
-      this.emit(sessionInfoUpdateNotification(this.sessionId, meta.title ?? null));
+      this.emit(sessionInfoUpdateNotification(this.sessionId, meta.title ?? null, meta.titleKind));
     } catch (error) {
       log.warn('acp: failed to push session_info_update', {
         sessionId: this.sessionId,

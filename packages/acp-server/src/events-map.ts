@@ -22,6 +22,7 @@ import type {
 } from '@moonshot-ai/agent-core-v2/agent/toolExecutor/toolExecutorEvents';
 import type { ToolResultEvent } from '@moonshot-ai/agent-core-v2/events';
 import type { ToolInputDisplay } from '@moonshot-ai/agent-core-v2/tool/toolInputDisplay';
+import type { LodySessionMeta } from 'acp-extension-core';
 
 import { displayBlockToAcpContent, toolResultToAcpContent } from './convert';
 import type { AcpStopReason } from './types';
@@ -556,12 +557,24 @@ export function usageUpdateNotification(
 export function sessionInfoUpdateNotification(
   sessionId: string,
   title: string | null,
+  titleKind?: 'replaceable' | 'generated' | 'custom',
 ): SessionNotification {
   return {
     sessionId,
     update: {
       sessionUpdate: 'session_info_update',
       title,
+      _meta: {
+        lody: {
+          titleSource: (title === null
+            ? 'unset'
+            : titleKind === 'generated'
+              ? 'generated'
+              : titleKind === 'custom'
+                ? 'explicit'
+                : 'fallback') satisfies LodySessionMeta['titleSource'],
+        },
+      },
     },
   };
 }

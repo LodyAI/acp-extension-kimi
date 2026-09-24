@@ -1,7 +1,9 @@
+import type { Klient } from '@moonshot-ai/klient';
 import { describe, expect, it } from 'vitest';
 
 import {
   hasTokenUsage,
+  supportsSessionTitles,
   readLodyForkTurnIndex,
   tokenUsageDelta,
   toLodyRateLimits,
@@ -95,8 +97,18 @@ describe('Lody ACP extension projections', () => {
       },
     });
     expect(result.rateLimits[0]?.windows).toEqual([
-      { label: 'Monthly total', usedPercent: 40, windowDurationSeconds: null, resetsAtEpochSeconds: null },
-      { label: 'Monthly code', usedPercent: 30, windowDurationSeconds: null, resetsAtEpochSeconds: null },
+      {
+        label: 'Monthly total',
+        usedPercent: 40,
+        windowDurationSeconds: null,
+        resetsAtEpochSeconds: null,
+      },
+      {
+        label: 'Monthly code',
+        usedPercent: 30,
+        windowDurationSeconds: null,
+        resetsAtEpochSeconds: null,
+      },
     ]);
   });
 
@@ -193,5 +205,17 @@ describe('fork-at-turn request parsing', () => {
     expect(
       readLodyForkTurnIndex({ lody: { forkAtTurn: { version: 1, turnId: 3 } } }),
     ).toBeUndefined();
+  });
+});
+
+describe('native title availability', () => {
+  it.each([
+    [{}, false],
+    [{ 'managed:kimi-code': { type: 'kimi', apiKey: 'example' } }, false],
+    [{ 'managed:kimi-code': { type: 'openai', oauth: 'managed' } }, false],
+    [{ 'managed:kimi-code': { type: 'kimi', oauth: 'managed' } }, true],
+  ])('advertises only a configured native OAuth title service', async (providers, expected) => {
+    const klient = { global: { config: { get: async () => providers } } } as unknown as Klient;
+    expect(await supportsSessionTitles(klient)).toBe(expected);
   });
 });

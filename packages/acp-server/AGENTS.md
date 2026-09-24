@@ -40,3 +40,8 @@ Package-local rules for `packages/acp-server`.
   records defining these positions stay, and a repeated or truncated prompt would match
   the wrong turn. A turn with no resolvable position is published without one; forking
   the wrong turn is worse than not offering the branch.
+
+- Declare Core `sessionTitle` only for a configured native OAuth title provider.
+  Accepted prompt launches trigger native generation without blocking the turn;
+  metadata updates retain generated/custom/replaceable provenance as Core
+  generated/explicit/fallback title sources. Never force generation over a user name.

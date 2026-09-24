@@ -80,6 +80,7 @@ import { log } from './log';
 import { isAcpModeId } from './modes';
 import {
   LODY_EXTENSION_CAPABILITIES,
+  supportsSessionTitles,
   readLodyForkTurnIndex,
   toLodyRateLimits,
   toLodySubagentTask,
@@ -234,7 +235,12 @@ export class AcpServer {
       // is not supported (dropped with a warning — see `./convert`).
       mcpCapabilities: { http: true, sse: true },
       auth: { logout: {} },
-      _meta: { lody: LODY_EXTENSION_CAPABILITIES },
+      _meta: {
+        lody: {
+          ...LODY_EXTENSION_CAPABILITIES,
+          sessionTitle: (await supportsSessionTitles(this.klient)) ? { version: 1 } : undefined,
+        },
+      },
     };
 
     return {
