@@ -1,5 +1,8 @@
 import type { SessionNotification } from '@agentclientprotocol/sdk';
-import type { AgentTaskInfo, ManagedUsageResult, UsageStatus } from '@moonshot-ai/klient';
+import type { ProviderConfig } from '@moonshot-ai/agent-core-v2/llm-adapter/provider/provider';
+import { isOAuthCatalogVendor } from '@moonshot-ai/agent-core-v2/llm-adapter/provider/provider-definition';
+import { KIMI_CODE_PROVIDER_NAME } from '@moonshot-ai/kimi-code-oauth';
+import type { AgentTaskInfo, Klient, ManagedUsageResult, UsageStatus } from '@moonshot-ai/klient';
 import type {
   LodyExtensionCapabilities,
   LodySubagentTask,
@@ -266,4 +269,13 @@ function resetEpochSeconds(value: string | undefined): number | null {
   if (value === undefined) return null;
   const epochMs = Date.parse(value);
   return Number.isFinite(epochMs) ? Math.floor(epochMs / 1_000) : null;
+}
+
+/** Match the native title service's provider requirements without requesting a title. */
+export async function supportsSessionTitles(klient: Klient): Promise<boolean> {
+  const providers = await klient.global.config.get<Record<string, ProviderConfig>>('providers');
+  const provider = providers[KIMI_CODE_PROVIDER_NAME];
+  return (
+    provider !== undefined && isOAuthCatalogVendor(provider.type) && provider.oauth !== undefined
+  );
 }

@@ -22,6 +22,7 @@ function makeFakeKlient(
   usage: () => unknown = () => ({}),
 ): {
   readonly klient: Klient;
+  readonly titleState: { title: string; kind: string; fail: boolean };
   emit(event: string, payload: unknown): void;
   readonly prompts: number[];
   readonly forks: Array<Record<string, unknown> | undefined>;
@@ -63,8 +64,19 @@ function makeFakeKlient(
     getTasks: () => Promise.resolve([]),
   };
   const forks: Array<Record<string, unknown> | undefined> = [];
+  const titleState = { title: 'First prompt preview', kind: 'replaceable', fail: false };
   const session = {
     agent: () => agent,
+    get: () => Promise.resolve({ title: titleState.title, titleKind: titleState.kind }),
+    generateTitle: async () => {
+      if (titleState.fail) throw new Error('title service unavailable');
+      if (titleState.kind === 'custom') return undefined;
+      titleState.title = 'Generated session title';
+      titleState.kind = 'generated';
+      for (const listener of listeners.get('metadata.changed') ?? [])
+        listener({ changed: ['title', 'titleKind'] });
+      return titleState.title;
+    },
     agents: () => Promise.resolve({}),
     events: { on, onError: () => ({ dispose: () => {} }) },
     skills: { list: () => Promise.resolve([]) },
@@ -84,6 +96,7 @@ function makeFakeKlient(
   };
   return {
     klient: klient as unknown as Klient,
+    titleState,
     emit: (event, payload) => {
       for (const listener of listeners.get(event) ?? []) listener(payload);
     },
@@ -419,5 +432,47 @@ describe('context compaction tool calls', () => {
       'completed',
     ]);
     expect(compaction[2]?.toolCallId).not.toBe(compaction[0]?.toolCallId);
+  });
+});
+
+describe('native session titles', () => {
+  it.each([false, true])('does not block a turn when generation fails: %s', async (fail) => {
+    const { fake, session, updates } = await startSession();
+    fake.titleState.fail = fail;
+    const response = session.prompt([{ type: 'text', text: 'Explain this project' }]);
+    await flush();
+    fake.emit('turn.ended', { turnId: 1, reason: 'completed' });
+    expect(await response).toEqual({ stopReason: 'end_turn' });
+    await flush();
+    const titles = updates.filter((item) => item.update.sessionUpdate === 'session_info_update');
+    if (fail) expect(titles).toEqual([]);
+    else
+      expect(titles.at(-1)?.update).toMatchObject({
+        title: 'Generated session title',
+        _meta: { lody: { titleSource: 'generated' } },
+      });
+    session.dispose();
+  });
+
+  it('preserves native user names and tags preview titles as fallback', async () => {
+    const { fake, session, updates } = await startSession();
+    fake.emit('metadata.changed', { changed: ['title'] });
+    await flush();
+    expect(updates.at(-1)?.update).toMatchObject({ _meta: { lody: { titleSource: 'fallback' } } });
+    fake.titleState.kind = 'custom';
+    fake.titleState.title = 'My chosen name';
+    const response = session.prompt([{ type: 'text', text: 'Explain this project' }]);
+    await flush();
+    fake.emit('metadata.changed', { changed: ['titleKind'] });
+    fake.emit('turn.ended', { turnId: 1, reason: 'completed' });
+    await response;
+    await flush();
+    expect(
+      updates.findLast((item) => item.update.sessionUpdate === 'session_info_update')?.update,
+    ).toMatchObject({
+      title: 'My chosen name',
+      _meta: { lody: { titleSource: 'explicit' } },
+    });
+    session.dispose();
   });
 });
