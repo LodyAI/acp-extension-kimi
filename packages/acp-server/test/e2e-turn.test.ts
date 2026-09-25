@@ -140,12 +140,7 @@ describe('acp-server real prompt turn (scripted LLM)', () => {
       expect(updates.at(-1)?.usage).toMatchObject({ outputTokens: 36, reasoningOutputTokens: 24 });
       expect(updates.reduce((sum, update) => sum + (update.delta?.usage.reasoningOutputTokens ?? 0), 0)).toBe(24);
       // One activation is one cumulative usage scope.
-      const scopes = new Set(
-        updates.map(
-          (update) =>
-            (update as { _meta?: { lody?: { usageScopeId?: string } } })._meta?.lody?.usageScopeId,
-        ),
-      );
+      const scopes = new Set(updates.map((update) => update._meta?.lody?.usageScopeId));
       expect(scopes.size).toBe(1);
       expect([...scopes][0]).toEqual(expect.any(String));
     });
