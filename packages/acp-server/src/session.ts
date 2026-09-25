@@ -318,6 +318,9 @@ export class AcpSession {
   /** Cumulative usage attributable only to this ACP activation. */
   private readonly lodyUsageSinceActivation = new Map<string, TokenUsage>();
   private lodyUsageLastEmitted: Record<string, TokenUsage> = {};
+  /** Core usage scope of this activation: its counters start from zero, so a
+   * later activation must never report under the same accounting identity. */
+  private readonly lodyUsageScopeId = randomUUID();
   private lodyUsageEmission: Promise<void> = Promise.resolve();
   /** Compaction tool-call correlation for the current background compaction. */
   private activeCompaction: { readonly id: string; readonly automatic: boolean } | undefined;
@@ -1272,6 +1275,7 @@ export class AcpSession {
       if (update !== null) {
         await this.conn.extensionNotification(LODY_EXTENSION_METHODS.sessionUsageUpdate, {
           ...update,
+          _meta: { lody: { usageScopeId: this.lodyUsageScopeId } },
         });
         this.lodyUsageLastEmitted = snapshot;
       }
