@@ -32,8 +32,9 @@ Subscription starts at task registration and has no replay guarantee, so histori
 are marked potentially incomplete. Child approvals use run-scoped root tool IDs;
 unknown child ownership is rejected rather than attributed to the main agent.
 Existing task-ID controls remain compatible, but normalized runs advertise neither
-cancel nor output reads. Deployment requires Core's new exports and a new managed
-runtime artifact; changing this source checkout alone does not update that artifact.
+cancel nor output reads. Core 0.1.9 supplies the contract and helper. Deployment
+still requires a new managed runtime artifact; changing this source checkout alone
+does not update that artifact.
 
 ## Session titles
 
