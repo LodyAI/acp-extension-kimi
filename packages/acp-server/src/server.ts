@@ -18,7 +18,6 @@
  * through the client terminal (`./acp-terminal`).
  */
 
-import { LODY_PLAN_MODE_CONFIG_ID } from 'acp-extension-core';
 import {
   agent,
   type AgentApp,
@@ -57,6 +56,7 @@ import {
   type SetSessionModeRequest,
   type SetSessionModeResponse,
 } from '@agentclientprotocol/sdk';
+import { ErrorCodes, isError2 } from '@moonshot-ai/agent-core-v2';
 import type {
   AgentHandle,
   Klient,
@@ -64,8 +64,8 @@ import type {
   SessionRestoreOptions,
   SessionSummary,
 } from '@moonshot-ai/klient';
-import { ErrorCodes, isError2 } from '@moonshot-ai/agent-core-v2';
 import { RPCError } from '@moonshot-ai/klient';
+import { LODY_PLAN_MODE_CONFIG_ID, supportsLodySubagentEvents } from 'acp-extension-core';
 import {
   LODY_EXTENSION_METHODS,
   type RateLimitsGetRequest,
@@ -76,8 +76,6 @@ import type { AcpClient } from './acp-client';
 import type { IAcpConnection } from './acp-fs';
 import { buildTerminalAuthMethod, TERMINAL_AUTH_METHOD } from './auth-methods';
 import { acpMcpServersToConfigRecord } from './convert';
-import { log } from './log';
-import { isAcpModeId } from './modes';
 import {
   LODY_EXTENSION_CAPABILITIES,
   supportsSessionTitles,
@@ -85,6 +83,8 @@ import {
   toLodyRateLimits,
   toLodySubagentTask,
 } from './lody-extension';
+import { log } from './log';
+import { isAcpModeId } from './modes';
 import { AcpSession } from './session';
 import { negotiateVersion } from './version';
 
@@ -310,10 +310,7 @@ export class AcpServer {
     }
     const restored = await this.klient.session(forkedId).restore();
     if (!restored) {
-      throw RequestError.invalidParams(
-        { sessionId: forkedId },
-        `Unknown sessionId: ${forkedId}`,
-      );
+      throw RequestError.invalidParams({ sessionId: forkedId }, `Unknown sessionId: ${forkedId}`);
     }
     return { sessionId: forkedId, ...(await this.activateSession(forkedId)) };
   }
@@ -640,6 +637,7 @@ export class AcpServer {
       this.resolveOriginalsDir,
       hostCommands,
       Boolean(this.clientCapabilities?.plan),
+      supportsLodySubagentEvents(this.clientCapabilities),
     );
     await acpSession.init();
     return acpSession;

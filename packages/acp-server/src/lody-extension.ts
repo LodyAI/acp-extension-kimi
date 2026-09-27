@@ -12,6 +12,7 @@ import type {
 } from 'acp-extension-core';
 
 export const LODY_EXTENSION_CAPABILITIES = {
+  subagentEvents: { version: 1 },
   usage: { version: 1 },
   rateLimits: { version: 1, query: true },
   forkAtTurn: { version: 1 },
@@ -155,10 +156,7 @@ export function toLodySessionUsage(
   };
 }
 
-export function toLodyRateLimits(
-  result: ManagedUsageResult,
-  now = Date.now(),
-): RateLimitsSnapshot {
+export function toLodyRateLimits(result: ManagedUsageResult, now = Date.now()): RateLimitsSnapshot {
   if (result.kind === 'error') {
     return {
       rateLimits: [],
@@ -173,12 +171,16 @@ export function toLodyRateLimits(
     { quota: result.quota.usages.monthCode, duration: null, label: 'Monthly code' },
   ];
   const windows = entries.flatMap(({ quota, duration, label }) =>
-    quota === undefined ? [] : [{
-      label,
-      usedPercent: Math.min(100, Math.max(0, quota.usedRatio * 100)),
-      windowDurationSeconds: duration,
-      resetsAtEpochSeconds: resetEpochSeconds(quota.resetAt),
-    }],
+    quota === undefined
+      ? []
+      : [
+          {
+            label,
+            usedPercent: Math.min(100, Math.max(0, quota.usedRatio * 100)),
+            windowDurationSeconds: duration,
+            resetsAtEpochSeconds: resetEpochSeconds(quota.resetAt),
+          },
+        ],
   );
 
   return {
@@ -214,9 +216,7 @@ export function toLodyTaskLifecycle(
     actor: task.subagentType === undefined ? 'Kimi subagent' : `Kimi ${task.subagentType}`,
     ...(task.model === undefined ? {} : { modelId: task.model }),
     startedAtEpochSeconds: Math.floor(task.startedAt / 1_000),
-    ...(task.endedAt === null
-      ? {}
-      : { endedAtEpochSeconds: Math.floor(task.endedAt / 1_000) }),
+    ...(task.endedAt === null ? {} : { endedAtEpochSeconds: Math.floor(task.endedAt / 1_000) }),
     ...(summary === undefined ? {} : { summary }),
     ...(terminal && task.status !== 'completed' && task.stopReason
       ? { error: task.stopReason }

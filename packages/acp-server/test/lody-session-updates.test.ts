@@ -1,6 +1,7 @@
 import type { SessionNotification } from '@agentclientprotocol/sdk';
 import type { ForkTurnSummary } from '@moonshot-ai/agent-core-v2';
 import type { AgentTaskInfo, Klient } from '@moonshot-ai/klient';
+import { isLodySubagentEvent, type LodySubagentEvent } from 'acp-extension-core';
 import { describe, expect, it } from 'vitest';
 
 import type { AcpClient } from '../src/acp-client';
@@ -24,11 +25,13 @@ function makeFakeKlient(
   readonly klient: Klient;
   readonly titleState: { title: string; kind: string; fail: boolean };
   emit(event: string, payload: unknown): void;
+  emitAgent(agentId: string, event: string, payload: unknown): void;
   readonly prompts: number[];
   readonly forks: Array<Record<string, unknown> | undefined>;
   readonly cancels: number;
 } {
   const listeners = new Map<string, Listener[]>();
+  const childListeners = new Map<string, Map<string, Listener[]>>();
   const on = (event: string, listener: Listener) => {
     const bucket = listeners.get(event) ?? [];
     bucket.push(listener);
@@ -66,7 +69,30 @@ function makeFakeKlient(
   const forks: Array<Record<string, unknown> | undefined> = [];
   const titleState = { title: 'First prompt preview', kind: 'replaceable', fail: false };
   const session = {
-    agent: () => agent,
+    agent: (id = 'main') => {
+      if (id === 'main') return agent;
+      let children = childListeners.get(id);
+      if (!children) {
+        children = new Map();
+        childListeners.set(id, children);
+      }
+      const bucket = children;
+      return {
+        ...agent,
+        events: {
+          on: (event: string, listener: Listener) => {
+            bucket.set(event, [...(bucket.get(event) ?? []), listener]);
+            return {
+              dispose: () =>
+                bucket.set(
+                  event,
+                  (bucket.get(event) ?? []).filter((item) => item !== listener),
+                ),
+            };
+          },
+        },
+      };
+    },
     get: () => Promise.resolve({ title: titleState.title, titleKind: titleState.kind }),
     generateTitle: async () => {
       if (titleState.fail) throw new Error('title service unavailable');
@@ -99,6 +125,9 @@ function makeFakeKlient(
     titleState,
     emit: (event, payload) => {
       for (const listener of listeners.get(event) ?? []) listener(payload);
+    },
+    emitAgent: (id, event, payload) => {
+      for (const listener of childListeners.get(id)?.get(event) ?? []) listener(payload);
     },
     prompts,
     forks,
@@ -160,6 +189,74 @@ const assistantText = (updates: readonly SessionNotification[]): string[] =>
     });
 
 describe('background subagent work and the client prompt', () => {
+  it('keeps negotiated child output in its run, preserving nested ownership and terminal ordering', async () => {
+    const fake = makeFakeKlient();
+    const { conn, updates } = makeFakeConn();
+    const events: LodySubagentEvent[] = [];
+    const done = Promise.withResolvers<void>();
+    conn.extensionNotification = async (_method, value) => {
+      if (!isLodySubagentEvent(value)) return;
+      events.push(value);
+      if (value.type === 'snapshot' && value.snapshot.state === 'completed') done.resolve();
+    };
+    const session = new AcpSession(
+      conn,
+      fake.klient,
+      SESSION_ID,
+      acpConnection,
+      false,
+      undefined,
+      [],
+      false,
+      true,
+    );
+    await session.init();
+    const task = { ...subagentTask(), agentId: 'child' };
+    fake.emit('task.started', { info: task });
+    fake.emitAgent('child', 'assistant.delta', { turnId: 1, delta: 'Child text' });
+    fake.emitAgent('child', 'tool.call.started', {
+      turnId: 1,
+      toolCallId: 'read',
+      name: 'ReadFile',
+      args: { path: 'a.ts' },
+    });
+    fake.emitAgent('child', 'tool.result', {
+      turnId: 1,
+      toolCallId: 'read',
+      output: 'source',
+      isError: false,
+    });
+    fake.emitAgent('child', 'task.started', {
+      info: { ...task, taskId: 'nested', agentId: 'nested' },
+    });
+    fake.emit('task.terminated', { info: { ...task, status: 'completed', endedAt: 1000 } });
+    fake.emitAgent('child', 'assistant.delta', { turnId: 1, delta: 'late' });
+    await done.promise;
+    expect(events.map((event) => event.type)).toEqual([
+      'snapshot',
+      'output',
+      'output',
+      'output',
+      'snapshot',
+      'snapshot',
+    ]);
+    expect(events[4]).toMatchObject({ snapshot: { parentRunId: events[0]!.runId } });
+    expect(events[0]).toMatchObject({
+      sessionId: SESSION_ID,
+      snapshot: { outputIncomplete: true },
+    });
+    expect(events[1]).toMatchObject({
+      nativeTurnId: '1',
+      update: { content: { text: 'Child text' } },
+    });
+    expect(assistantText(updates)).toEqual([]);
+    expect(
+      updates.some(
+        (value) => value.update._meta?.['lody'] && 'task' in (value.update._meta['lody'] as object),
+      ),
+    ).toBe(false);
+    session.dispose();
+  });
   it('serializes accounting emissions and retries the unreported delta after failure', async () => {
     let inputOther = 0;
     const fake = makeFakeKlient([], () => ({
