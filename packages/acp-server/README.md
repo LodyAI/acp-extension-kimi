@@ -23,6 +23,19 @@ repeated Plan switches with client file access and unchanged YOLO permissions.
 Build the runtime with the matching `acp-extension-core` package before updating
 Lody's checksummed managed-runtime manifest.
 
+## Subagent history
+
+Bilateral Core `subagentEvents` v1 replaces legacy task cards with root-scoped
+run snapshots and child text/thought/tool updates. The ACP edge subscribes to each
+registered child through Klient, including its nested tasks; the engine is unchanged.
+Subscription starts at task registration and has no replay guarantee, so histories
+are marked potentially incomplete. Child approvals use run-scoped root tool IDs;
+unknown child ownership is rejected rather than attributed to the main agent.
+Existing task-ID controls remain compatible, but normalized runs advertise neither
+cancel nor output reads. Core 0.1.9 supplies the contract and helper. Deployment
+still requires a new managed runtime artifact; changing this source checkout alone
+does not update that artifact.
+
 ## Session titles
 
 With a configured managed Kimi OAuth provider, initialize advertises Core 0.1.7's

@@ -18,6 +18,9 @@ Package-local rules for `packages/acp-server`.
   and advance the delta baseline only after successful notification delivery.
 - Subagent mutation requests require a live ACP session and use the engine task registry
   as the authoritative source for list, cancellation, lifecycle, and bounded output.
+- Negotiated Core run events observe registry-owned child streams at this edge.
+  Mark missing replay coverage incomplete; attribute child permissions explicitly.
+  Do not equate run IDs with legacy task IDs or count progress as billed usage.
 - `session/update` covers EVERY turn of the session's main agent, including turns the
   engine opens on its own (a finished detached subagent's notification, a cron fire).
   The prompt driver decides when `session/prompt` answers, never who may speak: gating

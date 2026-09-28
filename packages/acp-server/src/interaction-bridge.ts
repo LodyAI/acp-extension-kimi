@@ -13,6 +13,7 @@
  * settles the parked request via `session.interactions.respond(id, ...)`.
  */
 
+import type { ToolCallUpdate } from '@agentclientprotocol/sdk';
 import type {
   Interaction,
   QuestionAnswers,
@@ -23,7 +24,6 @@ import type {
 import type { IDisposable, SessionHandle } from '@moonshot-ai/klient';
 
 import type { AcpClient } from './acp-client';
-
 import {
   approvalRequestToPermissionOptions,
   attachSelectedLabel,
@@ -52,6 +52,13 @@ export class AcpInteractionBridge {
      * true, ask-user questions go through `elicitation/create`.
      */
     private readonly elicitationForm = false,
+    private readonly childPermission?: (
+      agentId: string,
+      tool: ToolCallUpdate,
+    ) => Promise<
+      | { toolCallId: string; meta: { subagentRunId: string; subagentToolCallId: string } }
+      | undefined
+    >,
   ) {
     this.subscription = session.events.on('interactions.changed', (pending) => {
       this.onPendingChanged(pending);
@@ -97,7 +104,11 @@ export class AcpInteractionBridge {
         return;
       }
       if (interaction.kind === 'question') {
-        const result = await this.handleQuestion(interaction.payload as QuestionRequest);
+        const agentId = interaction.tags?.['agentId'];
+        const result = await this.handleQuestion(
+          interaction.payload as QuestionRequest,
+          typeof agentId === 'string' ? agentId : undefined,
+        );
         await respond(result);
       }
     } catch (error) {
@@ -134,10 +145,18 @@ export class AcpInteractionBridge {
     const toolCall = buildPermissionToolCallUpdate(req);
     const options = approvalRequestToPermissionOptions(req);
     try {
+      const child =
+        this.childPermission !== undefined && req.agentId !== undefined && req.agentId !== 'main';
+      const attribution = child ? await this.childPermission!(req.agentId!, toolCall) : undefined;
+      if (child && attribution === undefined) return { decision: 'rejected' };
       const response = await this.conn.requestPermission({
         sessionId: this.sessionId,
         options: [...options],
-        toolCall,
+        toolCall:
+          attribution === undefined
+            ? toolCall
+            : { ...toolCall, toolCallId: attribution.toolCallId },
+        _meta: attribution === undefined ? undefined : { lody: attribution.meta },
       });
       return attachSelectedLabel(
         response,
@@ -160,7 +179,10 @@ export class AcpInteractionBridge {
    * client through ACP form elicitation. A client without that standard
    * capability cannot service AskUserQuestion and the tool is dismissed.
    */
-  private async handleQuestion(req: QuestionRequest): Promise<QuestionAnswers | null> {
+  private async handleQuestion(
+    req: QuestionRequest,
+    agentId?: string,
+  ): Promise<QuestionAnswers | null> {
     const questions = req.questions;
     if (questions.length === 0) {
       log.warn('acp: handleQuestion received empty questions array', {
@@ -173,9 +195,23 @@ export class AcpInteractionBridge {
       req.turnId !== undefined ? acpToolCallId(req.turnId, rawToolCallId) : rawToolCallId;
     if (!this.elicitationForm) return null;
     try {
-      const response = await this.conn.createElicitation(
-        questionRequestToElicitationParams(questions, this.sessionId, toolCallId),
+      const child =
+        this.childPermission !== undefined && agentId !== undefined && agentId !== 'main';
+      const attribution = child
+        ? await this.childPermission!(agentId!, { toolCallId, title: 'AskUserQuestion' })
+        : undefined;
+      if (child && attribution === undefined) return null;
+      const request = questionRequestToElicitationParams(
+        questions,
+        this.sessionId,
+        attribution?.toolCallId ?? toolCallId,
       );
+      if (attribution !== undefined)
+        request._meta = {
+          ...request._meta,
+          lody: { ...(request._meta?.['lody'] as object), ...attribution.meta },
+        };
+      const response = await this.conn.createElicitation(request);
       return elicitationResponseToQuestionAnswers(questions, response);
     } catch (error) {
       log.warn('acp: elicitation/create failed; dismissing question', {

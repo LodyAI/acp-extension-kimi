@@ -20,6 +20,8 @@
  *  - no `Turn.result` promise → settlement relies solely on `turn.ended`.
  */
 
+import { randomUUID } from 'node:crypto';
+
 import type {
   AvailableCommand,
   ContentBlock,
@@ -30,13 +32,18 @@ import type {
   ToolCallLocation,
 } from '@agentclientprotocol/sdk';
 import { RequestError } from '@agentclientprotocol/sdk';
-import { randomUUID } from 'node:crypto';
-import { LODY_EXTENSION_METHODS, type LodyActivityMeta } from 'acp-extension-core';
 import {
   type ContextMessage,
   type ForkTurnSummary,
   isUserVisibleTurnOrigin,
 } from '@moonshot-ai/agent-core-v2';
+import type {
+  ToolCallDeltaEvent,
+  ToolCallStartedEvent,
+  ToolProgressEvent,
+} from '@moonshot-ai/agent-core-v2/agent/toolExecutor/toolExecutorEvents';
+import type { ToolResultEvent } from '@moonshot-ai/agent-core-v2/events';
+import type { ToolInputDisplay } from '@moonshot-ai/agent-core-v2/tool/toolInputDisplay';
 import type {
   AgentEventPayloads,
   AgentHandle,
@@ -50,13 +57,7 @@ import type {
   SkillSummary,
   UsageStatus,
 } from '@moonshot-ai/klient';
-import type { ToolResultEvent } from '@moonshot-ai/agent-core-v2/events';
-import type {
-  ToolCallDeltaEvent,
-  ToolCallStartedEvent,
-  ToolProgressEvent,
-} from '@moonshot-ai/agent-core-v2/agent/toolExecutor/toolExecutorEvents';
-import type { ToolInputDisplay } from '@moonshot-ai/agent-core-v2/tool/toolInputDisplay';
+import { LODY_EXTENSION_METHODS, type LodyActivityMeta } from 'acp-extension-core';
 
 import type { AcpClient } from './acp-client';
 import type { AcpTerminalCreatedEvent, IAcpConnection } from './acp-fs';
@@ -90,7 +91,6 @@ import {
   stringifyArgs,
 } from './events-map';
 import { AcpInteractionBridge } from './interaction-bridge';
-import { log } from './log';
 import {
   addTokenUsage,
   hasTokenUsage,
@@ -102,10 +102,12 @@ import {
   toLodyTaskLifecycle,
   withLodyTurnId,
 } from './lody-extension';
+import { log } from './log';
 import { projectModelCatalog } from './model-catalog';
 import { ACP_MODES, type AcpModeId, DEFAULT_MODE_ID } from './modes';
 import { projectHistoryToSessionUpdates } from './replay';
 import { buildAcpSkillSlashCommands, detectSlashIntent } from './slash';
+import { KimiSubagentEvents } from './subagent-events';
 
 /** Leading text of the first text block, if any (used for slash detection). */
 function leadingText(blocks: readonly ContentBlock[]): string | undefined {
@@ -346,9 +348,15 @@ export class AcpSession {
     private readonly resolveOriginalsDir?: (sessionId: string) => string | undefined,
     private readonly hostCommands: ReadonlyArray<AvailableCommand> | HostSlashCommandsSnapshot = [],
     private readonly supportsPlan = false,
+    subagentEvents = false,
   ) {
     this.klient = klient;
     this.session = klient.session(sessionId);
+    this.subagentEvents = subagentEvents
+      ? new KimiSubagentEvents(this.session, sessionId, conn, (error) =>
+          log.warn('acp: subagent event delivery failed', { error: String(error) }),
+        )
+      : undefined;
     // `main` is auto-materialized by the transport's scope resolution on the
     // first call — no explicit agent bootstrap is needed here.
     this.agent = this.session.agent('main');
@@ -357,6 +365,9 @@ export class AcpSession {
       this.session,
       sessionId,
       elicitationForm,
+      this.subagentEvents === undefined
+        ? undefined
+        : (agentId, tool) => this.subagentEvents!.permission(agentId, tool),
     );
   }
 
@@ -364,6 +375,8 @@ export class AcpSession {
    * Subscribe the agent event stream and seed the config state. Must be
    * awaited before the first `prompt` so no early turn events are missed.
    */
+  private readonly subagentEvents: KimiSubagentEvents | undefined;
+
   async init(): Promise<void> {
     const events = this.agent.events;
     this.subscriptions.push(
@@ -524,6 +537,7 @@ export class AcpSession {
    * and detaches the event subscriptions. Idempotent.
    */
   dispose(): void {
+    this.subagentEvents?.dispose();
     this.clearWakeTurnGrace();
     this.cancel();
     const driver = this.driver;
@@ -1242,6 +1256,11 @@ export class AcpSession {
     task: AgentTaskInfo,
   ): Promise<void> {
     if (task.kind !== 'agent') return;
+    if (this.subagentEvents !== undefined) {
+      this.subagentEvents.task(event, task);
+      await this.subagentEvents.drain();
+      return;
+    }
     let output: string | undefined;
     if (event === 'terminated') {
       try {
@@ -1561,7 +1580,7 @@ export class AcpSession {
 
   /** Legacy mode requests remain readable; new clients use independent config options. */
   async setMode(id: AcpModeId): Promise<void> {
-    if(id === 'plan') {
+    if (id === 'plan') {
       await this.setPlanMode(true);
       return;
     }
