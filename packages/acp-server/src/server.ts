@@ -18,6 +18,8 @@
  * through the client terminal (`./acp-terminal`).
  */
 
+import { isAbsolute, resolve } from 'node:path';
+
 import {
   agent,
   type AgentApp,
@@ -61,7 +63,6 @@ import type {
   AgentHandle,
   Klient,
   SessionHandle,
-  SessionRestoreOptions,
   SessionSummary,
 } from '@moonshot-ai/klient';
 import { RPCError } from '@moonshot-ai/klient';
@@ -259,13 +260,14 @@ export class AcpServer {
   }
 
   async newSession(params: NewSessionRequest): Promise<NewSessionResponse> {
+    validateSessionDirectories(params);
     await this.ensureAuthed();
     // The engine mints the session id and registers the workspace for the cwd
     // implicitly. ACP `mcpServers` become ephemeral per-session servers
     // (connected for this session only, never persisted).
     const meta = await this.klient.global.sessions.create({
       workDir: params.cwd,
-      additionalDirs: params.additionalDirectories,
+      requestAdditionalDirs: params.additionalDirectories ?? [],
       mcpServers: acpMcpServersToConfigRecord(params.mcpServers),
     });
     return { sessionId: meta.id, ...(await this.activateSession(meta.id)) };
@@ -276,10 +278,8 @@ export class AcpServer {
    * session through the engine (`sessionLifecycleService.fork` via the klient
    * facade) and manages the forked session exactly like a `session/new` one —
    * same response surface (`sessionId` + `configOptions` + `modes`), same
-   * local `AcpSession` wiring. The engine fork inherits the source session's
-   * workspace and carries no slot for `cwd` / `additionalDirectories` /
-   * `mcpServers` (ephemeral servers are not carried over), so those request
-   * fields are ignored with a warning, mirroring load/resume. An unknown
+   * local `AcpSession` wiring. The target cwd and request directories belong
+   * to the independent fork; the source session remains unchanged. An unknown
    * source id maps to ACP `invalid_params` (-32602).
    *
    * `_meta.lody.forkAtTurn` selects a historical branch point: its `turnId` is
@@ -288,8 +288,8 @@ export class AcpServer {
    * saw a position) the fork keeps the whole session, as before.
    */
   async unstable_forkSession(params: ForkSessionRequest): Promise<ForkSessionResponse> {
+    validateSessionDirectories(params);
     await this.ensureAuthed();
-    this.warnIgnoredAdditionalDirs('session/fork', params.additionalDirectories);
     if (params.mcpServers !== undefined && params.mcpServers.length > 0) {
       log.warn('acp: session/fork ignores mcpServers (engine fork keeps the source servers)', {
         servers: params.mcpServers.map((server) => server.name),
@@ -298,7 +298,11 @@ export class AcpServer {
     const turnIndex = readLodyForkTurnIndex(params._meta);
     let forkedId: string;
     try {
-      forkedId = (await this.klient.session(params.sessionId).fork({ turnIndex })).id;
+      forkedId = (await this.klient.session(params.sessionId).fork({
+        turnIndex,
+        workDir: params.cwd,
+        requestAdditionalDirs: params.additionalDirectories ?? [],
+      })).id;
     } catch (error) {
       if (isSessionNotFound(error)) {
         throw RequestError.invalidParams(
@@ -317,11 +321,7 @@ export class AcpServer {
 
   async loadSession(params: LoadSessionRequest): Promise<LoadSessionResponse> {
     await this.ensureAuthed();
-    this.warnIgnoredAdditionalDirs('session/load', params.additionalDirectories);
-    const acpSession = await this.resumeAcpSession(
-      params.sessionId,
-      acpMcpServersToConfigRecord(params.mcpServers),
-    );
+    const acpSession = await this.resumeAcpSession(params);
     // Replay the persisted history as an ordered batch of `session/update`
     // notifications BEFORE settling, so the client re-renders prior turns
     // before the load response lands. This is the one differentiator vs.
@@ -333,11 +333,7 @@ export class AcpServer {
 
   async resumeSession(params: ResumeSessionRequest): Promise<ResumeSessionResponse> {
     await this.ensureAuthed();
-    this.warnIgnoredAdditionalDirs('session/resume', params.additionalDirectories);
-    const acpSession = await this.resumeAcpSession(
-      params.sessionId,
-      acpMcpServersToConfigRecord(params.mcpServers),
-    );
+    const acpSession = await this.resumeAcpSession(params);
     this.scheduleAvailableCommandsUpdate(acpSession);
     return { configOptions: await acpSession.configOptions(), modes: acpSession.modeState() };
   }
@@ -602,12 +598,24 @@ export class AcpServer {
    * ignored when the session is already live (restore passes through).
    */
   private async resumeAcpSession(
-    sessionId: string,
-    mcpServers?: SessionRestoreOptions['mcpServers'],
+    params: LoadSessionRequest | ResumeSessionRequest,
   ): Promise<AcpSession> {
-    // `restore` re-materializes a persisted session (a live one passes
-    // through) and reports `false` only when the id no longer exists.
-    const restored = await this.klient.session(sessionId).restore({ mcpServers });
+    validateSessionDirectories(params);
+    const { sessionId } = params;
+    const summary = await this.klient.global.sessions.get(sessionId);
+    if (summary === undefined) {
+      throw RequestError.invalidParams({ sessionId }, `Unknown sessionId: ${sessionId}`);
+    }
+    if (summary.cwd === undefined || resolve(summary.cwd) !== resolve(params.cwd)) {
+      throw RequestError.invalidParams(
+        { sessionId, cwd: params.cwd, sessionCwd: summary.cwd },
+        'The request cwd must match the session cwd',
+      );
+    }
+    const restored = await this.klient.session(sessionId).restore({
+      requestAdditionalDirs: params.additionalDirectories ?? [],
+      mcpServers: acpMcpServersToConfigRecord(params.mcpServers),
+    });
     if (!restored) {
       throw RequestError.invalidParams({ sessionId }, `Unknown sessionId: ${sessionId}`);
     }
@@ -710,18 +718,22 @@ export class AcpServer {
       throw RequestError.authRequired();
     }
   }
+}
 
-  /**
-   * KLIENT-GAP(additionalDirectories): the engine merges additional roots only
-   * on session create (`workspaceDirs.mergeAdditionalDirs`); load/resume have
-   * no merge slot yet, so the field is ignored there with a warning rather
-   * than silently honored.
-   */
-  private warnIgnoredAdditionalDirs(method: string, dirs: readonly string[] | undefined): void {
-    if (dirs === undefined || dirs.length === 0) return;
-    log.warn(`acp: ${method} ignores additionalDirectories (engine merges dirs only on create)`, {
-      dirs,
-    });
+function validateSessionDirectories(params: {
+  cwd: string;
+  additionalDirectories?: readonly string[];
+}): void {
+  if (!isAbsolute(params.cwd)) {
+    throw RequestError.invalidParams({ cwd: params.cwd }, 'cwd must be an absolute path');
+  }
+  for (const directory of params.additionalDirectories ?? []) {
+    if (!isAbsolute(directory)) {
+      throw RequestError.invalidParams(
+        { directory },
+        'Each additionalDirectories entry must be an absolute path',
+      );
+    }
   }
 }
 

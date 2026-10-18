@@ -14,6 +14,7 @@ export interface CreateSessionOptions {
   readonly sessionId?: string;
   readonly workDir: string;
   readonly additionalDirs?: readonly string[];
+  readonly requestAdditionalDirs?: readonly string[];
   readonly mainAgentBinding?: BindAgentInput;
   readonly mcpServers?: Readonly<Record<string, McpServerConfig>>;
 }
@@ -44,6 +45,8 @@ export function isUserVisibleTurnOrigin(origin: unknown): boolean {
 }
 
 export interface ForkSessionOptions {
+  readonly workDir?: string;
+  readonly requestAdditionalDirs?: readonly string[];
   readonly sourceSessionId: string;
   readonly newSessionId?: string;
   readonly title?: string;
@@ -53,10 +56,13 @@ export interface ForkSessionOptions {
 
 export interface ResumeSessionOptions {
   readonly additionalDirs?: readonly string[];
+  readonly requestAdditionalDirs?: readonly string[];
   readonly mcpServers?: Readonly<Record<string, McpServerConfig>>;
 }
 
 export interface CreateChildSessionOptions {
+  readonly workDir?: string;
+  readonly requestAdditionalDirs?: readonly string[];
   readonly sourceSessionId: string;
   readonly newSessionId?: string;
   readonly title?: string;

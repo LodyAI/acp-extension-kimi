@@ -13,6 +13,8 @@ import { join } from 'node:path';
 
 import { Service } from '@moonshot-ai/agent-core-v2/_base/di/service';
 import { CommandContribution } from '@moonshot-ai/agent-core-v2/agent/command/commandContribution';
+import { ISessionManager } from '@moonshot-ai/agent-core-v2/app/sessionManager/sessionManager';
+import { ISessionWorkspaceContext } from '@moonshot-ai/agent-core-v2/session/workspaceContext/workspaceContext';
 import { IFeatureManager } from '@moonshot-ai/agent-core-v2/app/feature/featureManager';
 import {
   resetModelsDevUpstreamForTest,
@@ -136,6 +138,99 @@ export function defineKlientConformance(
         }
       } finally {
         await target.klient.session(parent.id).close();
+      }
+    });
+
+    it('session request roots replace independently through create, hot/cold restore and fork', async () => {
+      const base = await mkdtemp(join(tmpdir(), 'klient-conf-roots-'));
+      const workDir = join(base, 'main');
+      const forkDir = join(base, 'fork');
+      const native = join(base, 'native');
+      const a = join(base, 'a');
+      const b = join(base, 'b');
+      await Promise.all([workDir, forkDir, native, a, b].map((dir) => mkdir(dir)));
+      const sessions: string[] = [];
+      const context = (id: string) => {
+        const handle = target.app.accessor.get(ISessionManager).get(id);
+        expect(handle).toBeDefined();
+        return handle!.accessor.get(ISessionWorkspaceContext);
+      };
+      const expectRoots = (id: string, roots: string[]) => {
+        expect([...context(id).additionalDirs].toSorted()).toEqual([...roots].toSorted());
+      };
+      try {
+        const parent = await target.klient.global.sessions.create({
+          workDir,
+          additionalDirs: [native],
+          requestAdditionalDirs: [a],
+          title: 'roots parent',
+        });
+        sessions.push(parent.id);
+        const sibling = await target.klient.global.sessions.create({ workDir });
+        sessions.push(sibling.id);
+        expectRoots(parent.id, [native, a]);
+        expectRoots(sibling.id, [native]);
+        expect(context(parent.id).resolve('relative.txt')).toBe(join(workDir, 'relative.txt'));
+        expect(context(sibling.id).isWithin(join(a, 'file.txt'))).toBe(false);
+
+        expect(await target.klient.session(parent.id).restore({ requestAdditionalDirs: [b] })).toBe(true);
+        expectRoots(parent.id, [native, b]);
+        expect(context(parent.id).isWithin(join(a, 'file.txt'))).toBe(false);
+        expect(context(parent.id).assertAllowed(join(b, 'file.txt'), 'read')).toBe(join(b, 'file.txt'));
+        expectRoots(sibling.id, [native]);
+        await target.klient.session(parent.id).restore({ requestAdditionalDirs: [] });
+        expectRoots(parent.id, [native]);
+        await target.klient.session(parent.id).restore({ requestAdditionalDirs: [a] });
+        await target.klient.session(parent.id).restore();
+        expectRoots(parent.id, [native, a]);
+
+        await target.klient.session(parent.id).close();
+        expect(await target.klient.session(parent.id).restore({ requestAdditionalDirs: [b] })).toBe(true);
+        expectRoots(parent.id, [native, b]);
+        await target.klient.session(parent.id).close();
+        await target.klient.session(parent.id).restore({ requestAdditionalDirs: [] });
+        expectRoots(parent.id, [native]);
+        await target.klient.session(parent.id).restore({ requestAdditionalDirs: [a] });
+        await target.klient.session(parent.id).close();
+        await target.klient.session(parent.id).restore();
+        expectRoots(parent.id, [native]);
+        await target.klient.session(parent.id).restore({ requestAdditionalDirs: [a] });
+
+        const child = await target.klient.session(parent.id).createChild({
+          requestAdditionalDirs: [b],
+        });
+        sessions.push(child.id);
+        expectRoots(child.id, [native, b]);
+        expectRoots(parent.id, [native, a]);
+
+        const fork = await target.klient.session(parent.id).fork({
+          workDir: forkDir,
+          requestAdditionalDirs: [b],
+        });
+        sessions.push(fork.id);
+        expect(fork.id).not.toBe(parent.id);
+        expect(fork.cwd).toBe(forkDir);
+        expectRoots(fork.id, [native, b]);
+        expectRoots(parent.id, [native, a]);
+        expect((await target.klient.session(parent.id).get()).cwd).toBe(workDir);
+        expect(context(fork.id).resolve('relative.txt')).toBe(join(forkDir, 'relative.txt'));
+        await target.klient.session(fork.id).restore({ requestAdditionalDirs: [] });
+        expectRoots(fork.id, [native]);
+        expectRoots(parent.id, [native, a]);
+        expectRoots(sibling.id, [native]);
+        expectRoots(child.id, [native, b]);
+        await target.klient.session(parent.id).restore({ requestAdditionalDirs: ['../b'] });
+        expect(context(parent.id).resolve('relative.txt')).toBe(join(workDir, 'relative.txt'));
+        expectRoots(parent.id, [native, b]);
+        expect((await target.klient.session(parent.id).get()).cwd).toBe(workDir);
+        expect(context(sibling.id).workDir).toBe(workDir);
+        await target.klient.session(parent.id).close();
+        await target.klient.session(parent.id).restore({ requestAdditionalDirs: ['../a'] });
+        expectRoots(parent.id, [native, a]);
+        expect(context(parent.id).resolve('relative.txt')).toBe(join(workDir, 'relative.txt'));
+      } finally {
+        await Promise.all(sessions.map((id) => target.klient.session(id).close()));
+        await rm(base, { recursive: true, force: true });
       }
     });
 

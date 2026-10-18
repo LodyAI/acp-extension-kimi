@@ -17,6 +17,11 @@ export const workspaceContextAdditionalDirsKey = defineState<string[]>(
   () => [],
 );
 
+export const workspaceContextRequestAdditionalDirsKey = defineState<string[]>(
+  'workspaceContext.requestAdditionalDirs',
+  () => [],
+);
+
 export class SessionWorkspaceContextService extends Service implements ISessionWorkspaceContext {
   declare readonly _serviceBrand: undefined;
 
@@ -28,6 +33,7 @@ export class SessionWorkspaceContextService extends Service implements ISessionW
     super();
     this.states.contributeState(workspaceContextWorkDirKey);
     this.states.contributeState(workspaceContextAdditionalDirsKey);
+    this.states.contributeState(workspaceContextRequestAdditionalDirsKey);
     this.states.set(workspaceContextWorkDirKey, resolve(ctx.cwd));
     this.states.set(workspaceContextAdditionalDirsKey, [
       ...new Set(workspaceInfo.additionalDirs.map((d) => resolve(d))),
@@ -46,7 +52,11 @@ export class SessionWorkspaceContextService extends Service implements ISessionW
   }
 
   private get _additionalDirs(): string[] {
-    return this.states.get(workspaceContextAdditionalDirsKey);
+    const requested = this.states.get(workspaceContextRequestAdditionalDirsKey);
+    return [...new Set([
+      ...this.states.get(workspaceContextAdditionalDirsKey),
+      ...requested.map((dir) => resolve(this._workDir, dir)),
+    ])];
   }
 
   get workDir(): string {

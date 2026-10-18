@@ -27,7 +27,7 @@ The table below lists the capabilities declared by the ACP server. The `agentCap
 | `sessionCapabilities.close` | `{}` | Supports `session/close` to tear down a live session |
 | `sessionCapabilities.delete` | `{}` | Supports `session/delete` to permanently remove a session |
 | `sessionCapabilities.fork` | `{}` | Supports `session/fork` to branch an existing session |
-| `sessionCapabilities.additionalDirectories` | `{}` | Extra working directories; honored on `session/new` only |
+| `sessionCapabilities.additionalDirectories` | `{}` | Extra working directories for `session/new`, `session/load`, `session/resume`, and `session/fork` |
 | `mcpCapabilities.http` | `true` | Forwards HTTP MCP services configured by the IDE |
 | `mcpCapabilities.sse` | `true` | Forwards legacy SSE MCP services configured by the IDE |
 | `auth.logout` | `{}` | Supports ACP `logout` to drop the managed provider's token |
@@ -54,7 +54,7 @@ With `@agentclientprotocol/sdk@1.x`, the ACP method set is organized by namespac
 | `session/load` | Yes | Restores a session from disk and replays history via `session/update` before the response settles |
 | `session/resume` | Yes | Lightweight sibling of `session/load`; skips history replay |
 | `session/list` | Yes | Enumerates sessions on disk, filterable by `cwd` |
-| `session/fork` | Yes | Branches a source session; `cwd` / `additionalDirectories` / `mcpServers` on the request are ignored with a warning |
+| `session/fork` | Yes | Creates an independent session with the source history and the requested `cwd` / `additionalDirectories`; `mcpServers` is ignored with a warning |
 | `session/close` | Yes | Best-effort teardown: cancels any in-flight turn, disposes per-session resources, and closes the live session; an unknown id is not an error |
 | `session/delete` | Yes | Permanently removes a session and its persisted data; an unknown id returns `invalidParams (-32602)` |
 | `session/prompt` | Yes | Accepts `text` / `image` / `resource` / `resource_link` content blocks; streams `agent_message_chunk` |
@@ -81,6 +81,12 @@ With `@agentclientprotocol/sdk@1.x`, the ACP method set is organized by namespac
 | `session/set_model` | Yes | Carried over from the ACP 0.23 unstable surface as an extension method; equivalent to `set_config_option({configId:'model'})` |
 
 All methods not listed above return `methodNotFound`.
+
+## Additional directories
+
+Send `additionalDirectories` with `session/new`, `session/load`, `session/resume`, or `session/fork` to set that session's extra working directories. Each request supplies the complete target list: `[A]` followed by `[B]` removes the previous request's `A`; an empty array or an omitted field clears all previous request directories. This also applies when loading or resuming an already active session.
+
+`cwd` remains the primary working directory and the base for relative paths. Request directories are local to the session: replacing them does not alter sibling sessions, the fork's source, or directories configured by the user. Forking creates a separate session ID with the selected source history and the target directory context. For `session/load` and `session/resume`, `cwd` must match the existing session’s primary directory. A different `cwd` is rejected before changing the session or its roots. Forking may specify a different target `cwd` while retaining the source workspace configuration and permissions. `cwd` and every `additionalDirectories` entry must be absolute paths; relative paths are rejected. Existing tool permission rules still apply; extra working directories do not bypass approvals.
 
 ## MCP forwarding
 

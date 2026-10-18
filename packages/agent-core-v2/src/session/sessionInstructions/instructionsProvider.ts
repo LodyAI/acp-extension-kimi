@@ -6,6 +6,7 @@ import type { WatchChange } from '#human/utils/watch';
 export interface ISessionInstructionsProvider {
   readonly _serviceBrand: undefined;
 
+  readonly workDir?: string;
   readonly ready: Promise<void>;
   readonly agentsMd: string | undefined;
   readonly agentsMdWarning: string | undefined;

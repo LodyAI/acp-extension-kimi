@@ -123,6 +123,7 @@ interface LLMRequestLogInput {
 }
 
 interface TurnRequestConfig {
+  readonly workspaceContextVersion: number;
   readonly resolved: ProfileModelContext;
   readonly params: ModelRequestParams;
   readonly systemPrompt: string;
@@ -249,6 +250,8 @@ export class AgentLLMRequesterService implements IAgentLLMRequesterService {
     signal: AbortSignal | undefined,
   ): Promise<AgentLLMRequestFinish> {
     signal?.throwIfAborted();
+    const workspaceContextPreparation = this.profile.prepareWorkspaceContext();
+    if (workspaceContextPreparation !== undefined) await workspaceContextPreparation;
     const startedAt = Date.now();
     const setTrace = (traceId: string | undefined): void => {
       trace.set(traceId);
@@ -733,8 +736,16 @@ export class AgentLLMRequesterService implements IAgentLLMRequesterService {
     let snapshot = this.turnConfigs.get(turnId);
     if (snapshot === undefined) {
       snapshot = {
+        workspaceContextVersion: this.profile.workspaceContextVersion,
         resolved: this.profile.resolveModelContext(),
         params: this.profile.resolveRequestParams(),
+        systemPrompt: this.profile.getSystemPrompt(),
+      };
+      this.turnConfigs.set(turnId, snapshot);
+    } else if (snapshot.workspaceContextVersion !== this.profile.workspaceContextVersion) {
+      snapshot = {
+        ...snapshot,
+        workspaceContextVersion: this.profile.workspaceContextVersion,
         systemPrompt: this.profile.getSystemPrompt(),
       };
       this.turnConfigs.set(turnId, snapshot);

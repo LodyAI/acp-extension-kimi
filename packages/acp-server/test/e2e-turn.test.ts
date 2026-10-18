@@ -9,7 +9,9 @@
  * `assistant.delta` → ACP `session/update` translation, and turn settlement.
  */
 
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -700,6 +702,212 @@ describe('acp-server real prompt turn (scripted LLM)', () => {
     ).toBe(true);
     // …while the stdout progress never crossed the wire.
     expect(updates.some((u) => u?.title === 'raw-stdout-bytes')).toBe(false);
+  }, 30_000);
+});
+
+describe('acp-server additional directories with real file tools', () => {
+  let homeDir: string;
+  let client: TestClient | undefined;
+  let scripted: ScriptedProvider;
+  let cwd: string;
+  let a: string;
+  let b: string;
+
+  afterEach(async () => {
+    await client?.close();
+    client = undefined;
+    if (homeDir) await rm(homeDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  });
+
+  async function boot(terminal = false): Promise<TestClient> {
+    homeDir = await mkdtemp(join(tmpdir(), 'acp-roots-tools-'));
+    cwd = join(homeDir, 'primary');
+    a = join(homeDir, 'a');
+    b = join(homeDir, 'b');
+    for (const directory of [cwd, a, b]) {
+      await mkdir(directory);
+      await writeFile(join(directory, 'fixture.txt'), `fixture:${directory}`);
+    }
+    await writeFakeModelConfig(homeDir);
+    scripted = createScriptedProvider();
+    client = await createTestClient({ homeDir, extraSeeds: [scripted.seed] });
+    await client.send('initialize', { protocolVersion: 1, clientCapabilities: { terminal } });
+    return client;
+  }
+
+  async function tool(sessionId: string, name: string, args: Record<string, unknown>): Promise<string> {
+    scripted.mockNextResponse({
+      type: 'function', id: `file_${scripted.callCount()}`, name, arguments: JSON.stringify(args),
+    });
+    scripted.mockNextText('done');
+    expect(await client!.send('session/prompt', {
+      sessionId, prompt: [{ type: 'text', text: 'Run the requested file operation.' }],
+    })).toMatchObject({ stopReason: 'end_turn' });
+    const result = scripted.callHistory().at(-1)?.findLast((message) => message.role === 'tool');
+    expect(result).toBeDefined();
+    return JSON.stringify(result);
+  }
+
+  async function expectRoots(sessionId: string, roots: readonly string[], primary = cwd): Promise<void> {
+    expect(await tool(sessionId, 'Read', { path: 'fixture.txt' })).toContain(`fixture:${primary}`);
+    const systemPrompt = scripted.systemPrompts().at(-1)!;
+    expect(systemPrompt).toContain(primary);
+    for (const directory of [a, b]) {
+      if (roots.includes(directory)) expect(systemPrompt).toContain(`### ${directory}\n`);
+      else expect(systemPrompt).not.toContain(`### ${directory}\n`);
+    }
+    for (const [directory, relative] of [[a, '../a/fixture.txt'], [b, '../b/fixture.txt']] as const) {
+      const result = await tool(sessionId, 'Read', { path: relative });
+      if (roots.includes(directory)) expect(result).toContain(`fixture:${directory}`);
+      else {
+        expect(result).toContain('must provide an absolute path');
+        expect(result).not.toContain(`fixture:${directory}`);
+      }
+    }
+  }
+
+  function installExecutingTerminal(c: TestClient): string[] {
+    const terminalCwds: string[] = [];
+    let output = '';
+    c.onRequest('terminal/create', async (params) => {
+      const request = params as { command: string; args: string[]; cwd: string };
+      terminalCwds.push(request.cwd);
+      const result = await promisify(execFile)(request.command, request.args, { cwd: request.cwd });
+      output = result.stdout;
+      return { terminalId: 'fixture-terminal' };
+    });
+    c.onRequest('terminal/output', () => ({ output, truncated: false, exitStatus: { exitCode: 0 } }));
+    c.onRequest('terminal/wait_for_exit', () => ({ exitCode: 0 }));
+    c.onRequest('terminal/release', () => ({}));
+    c.onRequest('terminal/kill', () => ({}));
+    c.onRequest('session/request_permission', () => ({
+      outcome: { outcome: 'selected', optionId: 'approve_once' },
+    }));
+    return terminalCwds;
+  }
+
+  it.each([
+    { method: 'session/load', cold: false },
+    { method: 'session/load', cold: true },
+    { method: 'session/resume', cold: false },
+    { method: 'session/resume', cold: true },
+  ])('$method (cold=$cold) replaces and clears actual file access without changing cwd', async ({ method, cold }) => {
+    const c = await boot();
+    const { sessionId } = await c.send('session/new', {
+      cwd, mcpServers: [], additionalDirectories: [a],
+    }) as { sessionId: string };
+    await expectRoots(sessionId, [a]);
+    for (const roots of [[b], [], [a], undefined]) {
+      if (cold) await c.send('session/close', { sessionId });
+      await c.send(method, { sessionId, cwd, mcpServers: [], additionalDirectories: roots });
+      await expectRoots(sessionId, roots ?? []);
+    }
+  }, 30_000);
+
+  it.each([
+    { method: 'session/load', cold: false },
+    { method: 'session/load', cold: true },
+    { method: 'session/resume', cold: false },
+    { method: 'session/resume', cold: true },
+  ])('$method (cold=$cold) rejects a different cwd without changing file roots or execution cwd', async ({ method, cold }) => {
+    const c = await boot(true);
+    const terminalCwds = installExecutingTerminal(c);
+    const { sessionId } = await c.send('session/new', {
+      cwd, mcpServers: [], additionalDirectories: [a],
+    }) as { sessionId: string };
+    await expectRoots(sessionId, [a]);
+    expect(await tool(sessionId, 'Bash', { command: 'cat fixture.txt' })).toContain(`fixture:${cwd}`);
+    if (cold) await c.send('session/close', { sessionId });
+    await expect(c.send(method, {
+      sessionId, cwd: b, mcpServers: [], additionalDirectories: [b],
+    })).rejects.toThrow('The request cwd must match the session cwd');
+    if (cold) {
+      await c.send(method, { sessionId, cwd, mcpServers: [], additionalDirectories: [a] });
+    }
+    await expectRoots(sessionId, [a]);
+    expect(await tool(sessionId, 'Bash', { command: 'cat fixture.txt' })).toContain(`fixture:${cwd}`);
+    expect(terminalCwds).toEqual([cwd, cwd]);
+  }, 30_000);
+
+  it('retains native local.toml directories and leaves user configuration untouched when request roots clear', async () => {
+    const c = await boot();
+    const configPath = join(cwd, '.kimi-code', 'local.toml');
+    const config = '[workspace]\nadditional_dir = ["../a"]\n\n[user]\nnote = "keep this setting"\n';
+    await mkdir(dirname(configPath));
+    await writeFile(configPath, config);
+    const { sessionId } = await c.send('session/new', {
+      cwd, mcpServers: [], additionalDirectories: [b],
+    }) as { sessionId: string };
+    await expectRoots(sessionId, [a, b]);
+    await c.send('session/load', { sessionId, cwd, mcpServers: [], additionalDirectories: [] });
+    await expectRoots(sessionId, [a]);
+    await c.send('session/resume', { sessionId, cwd, mcpServers: [], additionalDirectories: [b] });
+    await expectRoots(sessionId, [a, b]);
+    await c.send('session/close', { sessionId });
+    await c.send('session/resume', { sessionId, cwd, mcpServers: [] });
+    await expectRoots(sessionId, [a]);
+    expect(await readFile(configPath, 'utf8')).toBe(config);
+  }, 30_000);
+
+  it('executes Bash in the primary cwd after directory replacement and in the independent fork cwd', async () => {
+    const c = await boot(true);
+    const terminalCwds = installExecutingTerminal(c);
+    const parent = await c.send('session/new', {
+      cwd, mcpServers: [], additionalDirectories: [a],
+    }) as { sessionId: string };
+    const command = 'cat fixture.txt';
+    expect(await tool(parent.sessionId, 'Bash', { command })).toContain(`fixture:${cwd}`);
+    await c.send('session/load', {
+      sessionId: parent.sessionId, cwd, mcpServers: [], additionalDirectories: [b],
+    });
+    expect(await tool(parent.sessionId, 'Bash', { command })).toContain(`fixture:${cwd}`);
+    await c.send('session/resume', {
+      sessionId: parent.sessionId, cwd, mcpServers: [], additionalDirectories: [],
+    });
+    expect(await tool(parent.sessionId, 'Bash', { command })).toContain(`fixture:${cwd}`);
+    const fork = await c.send('session/fork', {
+      sessionId: parent.sessionId, cwd: b, mcpServers: [], additionalDirectories: [a],
+    }) as { sessionId: string };
+    expect(await tool(fork.sessionId, 'Bash', { command })).toContain(`fixture:${b}`);
+    expect(await tool(parent.sessionId, 'Bash', { command })).toContain(`fixture:${cwd}`);
+    expect(terminalCwds).toEqual([cwd, cwd, cwd, b, cwd]);
+  }, 30_000);
+
+  it('fork and sibling file access remain independent and writes retain native approval', async () => {
+    const c = await boot();
+    const parent = await c.send('session/new', {
+      cwd, mcpServers: [], additionalDirectories: [a],
+    }) as { sessionId: string };
+    const sibling = await c.send('session/new', {
+      cwd, mcpServers: [], additionalDirectories: [b],
+    }) as { sessionId: string };
+    await expectRoots(parent.sessionId, [a]);
+    const targetCwd = join(homeDir, 'fork-primary');
+    await mkdir(targetCwd);
+    await writeFile(join(targetCwd, 'fixture.txt'), `fixture:${targetCwd}`);
+    const fork = await c.send('session/fork', {
+      sessionId: parent.sessionId, cwd: targetCwd, mcpServers: [], additionalDirectories: [b],
+    }) as { sessionId: string };
+    expect(fork.sessionId).not.toBe(parent.sessionId);
+    await expectRoots(fork.sessionId, [b], targetCwd);
+    await c.send('session/resume', { sessionId: fork.sessionId, cwd: targetCwd, mcpServers: [] });
+    await expectRoots(fork.sessionId, [], targetCwd);
+    await expectRoots(parent.sessionId, [a]);
+    await expectRoots(sibling.sessionId, [b]);
+
+    const approvals: unknown[] = [];
+    c.onRequest('session/request_permission', (params) => {
+      approvals.push(params);
+      return { outcome: { outcome: 'selected', optionId: 'approve_once' } };
+    });
+    expect(await tool(parent.sessionId, 'Write', { path: '../a/written.txt', content: 'approved write' }))
+      .toContain('Wrote');
+    expect(approvals).toHaveLength(1);
+    expect(await readFile(join(a, 'written.txt'), 'utf8')).toBe('approved write');
+    expect(await tool(sibling.sessionId, 'Write', { path: '../a/rejected.txt', content: 'must not write' }))
+      .toContain('must provide an absolute path');
+    await expect(readFile(join(a, 'rejected.txt'), 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(approvals).toHaveLength(1);
   }, 30_000);
 });
 

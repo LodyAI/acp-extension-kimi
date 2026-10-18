@@ -27,7 +27,7 @@
 // references become '(circular)', and class instances collapse to a '(ClassName)'
 // marker — the wire shape of an entry is the JSON projection of the type here.
 //
-// Index (App: 0 keys · Workspace: 6 keys · Session: 9 keys · Agent: 73 keys)
+// Index (App: 0 keys · Workspace: 6 keys · Session: 10 keys · Agent: 73 keys)
 //   App
 //   Workspace
 //     workspaceDirs.ephemeralDirs          src/workspace/workspaceDirs/workspaceDirsService.ts
@@ -37,15 +37,16 @@
 //     workspaceSkillCatalog.merged         src/features/skill/workspace/workspaceSkillCatalogService.ts
 //     workspaceTrust.trusted               src/workspace/workspaceTrust/workspaceTrustService.ts
 //   Session
-//     sessionActivity.current            src/session/sessionActivity/sessionActivityService.ts
-//     sessionActivity.folds              src/session/sessionActivity/sessionActivityService.ts
-//     sessionLog.rootLevel               src/session/sessionLog/sessionLogService.ts
-//     sessionMetadata.data               src/session/sessionMetadata/sessionMetadataService.ts
-//     sessionSkillCatalog.contributions  src/features/skill/session/skillCatalogService.ts
-//     sessionSkillCatalog.merged         src/features/skill/session/skillCatalogService.ts
-//     sessionToolPolicy.state            src/session/sessionToolPolicy/sessionToolPolicyService.ts
-//     workspaceContext.additionalDirs    src/session/workspaceContext/workspaceContextService.ts
-//     workspaceContext.workDir           src/session/workspaceContext/workspaceContextService.ts
+//     sessionActivity.current                 src/session/sessionActivity/sessionActivityService.ts
+//     sessionActivity.folds                   src/session/sessionActivity/sessionActivityService.ts
+//     sessionLog.rootLevel                    src/session/sessionLog/sessionLogService.ts
+//     sessionMetadata.data                    src/session/sessionMetadata/sessionMetadataService.ts
+//     sessionSkillCatalog.contributions       src/features/skill/session/skillCatalogService.ts
+//     sessionSkillCatalog.merged              src/features/skill/session/skillCatalogService.ts
+//     sessionToolPolicy.state                 src/session/sessionToolPolicy/sessionToolPolicyService.ts
+//     workspaceContext.additionalDirs         src/session/workspaceContext/workspaceContextService.ts
+//     workspaceContext.requestAdditionalDirs  src/session/workspaceContext/workspaceContextService.ts
+//     workspaceContext.workDir                src/session/workspaceContext/workspaceContextService.ts
 //   Agent
 //     agentPlugin.sessionStartRefreshPending          src/agent/plugin/agentPluginService.ts
 //     agentsMdReminder.cwd                            src/agent/agentsMdReminder/agentsMdReminderService.ts
@@ -705,6 +706,7 @@ export interface SessionStateSnapshot {
   };
   // src/session/workspaceContext/workspaceContextService.ts
   'workspaceContext.additionalDirs': string[];
+  'workspaceContext.requestAdditionalDirs': string[];
   'workspaceContext.workDir': string;
 }
 
@@ -960,6 +962,7 @@ export interface AgentStateSnapshot {
     readonly "__@mediaStripSnapshotBrand": undefined;
   }>;
   'llmRequester.turnConfigs': Map<number, /* TurnRequestConfig — packages/agent-core-v2/src/agent/llmRequester/llmRequesterService.ts */ {
+    readonly workspaceContextVersion: number;
     readonly resolved: /* ProfileModelContext — packages/agent-core-v2/src/agent/profile/profile.ts */ {
       readonly modelAlias: string;
       readonly modelCapabilities: /* ModelCapability — packages/agent-core-v2/src/llm-adapter/contract/capability.ts */ {

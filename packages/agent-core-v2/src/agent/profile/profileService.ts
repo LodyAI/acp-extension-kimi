@@ -134,6 +134,13 @@ export class AgentProfileService extends Disposable implements IAgentProfileServ
     );
   }
 
+  private workspaceContextPending = false;
+  private workspaceContextRevision = 0;
+
+  get workspaceContextVersion(): number {
+    return this.workspaceContextRevision;
+  }
+
   private activeProfile: ResolvedAgentProfile | undefined;
 
   private frozenSkillListing: string | undefined;
@@ -407,6 +414,44 @@ export class AgentProfileService extends Disposable implements IAgentProfileServ
     this.cacheAgentsMdWarning(context);
     this.publishAgentsMdWarning();
     this.publishToolPatternWarnings(profile);
+  }
+
+  async refreshWorkspaceContext(): Promise<void> {
+    this.workspaceContextPending = true;
+    if (this.runtime.isAvailable()) await this.prepareWorkspaceContext();
+  }
+
+  prepareWorkspaceContext(): Promise<void> | undefined {
+    return this.workspaceContextPending ? this.rebuildWorkspaceContext() : undefined;
+  }
+
+  private async rebuildWorkspaceContext(): Promise<void> {
+    const profile = this.activeProfile ?? (
+      this.profileName === undefined ? undefined : this.catalog.get(this.profileName)
+    );
+    if (profile === undefined) {
+      if (this.profileName !== undefined) {
+        throw new ProfileError(
+          ProfileErrors.codes.PROFILE_UNKNOWN,
+          `Cannot refresh workspace context for missing agent profile: "${this.profileName}"`,
+          { profile: this.profileName },
+        );
+      }
+      this.workspaceContextPending = false;
+      return;
+    }
+    const context = await this.buildSystemPromptContext(profile);
+    const rendered = renderAgentProfilePrompt(profile, context);
+    this.update({
+      systemPrompt: rendered.text,
+      environmentDisclosure: rendered.environment,
+      agentsMdPaths: context.agentsMdPaths ?? [],
+    });
+    this.seedAgentsMdReminder(context);
+    this.cacheAgentsMdWarning(context);
+    this.publishAgentsMdWarning();
+    this.workspaceContextPending = false;
+    this.workspaceContextRevision += 1;
   }
 
   private seedAgentsMdReminder(context: SystemPromptContext): void {
@@ -807,7 +852,10 @@ export class AgentProfileService extends Disposable implements IAgentProfileServ
     options?: ApplyProfileOptions,
   ): Promise<SystemPromptContext> {
     await this.notify.ready;
-    const preloadedAgentsMd = await this.workspaceInstructionsSnapshot();
+    const preloadedAgentsMd = this.instructions.workDir === undefined ||
+      this.instructions.workDir === this.sessionContext.cwd
+      ? await this.workspaceInstructionsSnapshot()
+      : undefined;
     const fsAvailable = this.runtime.isAvailable(['fs']);
     const lease = this.runtime.acquire(fsAvailable ? ['fs'] : []);
     const env = lease.runtime.environment;
