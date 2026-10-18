@@ -2,6 +2,12 @@ import { randomUUID } from 'node:crypto';
 
 import { join } from 'pathe';
 
+import { IAgentProfileService } from '#/agent/profile/profile';
+import { ISessionStateService } from '#/session/state/sessionState';
+import {
+  workspaceContextRequestAdditionalDirsKey,
+} from '#/session/workspaceContext/workspaceContextService';
+
 import type { IInstantiationService } from '#/_base/di/instantiation';
 import { Disposable, type IDisposable } from '#/_base/di/lifecycle';
 import {
@@ -305,6 +311,10 @@ export class SessionLifecycleService extends Disposable implements ISessionLifec
       throw error;
     }
     try {
+      handle.accessor.get(ISessionStateService).set(
+        workspaceContextRequestAdditionalDirsKey,
+        [...(opts.requestAdditionalDirs ?? [])],
+      );
       await handle.accessor.get(ISessionMetadata).ready;
       await handle.accessor.get(ISessionNotify).ready;
       await handle.accessor.get(ISessionToolPolicy).ready;
@@ -349,9 +359,14 @@ export class SessionLifecycleService extends Disposable implements ISessionLifec
 
   resume(sessionId: string, opts?: ResumeSessionOptions): Promise<ISessionScopeHandle | undefined> {
     const inflight = this.resuming.get(sessionId);
-    if (inflight !== undefined) return inflight;
+    if (inflight !== undefined) {
+      return inflight.then(async (handle) => {
+        if (handle !== undefined) await this.applyResumeContext(handle, opts);
+        return handle;
+      });
+    }
     const live = this.sessions.get(sessionId);
-    if (live !== undefined) return Promise.resolve(live);
+    if (live !== undefined) return this.applyResumeContext(live, opts).then(() => live);
     this.resumeFailures.delete(sessionId);
     const promise = this.doResume(sessionId, opts)
       .catch((error: unknown) => {
@@ -366,6 +381,22 @@ export class SessionLifecycleService extends Disposable implements ISessionLifec
       .finally(() => this.resuming.delete(sessionId));
     this.resuming.set(sessionId, promise);
     return promise;
+  }
+
+  private async applyResumeContext(
+    handle: ISessionScopeHandle,
+    opts?: ResumeSessionOptions,
+  ): Promise<void> {
+    if (opts?.requestAdditionalDirs === undefined) return;
+    handle.accessor.get(ISessionStateService).set(
+      workspaceContextRequestAdditionalDirsKey,
+      [...opts.requestAdditionalDirs],
+    );
+    const agents = handle.accessor.get(IAgentLifecycleService);
+    for (const agent of agents.list()) {
+      const profile = agents.handleOf(agent.agentId)?.accessor.get(IAgentProfileService);
+      await profile?.refreshWorkspaceContext();
+    }
   }
 
   async whenResumeSettled(sessionId: string): Promise<void> {
@@ -389,6 +420,7 @@ export class SessionLifecycleService extends Disposable implements ISessionLifec
       sessionId,
       workDir,
       additionalDirs: opts?.additionalDirs,
+      requestAdditionalDirs: opts?.requestAdditionalDirs,
       mcpServers: opts?.mcpServers,
     });
     try {
@@ -396,6 +428,10 @@ export class SessionLifecycleService extends Disposable implements ISessionLifec
       if (agents.get(MAIN_AGENT_ID) === undefined) {
         await agents.create({ agentId: MAIN_AGENT_ID });
       }
+      await this.applyResumeContext(handle, {
+        ...opts,
+        requestAdditionalDirs: opts?.requestAdditionalDirs ?? [],
+      });
       await this.announceCreated({ sessionId, handle, source: 'resume' });
     } catch (error) {
       this.sessions.delete(sessionId);
@@ -637,6 +673,7 @@ export class SessionLifecycleService extends Disposable implements ISessionLifec
         });
       }
 
+      const workDir = opts.workDir ?? sourceMeta?.cwd ?? this.workspaceContext.cwd;
       const title = opts.title ?? `Fork: ${sourceMeta?.title || sourceId}`;
       const now = Date.now();
       const agents: Record<string, AgentMeta> = {};
@@ -656,7 +693,7 @@ export class SessionLifecycleService extends Disposable implements ISessionLifec
       const meta: SessionMeta = {
         id: targetId,
         version: SESSION_META_VERSION,
-        cwd: this.workspaceContext.cwd,
+        cwd: workDir,
         createdAt: now,
         updatedAt: toEpochMs(sourceMeta?.updatedAt) || now,
         archived: false,
@@ -677,7 +714,7 @@ export class SessionLifecycleService extends Disposable implements ISessionLifec
         buildSessionSummary({
           id: targetId,
           workspaceId: this.workspaceId,
-          cwd: this.workspaceContext.cwd,
+          cwd: workDir,
           title,
           lastPrompt: meta.lastPrompt,
           createdAt: now,
@@ -687,7 +724,10 @@ export class SessionLifecycleService extends Disposable implements ISessionLifec
           lastTurnReason: meta.lastTurnReason,
         }),
       );
-      await this.appendSessionIndexEntry(targetId, this.workspaceContext.cwd);
+      await this.appendSessionIndexEntry(targetId, workDir);
+      if (opts.requestAdditionalDirs !== undefined) {
+        await this.resume(targetId, { requestAdditionalDirs: opts.requestAdditionalDirs });
+      }
       this._onDidForkSession.fire({ sourceSessionId: sourceId, sessionId: targetId });
       return meta;
     } catch (error) {
@@ -712,6 +752,8 @@ export class SessionLifecycleService extends Disposable implements ISessionLifec
     return this.fork({
       sourceSessionId: opts.sourceSessionId,
       newSessionId: opts.newSessionId,
+      workDir: opts.workDir,
+      requestAdditionalDirs: opts.requestAdditionalDirs,
       title,
       metadata,
     });

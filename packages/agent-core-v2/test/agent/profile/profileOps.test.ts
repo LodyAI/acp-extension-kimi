@@ -5,6 +5,7 @@ import { DisposableStore } from '#/_base/di/lifecycle';
 import { TestInstantiationService } from '#/_base/di/test';
 import { Event } from '#/_base/event';
 import { IAgentProfileService } from '#/agent/profile/profile';
+import { IAgentRuntimeService } from '#/agent/runtimeBinding/agentRuntime';
 import { AgentProfileService } from '#/agent/profile/profileService';
 import { profileActiveToolsKey, profileKey } from '#/agent/profile/profileOps';
 import {
@@ -199,6 +200,7 @@ function buildHost(key: string): {
   host.stub(IConfigService, createConfigStub());
   host.stub(IModelCatalog, modelCatalog);
   host.stub(IProtocolAdapterRegistry, createProtocolRegistryStub());
+  host.stub(IAgentRuntimeService, { isAvailable: () => false } as IAgentRuntimeService);
   host.stub(IHostEnvironment, stubUnused());
   host.stub(IHostFileSystem, stubUnused());
   host.stub(IBootstrapService, stubUnused());
@@ -287,6 +289,13 @@ function activeToolsOf(target: IAgentStateService) {
 }
 
 describe('AgentProfileService (wire-backed config.update)', () => {
+  it('defers unavailable runtime context refresh and rejects a removed profile before reuse', async () => {
+    svc.update({ profileName: 'removed-profile', systemPrompt: 'old roots' });
+    await expect(svc.refreshWorkspaceContext()).resolves.toBeUndefined();
+    await expect(svc.prepareWorkspaceContext()).rejects.toThrow('missing agent profile');
+    expect(svc.workspaceContextVersion).toBe(0);
+  });
+
   it('update persists a flat config.update record and resolves thinkingLevel as wire thinkingEffort at the call site', async () => {
     svc.update({ profileName: DEFAULT_AGENT_PROFILE_NAME, systemPrompt: 'You are helpful.' });
     svc.update({ thinkingLevel: 'on' });

@@ -17,6 +17,7 @@ export const createSessionOptionsSchema = z.object({
   sessionId: z.string().optional(),
   workDir: z.string(),
   additionalDirs: z.array(z.string()).optional(),
+  requestAdditionalDirs: z.array(z.string()).optional(),
   /**
    * Ephemeral per-session MCP servers (engine `CreateSessionOptions.mcpServers`):
    * connected only for the created session, never persisted.
@@ -27,6 +28,7 @@ export const createSessionOptionsSchema = z.object({
 /** Same fields as `ResumeSessionOptions` in the engine — keep in sync. */
 export const resumeSessionOptionsSchema = z.object({
   additionalDirs: z.array(z.string()).optional(),
+  requestAdditionalDirs: z.array(z.string()).optional(),
   /**
    * Ephemeral per-session MCP servers, applied when resume re-materializes a
    * cold session (ignored when the session is already live).
@@ -37,6 +39,8 @@ export const resumeSessionOptionsSchema = z.object({
 /** Same fields as `ForkSessionOptions` in the engine — keep in sync. */
 export const forkSessionOptionsSchema = z.object({
   sourceSessionId: z.string(),
+  workDir: z.string().optional(),
+  requestAdditionalDirs: z.array(z.string()).optional(),
   newSessionId: z.string().optional(),
   title: z.string().optional(),
   metadata: z.record(z.string(), z.unknown()).optional(),

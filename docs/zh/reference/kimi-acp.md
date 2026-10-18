@@ -27,7 +27,7 @@ kimi acp
 | `sessionCapabilities.close` | `{}` | 支持 `session/close` 拆除存活中的会话 |
 | `sessionCapabilities.delete` | `{}` | 支持 `session/delete` 永久删除会话 |
 | `sessionCapabilities.fork` | `{}` | 支持 `session/fork` 从已有会话分叉 |
-| `sessionCapabilities.additionalDirectories` | `{}` | 额外工作目录，仅在 `session/new` 时生效 |
+| `sessionCapabilities.additionalDirectories` | `{}` | 额外工作目录，支持 `session/new`、`session/load`、`session/resume` 和 `session/fork` |
 | `mcpCapabilities.http` | `true` | 转发 IDE 配置的 HTTP MCP 服务 |
 | `mcpCapabilities.sse` | `true` | 转发 IDE 配置的旧式 SSE MCP 服务 |
 | `auth.logout` | `{}` | 支持 ACP `logout`，丢弃托管供应商的 token |
@@ -54,7 +54,7 @@ kimi acp
 | `session/load` | 是 | 恢复磁盘会话，在响应返回前把历史以 `session/update` 同步回放 |
 | `session/resume` | 是 | `session/load` 的轻量兄弟方法，跳过历史回放 |
 | `session/list` | 是 | 枚举磁盘会话，可按 `cwd` 过滤 |
-| `session/fork` | 是 | 从源会话分叉；请求上的 `cwd` / `additionalDirectories` / `mcpServers` 会被忽略并写 warn |
+| `session/fork` | 是 | 创建保留源会话历史的独立会话，使用请求中的 `cwd` / `additionalDirectories`；`mcpServers` 被忽略并写 warn |
 | `session/close` | 是 | 尽力拆除：中断进行中的 turn、释放会话级资源并关闭存活会话；未知 id 不算错误 |
 | `session/delete` | 是 | 永久删除会话及其持久化数据；未知 id 返回 `invalidParams (-32602)` |
 | `session/prompt` | 是 | 接受 `text` / `image` / `resource` / `resource_link` 内容块，流式输出 `agent_message_chunk` |
@@ -81,6 +81,12 @@ kimi acp
 | `session/set_model` | 是 | 从 ACP 0.23 不稳定面保留下来的扩展方法，等价于 `set_config_option({configId:'model'})` |
 
 上述未列出的方法一律返回 `methodNotFound`。
+
+## 额外目录
+
+在 `session/new`、`session/load`、`session/resume` 或 `session/fork` 中发送 `additionalDirectories`，即可设置该会话的额外工作目录。每次请求都提供完整目标列表：先发送 `[A]` 再发送 `[B]`，会移除上次请求的 `A`；空数组或省略字段都会清空此前请求带来的目录。加载或恢复已激活的会话时也遵循这一规则。
+
+`cwd` 始终是主工作目录和相对路径的基准。请求目录仅属于当前会话：替换它们不会改变兄弟会话、分叉源会话或用户配置的目录。分叉会创建新的会话 ID，保留所选源历史并使用目标目录上下文。`session/load` 和 `session/resume` 的 `cwd` 必须匹配原会话的主目录；不同的 `cwd` 会在修改会话或 roots 之前被拒绝。分叉可指定不同的目标 `cwd`，同时保留源工作区的配置和权限。`cwd` 和每个 `additionalDirectories` 条目都必须是绝对路径，相对路径会被拒绝。原有工具权限规则仍然生效，额外工作目录不会绕过审批。
 
 ## MCP 转发
 

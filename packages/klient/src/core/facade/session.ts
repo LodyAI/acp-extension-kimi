@@ -46,6 +46,8 @@ interface HandleWire {
  */
 export interface SessionRestoreOptions {
   readonly additionalDirs?: readonly string[];
+  /** Replace this session's ephemeral roots; [] clears them, omission preserves live roots. */
+  readonly requestAdditionalDirs?: readonly string[];
   readonly mcpServers?: Readonly<Record<string, McpServerConfig>>;
 }
 
@@ -113,12 +115,19 @@ export interface SessionFacade {
    */
   forkTurns(): Promise<readonly ForkTurnSummary[]>;
   fork(input?: {
+    workDir?: string;
+    requestAdditionalDirs?: readonly string[];
     title?: string;
     metadata?: Record<string, unknown>;
     /** Retain the session through this turn only (see {@link forkTurns}). */
     turnIndex?: number;
   }): Promise<SessionMeta>;
-  createChild(input?: { title?: string; metadata?: Record<string, unknown> }): Promise<SessionMeta>;
+  createChild(input?: {
+    workDir?: string;
+    requestAdditionalDirs?: readonly string[];
+    title?: string;
+    metadata?: Record<string, unknown>;
+  }): Promise<SessionMeta>;
   readonly approvals: SessionApprovalsFacade;
   readonly questions: SessionQuestionsFacade;
   readonly interactions: SessionInteractionsFacade;
@@ -133,10 +142,23 @@ export function createSessionFacade(call: ScopedCaller, sessionId: string): Sess
     call(scope, 'sessionMetadata', 'read', []) as Promise<SessionMeta>;
   const spawn = async (
     method: 'fork' | 'createChild',
-    input: { title?: string; metadata?: Record<string, unknown>; turnIndex?: number } = {},
+    input: {
+      workDir?: string;
+      requestAdditionalDirs?: readonly string[];
+      title?: string;
+      metadata?: Record<string, unknown>;
+      turnIndex?: number;
+    } = {},
   ): Promise<SessionMeta> => {
     return call({}, 'sessionManager', method, [
-      { sourceSessionId: sessionId, title: input.title, metadata: input.metadata, turnIndex: input.turnIndex },
+      {
+        sourceSessionId: sessionId,
+        workDir: input.workDir,
+        requestAdditionalDirs: input.requestAdditionalDirs,
+        title: input.title,
+        metadata: input.metadata,
+        turnIndex: input.turnIndex,
+      },
     ]) as Promise<SessionMeta>;
   };
 

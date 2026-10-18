@@ -138,6 +138,8 @@ export interface GlobalSessionsFacade {
   create(input: {
     workDir: string;
     additionalDirs?: readonly string[];
+    /** Ephemeral roots isolated to this session, independent of workspace configuration. */
+    requestAdditionalDirs?: readonly string[];
     title?: string;
     mcpServers?: Readonly<Record<string, McpServerConfig>>;
   }): Promise<SessionMeta>;
@@ -410,9 +412,9 @@ export function createGlobalFacade(scoped: ScopedCaller, scopedStream: ScopedStr
       get: (id) => call('sessionIndex', 'get', [id]) as Promise<SessionSummary | undefined>,
       countActive: (workspaceIds) =>
         call('sessionIndex', 'count', [{ workspaceIds }]) as Promise<number>,
-      create: async ({ workDir, additionalDirs, title, mcpServers }) => {
+      create: async ({ workDir, additionalDirs, requestAdditionalDirs, title, mcpServers }) => {
         const handle = (await scoped({}, 'sessionManager', 'create', [
-          { workDir, additionalDirs, mcpServers },
+          { workDir, additionalDirs, requestAdditionalDirs, mcpServers },
         ])) as { id: string };
         const scope = { sessionId: handle.id };
         if (title !== undefined) {

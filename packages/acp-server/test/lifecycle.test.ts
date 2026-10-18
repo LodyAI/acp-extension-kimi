@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -10,6 +10,9 @@ import {
   IWorkspaceInstanceManager,
 } from '@moonshot-ai/agent-core-v2';
 import { afterEach, describe, expect, it } from 'vitest';
+import { ISessionContext } from '@moonshot-ai/agent-core-v2/session/sessionContext/sessionContext';
+import { IAtomicDocumentStore } from '@moonshot-ai/agent-core-v2/persistence/interface/atomicDocumentStore';
+import { ISessionWorkspaceContext } from '@moonshot-ai/agent-core-v2/session/workspaceContext/workspaceContext';
 
 import type { SessionSummary } from '@moonshot-ai/klient';
 
@@ -247,6 +250,15 @@ describe('acp-server session lifecycle', () => {
       expect(userChunks).toContain('hello from the fork');
       expect(agentChunks).toContain('first turn reply');
       expect(agentChunks).toContain('fork reply');
+      const sourceBefore = c.sessionUpdates().length;
+      await c.send('session/load', {
+        sessionId: created.sessionId, cwd: homeDir, mcpServers: [],
+      });
+      const sourceReplay = JSON.stringify(c.sessionUpdates().slice(sourceBefore));
+      expect(sourceReplay).toContain('hello from the source session');
+      expect(sourceReplay).toContain('first turn reply');
+      expect(sourceReplay).not.toContain('hello from the fork');
+      expect(sourceReplay).not.toContain('fork reply');
     },
     30_000,
   );
@@ -338,31 +350,197 @@ describe('acp-server session lifecycle', () => {
     30_000,
   );
 
-  it(
-    'session/new forwards additionalDirectories to the engine workspace dirs',
-    async () => {
+  it.each([
+    { method: 'session/load', cold: false },
+    { method: 'session/load', cold: true },
+    { method: 'session/resume', cold: false },
+    { method: 'session/resume', cold: true },
+  ])('$method rejects invalid directory requests without mutations (cold=$cold)', async ({ method, cold }) => {
+    const c = await boot();
+    const cwd = join(homeDir!, 'primary');
+    const otherCwd = join(homeDir!, 'other');
+    const a = join(homeDir!, 'a');
+    const b = join(homeDir!, 'b');
+    await Promise.all([cwd, otherCwd, a, b].map((dir) => mkdir(dir)));
+    const { sessionId } = await c.send('session/new', {
+      cwd, mcpServers: [], additionalDirectories: [a],
+    }) as { sessionId: string };
+    await c.waitForSessionUpdate('available_commands_update', 10_000);
+    const manager = c.server.core.accessor.get(ISessionManager);
+    const handle = manager.get(sessionId)!;
+    const context = handle.accessor.get(ISessionWorkspaceContext);
+    const scope = handle.accessor.get(ISessionContext).metaScope;
+    const store = c.server.core.accessor.get(IAtomicDocumentStore);
+    if (cold) await c.send('session/close', { sessionId });
+    const beforeMetadata = structuredClone(await store.get(scope, 'state.json'));
+    const beforeSummary = await c.server.klient.global.sessions.get(sessionId);
+    for (const invalid of [
+      { cwd: otherCwd, additionalDirectories: [b] },
+      { cwd: otherCwd, additionalDirectories: [] },
+      { cwd: otherCwd, additionalDirectories: undefined },
+      { cwd: 'relative', additionalDirectories: [b] },
+      { cwd: '', additionalDirectories: [] },
+      { cwd, additionalDirectories: [b, '../a'] },
+      { cwd, additionalDirectories: [''] },
+    ]) {
+      await expect(c.send(method, { sessionId, mcpServers: [], ...invalid }))
+        .rejects.toThrow(/-32602/);
+      expect(manager.get(sessionId)).toBe(cold ? undefined : handle);
+      expect(await store.get(scope, 'state.json')).toEqual(beforeMetadata);
+      expect(await c.server.klient.global.sessions.get(sessionId)).toEqual(beforeSummary);
+      if (!cold) {
+        expect(context.workDir).toBe(cwd);
+        expect(context.additionalDirs).toEqual([a]);
+        expect(context.resolve('file.txt')).toBe(join(cwd, 'file.txt'));
+        expect(context.isWithin(join(b, 'file.txt'))).toBe(false);
+      }
+    }
+    await c.send(method, { sessionId, cwd, mcpServers: [], additionalDirectories: [a] });
+    const restored = manager.get(sessionId)!.accessor.get(ISessionWorkspaceContext);
+    expect(restored.workDir).toBe(cwd);
+    expect(restored.additionalDirs).toEqual([a]);
+  }, 30_000);
+
+  it.each(['session/new', 'session/fork'])(
+    '%s rejects relative directory inputs without creating a session', async (method) => {
       const c = await boot();
-      const extraDir = join(homeDir!, 'extra-root');
-      await mkdir(extraDir, { recursive: true });
+      const { sessionId } = await c.send('session/new', {
+        cwd: homeDir, mcpServers: [],
+      }) as { sessionId: string };
+      await c.waitForSessionUpdate('available_commands_update', 10_000);
+      const before = await c.server.klient.global.sessions.list({});
+      for (const invalid of [
+        { cwd: 'relative', additionalDirectories: [] },
+        { cwd: '', additionalDirectories: [] },
+        { cwd: homeDir, additionalDirectories: [homeDir, '../extra'] },
+        { cwd: homeDir, additionalDirectories: [''] },
+      ]) {
+        await expect(c.send(method, { sessionId, mcpServers: [], ...invalid }))
+          .rejects.toThrow(/-32602/);
+        expect(await c.server.klient.global.sessions.list({})).toEqual(before);
+      }
+    }, 30_000,
+  );
 
-      const created = (await c.send('session/new', {
-        cwd: homeDir,
-        mcpServers: [],
-        additionalDirectories: [extraDir],
-      })) as { sessionId: string };
-      expect(created.sessionId).toMatch(/^session_/);
-
-      // The workspace handler merges create-time dirs into its
-      // (ephemeral) additional-dir set.
+  it.each(['session/load', 'session/resume'])(
+    '%s replaces request roots on hot and cold sessions without changing siblings',
+    async (method) => {
+      const c = await boot();
+      const cwd = join(homeDir!, 'primary');
+      const a = join(homeDir!, 'root-a');
+      const b = join(homeDir!, 'root-b');
+      await Promise.all([cwd, a, b].map((dir) => mkdir(dir)));
+      const create = async (additionalDirectories?: string[]) =>
+        (await c.send('session/new', { cwd, mcpServers: [], additionalDirectories })) as {
+          sessionId: string;
+        };
+      const first = await create([a]);
+      const sibling = await create([b]);
+      const empty = await create();
+      const context = (id: string) =>
+        c.server.core.accessor.get(ISessionManager).get(id)!.accessor.get(ISessionWorkspaceContext);
+      const assertRoots = (id: string, roots: string[]) => {
+        expect(context(id).workDir).toBe(cwd);
+        expect(context(id).resolve('relative.txt')).toBe(join(cwd, 'relative.txt'));
+        expect(context(id).additionalDirs).toEqual(roots);
+        expect(context(id).isWithin(join(a, 'file.txt'))).toBe(roots.includes(a));
+        expect(context(id).isWithin(join(b, 'file.txt'))).toBe(roots.includes(b));
+      };
+      assertRoots(first.sessionId, [a]);
+      assertRoots(sibling.sessionId, [b]);
+      assertRoots(empty.sessionId, []);
       const workspace = await c.server.core.accessor
-        .get(IWorkspaceInstanceManager)
-        .getOrCreate({ root: homeDir! });
-      const dirs = workspace.program.dirs;
-      await dirs.ready;
-      expect(dirs.additionalDirs).toContain(extraDir);
+        .get(IWorkspaceInstanceManager).getOrCreate({ root: cwd });
+      expect(workspace.program.dirs.additionalDirs).toEqual([]);
+
+      for (const cold of [false, true]) {
+        for (const roots of [[a], [b], [], [a], undefined]) {
+          if (cold) await c.send('session/close', { sessionId: first.sessionId });
+          await c.send(method, {
+            sessionId: first.sessionId, cwd, mcpServers: [], additionalDirectories: roots,
+          });
+          assertRoots(first.sessionId, roots ?? []);
+          assertRoots(sibling.sessionId, [b]);
+          assertRoots(empty.sessionId, []);
+          expect(workspace.program.dirs.additionalDirs).toEqual([]);
+        }
+      }
     },
     30_000,
   );
+
+  it('preserves persisted native directories through all ACP lifecycle paths', async () => {
+    const c = await boot();
+    const cwd = join(homeDir!, 'primary');
+    const native = join(homeDir!, 'native');
+    const requested = join(homeDir!, 'requested');
+    await Promise.all([cwd, native, requested].map((dir) => mkdir(dir)));
+    const workspace = await c.server.core.accessor
+      .get(IWorkspaceInstanceManager).getOrCreate({ root: cwd });
+    const saved = await workspace.program.dirs.addDir({ path: native, persist: true });
+    const originalConfig = await readFile(saved.configPath, 'utf8');
+    const created = await c.send('session/new', {
+      cwd, mcpServers: [], additionalDirectories: [requested],
+    }) as { sessionId: string };
+    const roots = (id: string) =>
+      c.server.core.accessor.get(ISessionManager).get(id)!.accessor
+        .get(ISessionWorkspaceContext).additionalDirs;
+    expect(roots(created.sessionId)).toEqual([native, requested]);
+    await c.send('session/load', {
+      sessionId: created.sessionId, cwd, mcpServers: [], additionalDirectories: [],
+    });
+    expect(roots(created.sessionId)).toEqual([native]);
+    await c.send('session/resume', {
+      sessionId: created.sessionId, cwd, mcpServers: [], additionalDirectories: [requested],
+    });
+    const forked = await c.send('session/fork', {
+      sessionId: created.sessionId, cwd, mcpServers: [],
+    }) as { sessionId: string };
+    expect(roots(forked.sessionId)).toEqual([native]);
+    expect(roots(created.sessionId)).toEqual([native, requested]);
+    await c.send('session/resume', { sessionId: created.sessionId, cwd, mcpServers: [] });
+    expect(roots(created.sessionId)).toEqual([native]);
+    expect(await readFile(saved.configPath, 'utf8')).toBe(originalConfig);
+  }, 30_000);
+
+  it('session/fork applies only the target roots and cwd to each independent child', async () => {
+    const c = await boot();
+    const cwd = join(homeDir!, 'primary');
+    const target = join(homeDir!, 'fork-primary');
+    const a = join(homeDir!, 'root-a');
+    const b = join(homeDir!, 'root-b');
+    await Promise.all([cwd, target, a, b].map((dir) => mkdir(dir)));
+    const source = (await c.send('session/new', {
+      cwd, mcpServers: [], additionalDirectories: [a],
+    })) as { sessionId: string };
+    const context = (id: string) =>
+      c.server.core.accessor.get(ISessionManager).get(id)!.accessor.get(ISessionWorkspaceContext);
+    const children: string[] = [];
+    for (const roots of [[b], [], undefined]) {
+      const fork = (await c.send('session/fork', {
+        sessionId: source.sessionId, cwd: target, mcpServers: [], additionalDirectories: roots,
+      })) as { sessionId: string };
+      expect(fork.sessionId).not.toBe(source.sessionId);
+      expect(children).not.toContain(fork.sessionId);
+      children.push(fork.sessionId);
+      expect(context(fork.sessionId).workDir).toBe(target);
+      expect(context(fork.sessionId).resolve('relative.txt')).toBe(join(target, 'relative.txt'));
+      expect(context(fork.sessionId).additionalDirs).toEqual(roots ?? []);
+      expect(context(source.sessionId).workDir).toBe(cwd);
+      expect(context(source.sessionId).additionalDirs).toEqual([a]);
+    }
+    await c.send('session/resume', {
+      sessionId: children[0], cwd: target, mcpServers: [], additionalDirectories: [a],
+    });
+    expect(context(children[0]!).additionalDirs).toEqual([a]);
+    expect(context(children[1]!).additionalDirs).toEqual([]);
+    expect(context(source.sessionId).additionalDirs).toEqual([a]);
+    await c.send('session/resume', {
+      sessionId: source.sessionId, cwd, mcpServers: [], additionalDirectories: [b],
+    });
+    expect(context(children[0]!).additionalDirs).toEqual([a]);
+    expect(context(source.sessionId).additionalDirs).toEqual([b]);
+  }, 30_000);
 
   it(
     'a title change pushes session_info_update',

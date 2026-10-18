@@ -99,6 +99,7 @@ export class WorkspaceInstructionsService
     const currentPaths = (): readonly string[] | undefined => this.current.agentsMdPaths;
     return {
       _serviceBrand: undefined,
+      workDir: this.workspace.cwd,
       ready: this.ready,
       onDidChange: this.onDidChange,
       get agentsMd() {

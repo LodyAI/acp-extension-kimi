@@ -221,6 +221,8 @@ function createService(
   ix.stub(IBootstrapService, stubBootstrap('/tmp/kimi-code-llm-requester-test', options.env ?? {}));
   const thinkingLevel = options.thinkingLevel ?? 'off';
   const profile: Partial<IAgentProfileService> = {
+    workspaceContextVersion: 0,
+    prepareWorkspaceContext: () => undefined,
     hasProvider: () => true,
     resolveModelContext: () => ({
       modelAlias: 'm',
@@ -322,6 +324,7 @@ function createService(
 
   return {
     service: ix.get(IAgentLLMRequesterService),
+    profile,
     dispatcher: ix.get(IEventDispatcher),
     records,
     events,
@@ -330,6 +333,38 @@ function createService(
     measuredCalls,
   };
 }
+
+describe('AgentLLMRequesterService workspace context', () => {
+  it('refreshes only the prompt snapshot when workspace roots change within a turn', async () => {
+    const inputs: ModelRequestInput[] = [];
+    const { service, profile } = createService(createRequester({ value: 0 }, null, [], inputs), undefined);
+    service.prepareTurnConfig(1);
+    Object.assign(profile, { getSystemPrompt: () => 'ordinary config edit' });
+    await service.request({ source: { type: 'turn', turnId: 1, step: 1 } });
+    expect(inputs[0]?.systemPrompt).toBe('system');
+
+    const originalModelContext = profile.resolveModelContext!();
+    Object.assign(profile, {
+      workspaceContextVersion: 1,
+      getSystemPrompt: () => 'workspace roots B',
+      resolveModelContext: () => ({ ...originalModelContext, thinkingLevel: 'high' }),
+    });
+    await service.request({ source: { type: 'turn', turnId: 1, step: 2 } });
+    expect(inputs[1]?.systemPrompt).toBe('workspace roots B');
+    expect(service.prepareTurnConfig(1)?.thinkingEffort).toBe('off');
+
+    Object.assign(profile, {
+      prepareWorkspaceContext: async () => {
+        Object.assign(profile, {
+          workspaceContextVersion: 2,
+          getSystemPrompt: () => 'workspace roots cleared',
+        });
+      },
+    });
+    await service.request({ source: { type: 'turn', turnId: 1, step: 3 } });
+    expect(inputs[2]?.systemPrompt).toBe('workspace roots cleared');
+  });
+});
 
 describe('AgentLLMRequesterService measured anchors', () => {
   it('skips the measured anchor when the stream reports no usage', async () => {

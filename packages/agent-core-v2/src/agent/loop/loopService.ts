@@ -569,6 +569,8 @@ export class AgentLoopService extends Disposable implements IAgentLoopService {
     queueItemId: string | undefined,
     message: UserMessage,
   ): Promise<PromptGateVerdict> {
+    const workspaceContextPreparation = this.profile.prepareWorkspaceContext();
+    if (workspaceContextPreparation !== undefined) await workspaceContextPreparation;
     const waiter = queueItemId === undefined ? undefined : this.promptWaiters.get(queueItemId);
     const entry =
       queueItemId === undefined
