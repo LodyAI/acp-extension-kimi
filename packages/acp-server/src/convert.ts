@@ -321,11 +321,12 @@ function composePlanContent(
  * Convert a {@link ToolResultEvent}'s `output` into ACP
  * {@link ToolCallContent} entries.
  *
- * A non-empty string is passed through as a text block; objects/arrays are
- * JSON-stringified (best-effort — falls back to a placeholder on circular
- * structures). Empty/undefined/null output yields an empty array — the caller
- * still emits a `tool_call_update` so the client sees the status transition
- * to completed/failed.
+ * A non-empty string is passed through as a text block. Media content-part
+ * arrays containing data-URL images become ordered ACP text and image blocks;
+ * other objects/arrays are JSON-stringified (best-effort — falls back to a
+ * placeholder on circular structures). Empty/undefined/null output yields an
+ * empty array — the caller still emits a `tool_call_update` so the client sees
+ * the status transition to completed/failed.
  *
  * Diff content does NOT come from this function: `ToolResultEvent` has no
  * `display` field; diffs attach to `ToolCallStartedEvent.display` and are
@@ -345,6 +346,10 @@ export function toolResultToAcpContent(event: ToolResultEvent): ToolCallContent[
     if (out.length === 0) return [];
     return [{ type: 'content', content: { type: 'text', text: out } }];
   }
+  if (Array.isArray(out)) {
+    const mediaContent = mediaPartsToAcpContent(out);
+    if (mediaContent !== null) return mediaContent;
+  }
   // Best-effort stringify for object/array outputs.
   let text: string;
   try {
@@ -354,4 +359,42 @@ export function toolResultToAcpContent(event: ToolResultEvent): ToolCallContent[
   }
   if (!text) return [];
   return [{ type: 'content', content: { type: 'text', text } }];
+}
+
+function mediaPartsToAcpContent(parts: unknown[]): ToolCallContent[] | null {
+  const content: ToolCallContent[] = [];
+  let hasImage = false;
+  for (const part of parts) {
+    if (part === null || typeof part !== 'object' || !('type' in part)) return null;
+    if (part.type === 'text' && 'text' in part && typeof part.text === 'string') {
+      content.push({ type: 'content', content: { type: 'text', text: part.text } });
+      continue;
+    }
+    if (
+      part.type !== 'image_url' ||
+      !('imageUrl' in part) ||
+      part.imageUrl === null ||
+      typeof part.imageUrl !== 'object' ||
+      !('url' in part.imageUrl) ||
+      typeof part.imageUrl.url !== 'string'
+    ) {
+      return null;
+    }
+    const image = parseImageDataUrl(part.imageUrl.url);
+    if (
+      image === null ||
+      !/^image\//i.test(image.mimeType) ||
+      image.base64.length === 0 ||
+      image.base64.length % 4 !== 0 ||
+      !/^[A-Za-z0-9+/]*={0,2}$/.test(image.base64)
+    ) {
+      return null;
+    }
+    content.push({
+      type: 'content',
+      content: { type: 'image', mimeType: image.mimeType, data: image.base64 },
+    });
+    hasImage = true;
+  }
+  return hasImage ? content : null;
 }
