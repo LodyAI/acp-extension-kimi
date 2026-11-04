@@ -23,6 +23,15 @@ repeated Plan switches with client file access and unchanged YOLO permissions.
 Build the runtime with the matching `acp-extension-core` package before updating
 Lody's checksummed managed-runtime manifest.
 
+## Tool media output
+
+Live tool results containing Kimi text and data-URL image parts are sent as
+ordered ACP text and image content blocks. Other results retain their existing
+text representation, and `rawOutput` remains available to clients. Session replay
+currently represents image parts with a text placeholder. Lody filters tool image
+blocks from its history, so this prevents base64 from appearing as text without
+adding an image preview to Lody.
+
 ## Subagent history
 
 Bilateral Core `subagentEvents` v1 replaces legacy task cards with root-scoped

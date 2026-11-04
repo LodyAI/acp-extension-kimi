@@ -4,6 +4,7 @@ import { join } from 'node:path';
 
 import type { McpServer } from '@agentclientprotocol/sdk';
 import type { ContentPart } from '@moonshot-ai/agent-core-v2';
+import type { ToolResultEvent } from '@moonshot-ai/agent-core-v2/events';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import {
@@ -11,7 +12,81 @@ import {
   acpMcpServersToConfigRecord,
   compressPromptImageParts,
 } from '../src/convert';
+import { toolResultToSessionUpdate } from '../src/events-map';
 import { solidPng, solidPngBase64 } from './_helpers/png';
+
+describe('tool result session updates', () => {
+  function update(output: unknown, isError = false) {
+    const event: ToolResultEvent = {
+      type: 'tool.result',
+      turnId: 1,
+      toolCallId: 'media',
+      output,
+      isError,
+    };
+    return toolResultToSessionUpdate('session', event).update;
+  }
+
+  it('sends Kimi media output as ordered ACP text and image blocks', () => {
+    const base64 = solidPngBase64(8, 8);
+    const output = [
+      { type: 'text', text: '<image path="/tmp/example.png">' },
+      { type: 'image_url', imageUrl: { url: `data:image/png;base64,${base64}` } },
+      { type: 'text', text: '</image>' },
+    ];
+    expect(update(output)).toMatchObject({
+      sessionUpdate: 'tool_call_update',
+      status: 'completed',
+      content: [
+        { type: 'content', content: { type: 'text', text: '<image path="/tmp/example.png">' } },
+        { type: 'content', content: { type: 'image', mimeType: 'image/png', data: base64 } },
+        { type: 'content', content: { type: 'text', text: '</image>' } },
+      ],
+      rawOutput: output,
+    });
+  });
+
+  it('preserves the order and MIME types of multiple images', () => {
+    const output = [
+      { type: 'image_url', imageUrl: { url: 'data:image/png;base64,YQ==' } },
+      { type: 'text', text: 'between' },
+      { type: 'image_url', imageUrl: { url: 'data:image/jpeg;base64,Yg==' } },
+    ];
+    expect(update(output)).toMatchObject({
+      content: [
+        { type: 'content', content: { type: 'image', mimeType: 'image/png', data: 'YQ==' } },
+        { type: 'content', content: { type: 'text', text: 'between' } },
+        { type: 'content', content: { type: 'image', mimeType: 'image/jpeg', data: 'Yg==' } },
+      ],
+    });
+  });
+
+  it('preserves existing output and failure behavior for non-media results', () => {
+    for (const output of [
+      'Could not read the file',
+      { count: 3 },
+      [{ type: 'text', text: 'ordinary output' }],
+      [{ type: 'image_url', imageUrl: { url: 'https://example.test/image.png' } }],
+      [{ type: 'image_url', imageUrl: { url: 'data:text/plain;base64,SGVsbG8=' } }],
+      [{ type: 'image_url', imageUrl: { url: 'data:image/png;base64,not valid!' } }],
+      [
+        { type: 'image_url', imageUrl: { url: 'data:image/png;base64,SGVsbG8=' } },
+        { type: 'unknown' },
+      ],
+    ]) {
+      expect(update(output, true)).toMatchObject({
+        status: 'failed',
+        content: [
+          {
+            type: 'content',
+            content: { type: 'text', text: typeof output === 'string' ? output : JSON.stringify(output) },
+          },
+        ],
+        rawOutput: output,
+      });
+    }
+  });
+});
 
 describe('acpMcpServersToConfigRecord', () => {
   it('returns undefined for an absent or empty list', () => {
