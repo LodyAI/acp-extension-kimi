@@ -67,6 +67,7 @@ import type {
 } from '@moonshot-ai/klient';
 import { RPCError } from '@moonshot-ai/klient';
 import { LODY_PLAN_MODE_CONFIG_ID, supportsLodySubagentEvents } from 'acp-extension-core';
+import { readClientSystemPrompt, type ClientSystemPrompt } from './client-system-prompt';
 import {
   LODY_EXTENSION_METHODS,
   type RateLimitsGetRequest,
@@ -149,7 +150,7 @@ export interface AcpServerOptions {
    * scope. Absent → `persistOriginalImage`'s shared temp-dir fallback.
    */
   readonly resolveOriginalsDir?: (sessionId: string) => string | undefined;
-  readonly bindSessionRuntime?: (sessionId: string) => Promise<void>;
+  readonly bindSessionRuntime?: (sessionId: string, systemPrompt?: ClientSystemPrompt) => Promise<void>;
   readonly unbindSessionRuntime?: (sessionId: string) => Promise<void>;
   /** Static or per-session host command palette. */
   readonly slashCommands?: SlashCommandsResolver;
@@ -162,7 +163,8 @@ export class AcpServer {
   private readonly terminalAuthEnv: Readonly<Record<string, string>> | undefined;
   private readonly terminalAuthLegacyCommand: string | undefined;
   private readonly resolveOriginalsDir: ((sessionId: string) => string | undefined) | undefined;
-  private readonly bindSessionRuntime: ((sessionId: string) => Promise<void>) | undefined;
+  private readonly bindSessionRuntime:
+    ((sessionId: string, systemPrompt?: ClientSystemPrompt) => Promise<void>) | undefined;
   private readonly unbindSessionRuntime: ((sessionId: string) => Promise<void>) | undefined;
   private readonly resolveSlashCommands: (
     session: SessionHandle,
@@ -220,6 +222,7 @@ export class AcpServer {
         embeddedContext: true,
       },
       sessionCapabilities: {
+        ...(this.bindSessionRuntime ? { systemPrompt: { mode: { override: {} } } } : {}),
         list: {},
         resume: {},
         close: {},
@@ -261,6 +264,7 @@ export class AcpServer {
 
   async newSession(params: NewSessionRequest): Promise<NewSessionResponse> {
     validateSessionDirectories(params);
+    const systemPrompt = this.validateSystemPrompt(params);
     await this.ensureAuthed();
     // The engine mints the session id and registers the workspace for the cwd
     // implicitly. ACP `mcpServers` become ephemeral per-session servers
@@ -270,7 +274,7 @@ export class AcpServer {
       requestAdditionalDirs: params.additionalDirectories ?? [],
       mcpServers: acpMcpServersToConfigRecord(params.mcpServers),
     });
-    return { sessionId: meta.id, ...(await this.activateSession(meta.id)) };
+    return { sessionId: meta.id, ...(await this.activateSession(meta.id, systemPrompt)) };
   }
 
   /**
@@ -289,6 +293,7 @@ export class AcpServer {
    */
   async unstable_forkSession(params: ForkSessionRequest): Promise<ForkSessionResponse> {
     validateSessionDirectories(params);
+    const systemPrompt = this.validateSystemPrompt({ systemPrompt: params.systemPrompt });
     await this.ensureAuthed();
     if (params.mcpServers !== undefined && params.mcpServers.length > 0) {
       log.warn('acp: session/fork ignores mcpServers (engine fork keeps the source servers)', {
@@ -298,11 +303,13 @@ export class AcpServer {
     const turnIndex = readLodyForkTurnIndex(params._meta);
     let forkedId: string;
     try {
-      forkedId = (await this.klient.session(params.sessionId).fork({
-        turnIndex,
-        workDir: params.cwd,
-        requestAdditionalDirs: params.additionalDirectories ?? [],
-      })).id;
+      forkedId = (
+        await this.klient.session(params.sessionId).fork({
+          turnIndex,
+          workDir: params.cwd,
+          requestAdditionalDirs: params.additionalDirectories ?? [],
+        })
+      ).id;
     } catch (error) {
       if (isSessionNotFound(error)) {
         throw RequestError.invalidParams(
@@ -316,7 +323,7 @@ export class AcpServer {
     if (!restored) {
       throw RequestError.invalidParams({ sessionId: forkedId }, `Unknown sessionId: ${forkedId}`);
     }
-    return { sessionId: forkedId, ...(await this.activateSession(forkedId)) };
+    return { sessionId: forkedId, ...(await this.activateSession(forkedId, systemPrompt)) };
   }
 
   async loadSession(params: LoadSessionRequest): Promise<LoadSessionResponse> {
@@ -601,6 +608,7 @@ export class AcpServer {
     params: LoadSessionRequest | ResumeSessionRequest,
   ): Promise<AcpSession> {
     validateSessionDirectories(params);
+    const systemPrompt = this.validateSystemPrompt(params);
     const { sessionId } = params;
     const summary = await this.klient.global.sessions.get(sessionId);
     if (summary === undefined) {
@@ -619,7 +627,7 @@ export class AcpServer {
     if (!restored) {
       throw RequestError.invalidParams({ sessionId }, `Unknown sessionId: ${sessionId}`);
     }
-    const acpSession = await this.wireSession(sessionId);
+    const acpSession = await this.wireSession(sessionId, systemPrompt);
     this.sessions.get(sessionId)?.dispose();
     this.sessions.set(sessionId, acpSession);
     return acpSession;
@@ -631,10 +639,29 @@ export class AcpServer {
    * agent unbound, and `prompt` settles gracefully until a model is set via
    * `set_config_option`), then subscribe its event stream.
    */
-  private async wireSession(sessionId: string): Promise<AcpSession> {
+  private validateSystemPrompt(params: {
+    sessionId?: string;
+    systemPrompt?: unknown;
+  }): ClientSystemPrompt | undefined {
+    const prompt = readClientSystemPrompt(params.systemPrompt);
+    if (prompt && !this.bindSessionRuntime) {
+      throw RequestError.invalidParams(undefined, 'systemPrompt is unavailable');
+    }
+    const existing =
+      params.sessionId === undefined ? undefined : this.sessions.get(params.sessionId);
+    if (prompt && existing && !existing.canChangeSystemPrompt()) {
+      throw RequestError.invalidParams(undefined, 'Changing systemPrompt requires an idle session');
+    }
+    return prompt;
+  }
+
+  private async wireSession(
+    sessionId: string,
+    systemPrompt?: ClientSystemPrompt,
+  ): Promise<AcpSession> {
     const session = this.klient.session(sessionId);
     await this.bindDefaultModel(session.agent('main'));
-    await this.bindSessionRuntime?.(sessionId);
+    await this.bindSessionRuntime?.(sessionId, systemPrompt);
     const hostCommands = await this.resolveSlashCommands(session);
     const acpSession = new AcpSession(
       this.conn,
@@ -656,11 +683,14 @@ export class AcpServer {
    * (wire + register + advertise slash commands) and build the response
    * surface shared by `session/new` and `session/fork`.
    */
-  private async activateSession(sessionId: string): Promise<{
+  private async activateSession(
+    sessionId: string,
+    systemPrompt?: ClientSystemPrompt,
+  ): Promise<{
     configOptions: Awaited<ReturnType<AcpSession['configOptions']>>;
     modes: ReturnType<AcpSession['modeState']>;
   }> {
-    const acpSession = await this.wireSession(sessionId);
+    const acpSession = await this.wireSession(sessionId, systemPrompt);
     this.sessions.set(sessionId, acpSession);
     this.scheduleAvailableCommandsUpdate(acpSession);
     return { configOptions: await acpSession.configOptions(), modes: acpSession.modeState() };

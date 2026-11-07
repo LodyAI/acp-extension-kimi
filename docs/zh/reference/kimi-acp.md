@@ -32,6 +32,19 @@ kimi acp
 | `mcpCapabilities.sse` | `true` | 转发 IDE 配置的旧式 SSE MCP 服务 |
 | `auth.logout` | `{}` | 支持 ACP `logout`，丢弃托管供应商的 token |
 
+## 客户端系统提示词
+
+`sessionCapabilities.systemPrompt.mode.override` 表示支持在 `session/new`、
+`session/load`、`session/resume` 和 `session/fork` 中传入标准 ACP `systemPrompt`。
+使用 `{"mode":"append","content":[{"type":"text","text":"使用项目术语。"}]}`
+追加到原生 Agent 配置的提示词，或使用 `mode: "override"` 替换基础指令。
+仅接受非空的文本块数组；无效参数返回 `invalidParams`（-32602）。
+
+指令仅作用于该会话的主 Agent，保留工具、权限、subagent 配置和必要的运行时指引。
+重新连接时传入新值会替换之前的自定义内容，且要求会话空闲。
+省略该字段或传入 `null` 时，仍在运行的配置保持不变，冷恢复则使用原生默认值；
+客户端应在每次激活（包括分叉）时重新传入所需值。该设置不会修改磁盘上的 Agent 配置定义。
+
 ## ACP 方法覆盖
 
 在 `@agentclientprotocol/sdk@1.x` 中，ACP 方法按命名空间组织：`core` 与 `session` 覆盖主 agent 流程，`providers`、`nes`（inline-edit 预测）与 `document`（缓冲区同步）是可选扩展面；客户端侧的 reverse-RPC 方法则分组在 `session`、`fs`、`terminal` 与 `elicitation` 下。

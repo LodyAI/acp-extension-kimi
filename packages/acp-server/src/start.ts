@@ -23,6 +23,8 @@ import {
   ensureMainAgent,
   getLiveSessionById,
   IAgentLifecycleService,
+  IAgentProfileService,
+  ISessionAgentProfileCatalog,
   IAgentRuntimeBindingService,
   IAppendLogStore,
   IHostEnvironment,
@@ -151,7 +153,7 @@ export async function runAcpServerWithStream(
     terminalAuthEnv: opts.terminalAuthEnv,
     terminalAuthLegacyCommand: opts.terminalAuthLegacyCommand,
     slashCommands: opts.slashCommands,
-    bindSessionRuntime: async (sessionId) => {
+    bindSessionRuntime: async (sessionId, systemPrompt) => {
       const handle = getLiveSessionById(core.accessor, sessionId);
       if (handle === undefined) throw new Error(`session ${sessionId} is not live`);
       const context = handle.accessor.get(ISessionContext);
@@ -163,6 +165,30 @@ export async function runAcpServerWithStream(
         .handleOf(agentContext.agentId)!
         .accessor.get(IAgentRuntimeBindingService)
         .switch(runtimeId);
+      if (systemPrompt) {
+        const agent = handle.accessor.get(IAgentLifecycleService).handleOf(agentContext.agentId)!;
+        const profile = agent.accessor.get(IAgentProfileService);
+        const catalog = handle.accessor.get(ISessionAgentProfileCatalog);
+        await catalog.ready;
+        const name = profile.data().profileName;
+        const base = name === undefined ? catalog.getDefault() : catalog.get(name);
+        if (base === undefined) throw new Error('The active agent profile is unavailable');
+        const renderSystemPrompt: typeof base.renderSystemPrompt = (context) => {
+          const rendered = base.renderSystemPrompt(context);
+          return {
+            ...rendered,
+            text:
+              systemPrompt.mode === 'override'
+                ? systemPrompt.text
+                : `${rendered.text}\n\n${systemPrompt.text}`,
+          };
+        };
+        await profile.applyProfile({
+          ...base,
+          renderSystemPrompt,
+          systemPrompt: (context) => renderSystemPrompt(context).text,
+        });
+      }
     },
     unbindSessionRuntime: async (sessionId) => {
       const workspaceId = sessionWorkspaces.get(sessionId);

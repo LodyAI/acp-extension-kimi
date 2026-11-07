@@ -377,6 +377,10 @@ export class AcpSession {
    */
   private readonly subagentEvents: KimiSubagentEvents | undefined;
 
+  canChangeSystemPrompt(): boolean {
+    return !this.driver && this.runningTurns.size === 0 && this.activeSubagentTasks.size === 0;
+  }
+
   async init(): Promise<void> {
     const events = this.agent.events;
     this.subscriptions.push(
