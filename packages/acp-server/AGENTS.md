@@ -50,3 +50,5 @@ Package-local rules for `packages/acp-server`.
   Accepted prompt launches trigger native generation without blocking the turn;
   metadata updates retain generated/custom/replaceable provenance as Core
   generated/explicit/fallback title sources. Never force generation over a user name.
+
+- Standard ACP `systemPrompt` customizes the session's main-agent profile at this edge. Validate before activation, rebuild each customization from the catalog profile, preserve tools and permissions, and reject changes while the session is busy.

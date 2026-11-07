@@ -76,6 +76,68 @@ describe('acp-server real prompt turn (scripted LLM)', () => {
     return client;
   }
 
+  it('applies and replaces ACP system prompts without changing sibling sessions', async () => {
+    const c = await boot();
+    const create = async (text?: string) =>
+      c.send('session/new', {
+        cwd: homeDir,
+        mcpServers: [],
+        systemPrompt:
+          text === undefined ? undefined : { mode: 'append', content: [{ type: 'text', text }] },
+      }) as Promise<{ sessionId: string }>;
+    const first = await create('First client instructions');
+    const sibling = await create();
+    const prompt = async (sessionId: string) => {
+      scripted!.mockNextText('Synthetic answer');
+      await c.send('session/prompt', { sessionId, prompt: [{ type: 'text', text: 'Continue' }] });
+      return scripted!.systemPrompts().at(-1)!;
+    };
+    expect(await prompt(first.sessionId)).toContain('First client instructions');
+    expect(await prompt(sibling.sessionId)).not.toContain('First client instructions');
+    await c.send('session/resume', {
+      sessionId: first.sessionId,
+      cwd: homeDir,
+      mcpServers: [],
+      systemPrompt: {
+        mode: 'override',
+        content: [{ type: 'text', text: 'Replacement client instructions' }],
+      },
+    });
+    const replaced = await prompt(first.sessionId);
+    expect(replaced).toContain('Replacement client instructions');
+    expect(replaced).not.toContain('First client instructions');
+    expect(replaced).not.toContain('You are Kimi');
+    await expect(
+      c.send('session/resume', {
+        sessionId: first.sessionId,
+        cwd: homeDir,
+        systemPrompt: { mode: 'unknown', content: [{ type: 'text', text: 'Bad' }] },
+      }),
+    ).rejects.toThrow('"code":-32602');
+    expect(await prompt(first.sessionId)).toBe(replaced);
+    const forked = (await c.send('session/fork', {
+      sessionId: first.sessionId,
+      cwd: homeDir,
+      systemPrompt: { mode: 'append', content: [{ type: 'text', text: 'Fork instructions' }] },
+    })) as { sessionId: string };
+    const childPrompt = await prompt(forked.sessionId);
+    expect(childPrompt).toContain('Fork instructions');
+    expect(childPrompt).not.toContain('Replacement client instructions');
+    expect(await prompt(first.sessionId)).toBe(replaced);
+    await c.send('session/load', {
+      sessionId: first.sessionId,
+      cwd: homeDir,
+      mcpServers: [],
+      systemPrompt: { mode: 'append', content: [{ type: 'text', text: 'Loaded instructions' }] },
+    });
+    const loaded = await prompt(first.sessionId);
+    expect(loaded).toContain('Loaded instructions');
+    expect(loaded).not.toContain('Replacement client instructions');
+    await c.send('session/close', { sessionId: first.sessionId });
+    await c.send('session/resume', { sessionId: first.sessionId, cwd: homeDir });
+    expect(await prompt(first.sessionId)).not.toContain('Loaded instructions');
+  }, 30_000);
+
   it('drives initialize → new → prompt and streams the assistant text as agent_message_chunk', async () => {
     const c = await boot();
     scripted!.mockNextText('hello from the scripted model');

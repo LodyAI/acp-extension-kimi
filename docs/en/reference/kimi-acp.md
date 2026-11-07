@@ -32,6 +32,21 @@ The table below lists the capabilities declared by the ACP server. The `agentCap
 | `mcpCapabilities.sse` | `true` | Forwards legacy SSE MCP services configured by the IDE |
 | `auth.logout` | `{}` | Supports ACP `logout` to drop the managed provider's token |
 
+## Client system prompts
+
+`sessionCapabilities.systemPrompt.mode.override` advertises support for standard ACP
+`systemPrompt` on `session/new`, `session/load`, `session/resume`, and `session/fork`.
+Use `{"mode":"append","content":[{"type":"text","text":"Use project terminology."}]}`
+to append instructions to the native profile, or `mode: "override"` to replace its
+base instructions. Only nonempty arrays of text blocks are accepted; invalid values
+return `invalidParams` (-32602).
+
+Instructions apply to the main agent of that session. Tools, permissions, subagent
+profiles, and required runtime guidance are retained. Reattaching with a new value
+replaces the earlier customization and requires an idle session. An omitted or `null`
+value preserves a live profile but uses native defaults after a cold restore; clients
+should resend the desired value on every activation, including forks. This does not edit the profile definition on disk.
+
 ## ACP method coverage
 
 With `@agentclientprotocol/sdk@1.x`, the ACP method set is organized by namespace: `core` and `session` cover the main agent flow, while `providers`, `nes` (inline-edit prediction), and `document` (buffer sync) are optional extension surfaces. On the client side, reverse-RPC methods are grouped under `session`, `fs`, `terminal`, and `elicitation`.
