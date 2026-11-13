@@ -462,6 +462,7 @@ export class AcpSession {
       // Compaction runs as a background LLM task outside any turn, so these
       // are not turn-scoped; the subscription is already agent-grained (this
       // session's main agent), which keeps other sessions' events out.
+      // A blocked turn waits for the same compaction to finish.
       events.on('compaction.started', (event) => {
         this.onCompactionStarted(event);
       }),
@@ -469,10 +470,7 @@ export class AcpSession {
         this.onCompactionCompleted(event);
       }),
       events.on('compaction.cancelled', () => {
-        this.finishCompaction('Compaction cancelled');
-      }),
-      events.on('compaction.blocked', () => {
-        this.finishCompaction('Compaction is blocked by the current turn');
+        this.onCompactionCancelled();
       }),
     );
     // Session-scope stream: title changes surface as `session_info_update`.
@@ -1127,45 +1125,45 @@ export class AcpSession {
   /** Report the compaction token result on the same tool call. */
   private onCompactionCompleted(event: AgentEventPayloads['compaction.completed']): void {
     const active = this.activeCompaction;
-    const id = active?.id ?? `context-compaction:${randomUUID()}`;
+    // Terminal events without a matching start cannot be correlated safely.
+    if (active === undefined) return;
     this.activeCompaction = undefined;
     const activity: LodyActivityMeta = {
       version: 1,
       kind: 'context_compaction',
-      automatic: active?.automatic ?? true,
+      automatic: active.automatic,
       usedTokensBefore: event.result.tokensBefore,
       usedTokensAfter: event.result.tokensAfter,
     };
     this.emit({
       sessionId: this.sessionId,
       update: {
-        sessionUpdate: active === undefined ? 'tool_call' : 'tool_call_update',
-        toolCallId: id,
+        sessionUpdate: 'tool_call_update',
+        toolCallId: active.id,
         title: 'Context compacted',
-        ...(active === undefined ? { kind: 'think' as const } : {}),
         status: 'completed',
         _meta: { lody: { activity } },
       },
     });
   }
 
-  private finishCompaction(failureReason: string): void {
+  private onCompactionCancelled(): void {
     const active = this.activeCompaction;
-    const id = active?.id ?? `context-compaction:${randomUUID()}`;
+    if (active === undefined) return;
     this.activeCompaction = undefined;
+    const title = 'Compaction cancelled';
     const activity: LodyActivityMeta = {
       version: 1,
       kind: 'context_compaction',
-      automatic: active?.automatic ?? false,
-      failureReason,
+      automatic: active.automatic,
+      failureReason: title,
     };
     this.emit({
       sessionId: this.sessionId,
       update: {
-        sessionUpdate: active === undefined ? 'tool_call' : 'tool_call_update',
-        toolCallId: id,
-        title: failureReason,
-        ...(active === undefined ? { kind: 'think' as const } : {}),
+        sessionUpdate: 'tool_call_update',
+        toolCallId: active.id,
+        title,
         status: 'failed',
         _meta: { lody: { activity } },
       },
