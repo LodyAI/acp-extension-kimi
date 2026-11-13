@@ -15,7 +15,7 @@ import { runWithCredentialRecovery } from '#/llm-adapter/model/credential-recove
 import { IAgentLoopService, type LoopErrorContext } from '#/agent/loop/loop';
 import { TurnStarted } from '#/agent/loop/turnEvents';
 import { TurnEnded } from '#/agent/loop/turnOps';
-import { isAbortError, isUserCancellation } from '#/_base/utils/abort';
+import { isAbortError } from '#/_base/utils/abort';
 import { IAgentProfileService, type ProfileModelContext } from '#/agent/profile/profile';
 import {
   agentContextOfScope,
@@ -59,7 +59,6 @@ import {
 import {
   CompactionBlocked,
   CompactionCancelled,
-  type CompactionCancelledPayload,
   CompactionCompleted,
   fullCompactionKey,
   fullCompactionWireRangesKey,
@@ -360,10 +359,7 @@ export class AgentFullCompactionService extends Service implements IAgentFullCom
       this._compacting = active.task;
       active.task.abortController.signal.addEventListener(
         'abort',
-        () => {
-          const reason: unknown = active.task.abortController.signal.reason;
-          this.cancelActive(active.task, isUserCancellation(reason) ? 'user-abort' : 'cancelled');
-        },
+        () => this.cancelActive(active.task),
         { once: true },
       );
       void this.compactionWorker(active.task, data).then(active.resolve, active.reject);
@@ -440,14 +436,14 @@ export class AgentFullCompactionService extends Service implements IAgentFullCom
     super.dispose();
   }
 
-  private cancelActive(active: ActiveCompaction, cause: CompactionCancelledPayload['cause']): boolean {
+  private cancelActive(active: ActiveCompaction): boolean {
     if (this._compacting !== active) return false;
     void this.dispatcher.dispatch(new FullCompactionCancel({ agentId: this.agent.agentId }));
     this._compacting = null;
     if (!active.abortController.signal.aborted) {
       active.abortController.abort();
     }
-    void this.dispatcher.dispatch(new CompactionCancelled({ agentId: this.agent.agentId, cause }));
+    void this.dispatcher.dispatch(new CompactionCancelled({ agentId: this.agent.agentId }));
     return true;
   }
 
@@ -559,7 +555,7 @@ export class AgentFullCompactionService extends Service implements IAgentFullCom
     signal?.addEventListener(
       'abort',
       () => {
-        if (this._compacting === active) active.abortController.abort(signal.reason);
+        if (this._compacting === active) active.abortController.abort();
       },
       { once: true },
     );
@@ -594,15 +590,14 @@ export class AgentFullCompactionService extends Service implements IAgentFullCom
       );
       return result;
     } catch (error) {
-      if (active.abortController.signal.aborted) {
-        throw error;
-      }
-      if (isAbortError(error)) {
-        this.cancelActive(active, isUserCancellation(error) ? 'user-abort' : 'cancelled');
+      if (active.abortController.signal.aborted || isAbortError(error)) {
+        this.cancelActive(active);
         throw error;
       }
       const blockedByTurn = this._compacting === active && active.blockedByTurn;
-      this.cancelActive(active, 'failed');
+      if (this._compacting === active) {
+        this.cancelActive(active);
+      }
       if (blockedByTurn) {
         throw error;
       }
@@ -751,7 +746,10 @@ export class AgentFullCompactionService extends Service implements IAgentFullCom
       }
 
       if (!historySafeToCompact(this.context.get(), originalHistory)) {
-        this.cancelActive(active, 'drift');
+        const active = this._compacting;
+        if (active !== null) {
+          this.cancelActive(active);
+        }
         throw compactionCancelledReason(active);
       }
 

@@ -720,8 +720,7 @@ const _compactionBlockedEvent: AssertWire<
   typeof compactionBlockedEventSchema,
   CompactionBlockedEvent
 > = true;
-// Older engines emit cancellation without a cause.
-const _compactionCancelledEvent: AssertEngineToWire<
+const _compactionCancelledEvent: AssertWire<
   typeof compactionCancelledEventSchema,
   CompactionCancelledEvent
 > = true;

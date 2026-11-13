@@ -505,7 +505,7 @@ describe('context compaction tool calls', () => {
 
     fake.emit('compaction.completed', result);
     fake.emit('compaction.completed', result);
-    fake.emit('compaction.cancelled', { cause: 'failed' });
+    fake.emit('compaction.cancelled', {});
     await flush();
 
     const compaction = compactionUpdates(updates);
@@ -519,19 +519,12 @@ describe('context compaction tool calls', () => {
     });
   });
 
-  it.each([
-    ['cancelled', 'Context compaction cancelled'],
-    ['user-abort', 'Context compaction stopped by user'],
-    ['failed', 'Context compaction failed'],
-    ['drift', 'Context changed during compaction'],
-    [undefined, 'Context compaction cancelled'],
-  ])('settles %s on the original tool call', async (cause, title) => {
+  it('settles cancellation on the original tool call once', async () => {
     const { fake, updates } = await startSession();
-    const cancelled = cause === 'cancelled' || cause === 'user-abort' || cause === undefined;
 
     fake.emit('compaction.started', { trigger: 'manual' });
-    fake.emit('compaction.cancelled', { cause });
-    fake.emit('compaction.cancelled', { cause });
+    fake.emit('compaction.cancelled', {});
+    fake.emit('compaction.cancelled', {});
     fake.emit('compaction.completed', result);
     await flush();
 
@@ -540,14 +533,13 @@ describe('context compaction tool calls', () => {
     expect(compaction[1]).toMatchObject({
       sessionUpdate: 'tool_call_update',
       toolCallId: compaction[0]?.toolCallId,
-      title,
+      title: 'Compaction cancelled',
       status: 'failed',
       _meta: {
         lody: {
           activity: {
             automatic: false,
-            cancellationReason: cancelled ? (cause ?? 'cancelled') : undefined,
-            failureReason: cancelled ? undefined : title,
+            failureReason: 'Compaction cancelled',
           },
         },
       },
@@ -559,12 +551,12 @@ describe('context compaction tool calls', () => {
 
     fake.emit('compaction.blocked', {});
     fake.emit('compaction.completed', result);
-    fake.emit('compaction.cancelled', { cause: 'failed' });
+    fake.emit('compaction.cancelled', {});
     await flush();
     expect(compactionUpdates(updates)).toEqual([]);
 
     fake.emit('compaction.started', { trigger: 'auto' });
-    fake.emit('compaction.cancelled', { cause: 'failed' });
+    fake.emit('compaction.cancelled', {});
     fake.emit('compaction.started', { trigger: 'auto' });
     fake.emit('compaction.completed', result);
     await flush();

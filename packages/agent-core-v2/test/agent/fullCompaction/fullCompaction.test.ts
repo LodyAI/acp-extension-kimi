@@ -627,12 +627,6 @@ describe('FullCompaction', () => {
     const canceled = ctx.once('compaction.cancelled');
     void ctx.rpc.cancelCompaction({});
     await canceled;
-    expect(ctx.newEvents()).toContainEqual(
-      expect.objectContaining({
-        event: 'compaction.cancelled',
-        args: expect.objectContaining({ cause: 'cancelled' }),
-      }),
-    );
 
     expect(trigger).toHaveBeenCalledWith(
       'PreCompact',
@@ -1160,11 +1154,7 @@ describe('FullCompaction', () => {
     expect(events).toEqual(
       expect.arrayContaining([
         expect.objectContaining({ type: '[wire]', event: 'full_compaction.cancel' }),
-        expect.objectContaining({
-          type: '[rpc]',
-          event: 'compaction.cancelled',
-          args: expect.objectContaining({ cause: 'failed' }),
-        }),
+        expect.objectContaining({ type: '[rpc]', event: 'compaction.cancelled' }),
         expect.objectContaining({ type: '[rpc]', event: 'error' }),
       ]),
     );
@@ -1751,12 +1741,6 @@ describe('FullCompaction', () => {
     await cancelled;
 
     const events = ctx.newEvents();
-    expect(events).toContainEqual(
-      expect.objectContaining({
-        event: 'compaction.cancelled',
-        args: expect.objectContaining({ cause: 'drift' }),
-      }),
-    );
     expect(countEvents(events, 'full_compaction.cancel')).toBe(1);
     expect(countEvents(events, 'compaction.started')).toBe(1);
     expect(countEvents(events, 'compaction.completed')).toBe(0);
@@ -1973,39 +1957,6 @@ describe('FullCompaction', () => {
       }),
     });
     await ctx.expectResumeMatches();
-  });
-
-  it('reports user abort when the user stops a turn waiting for compaction', async () => {
-    const releaseSummary = deferred<void>();
-    const generate: GenerateFn = requesterFromGenerateFn(async () => {
-      await releaseSummary.promise;
-      return textResult('Unused compaction summary.');
-    });
-    const ctx = testAgent({ generate });
-    ctx.configure({
-      provider: CATALOGUED_PROVIDER,
-      modelCapabilities: CATALOGUED_MODEL_CAPABILITIES,
-    });
-    ctx.appendExchange(1, 'old user', 'old assistant', 950_000);
-    const blocked = ctx.once('compaction.blocked');
-    const cancelled = ctx.once('compaction.cancelled');
-
-    try {
-      await ctx.rpc.prompt({ input: [{ type: 'text', text: 'Answer after compacting' }] });
-      await blocked;
-      await ctx.rpc.cancel({});
-      await cancelled;
-      const events = await ctx.untilTurnEnd();
-      expect(events).toContainEqual(
-        expect.objectContaining({
-          event: 'compaction.cancelled',
-          args: expect.objectContaining({ cause: 'user-abort' }),
-        }),
-      );
-      expect(countEvents(events, 'compaction.completed')).toBe(0);
-    } finally {
-      releaseSummary.resolve();
-    }
   });
 
   it('attributes background auto compaction to the turn that started it', async () => {

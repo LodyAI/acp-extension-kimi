@@ -1,7 +1,7 @@
 /* oxlint-disable typescript-eslint/no-unsafe-declaration-merging, eslint-plugin-import/namespace -- Event2 class+payload-interface declaration merging is the sanctioned event-declaration idiom. */
 import { z } from 'zod';
 
-import { AgentEvent2 } from '#/app/event/event2';
+import { AgentEvent2, type AgentDomainTrait } from '#/app/event/event2';
 import { defineState } from '#/state/state';
 import {
   ContextApplyCompaction,
@@ -84,16 +84,13 @@ export class CompactionBlocked extends AgentEvent2<CompactionBlockedPayload> {
 }
 export interface CompactionBlocked extends CompactionBlockedPayload {}
 
-export interface CompactionCancelledPayload {
-  readonly agentId: string;
-  readonly cause: 'cancelled' | 'user-abort' | 'drift' | 'failed';
-}
-
-export class CompactionCancelled extends AgentEvent2<CompactionCancelledPayload> {
+export class CompactionCancelled extends AgentEvent2<AgentDomainTrait> {
   static override readonly type = 'compaction.cancelled';
   static override readonly observable = true;
 }
-export interface CompactionCancelled extends CompactionCancelledPayload {}
+export interface CompactionCancelled {
+  readonly agentId: string;
+}
 
 export interface CompactionCompletedPayload {
   readonly agentId: string;
@@ -114,7 +111,7 @@ export interface CompactionBlockedEvent extends Omit<CompactionBlockedPayload, '
   readonly type: 'compaction.blocked';
 }
 
-export interface CompactionCancelledEvent extends Omit<CompactionCancelledPayload, 'agentId'> {
+export interface CompactionCancelledEvent {
   readonly type: 'compaction.cancelled';
 }
 

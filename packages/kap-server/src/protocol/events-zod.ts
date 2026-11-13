@@ -22,7 +22,6 @@ import { messageContentSchema } from './message';
 import type { HookResultPayload } from '@moonshot-ai/agent-core-v2/features/externalHooks/agent/agentExternalHooksService';
 import type {
   CompactionBlockedPayload,
-  CompactionCancelledPayload,
   CompactionCompletedPayload,
   CompactionStartedPayload,
 } from '@moonshot-ai/agent-core-v2/agent/fullCompaction/compactionOps';
@@ -953,8 +952,7 @@ export const compactionBlockedEventSchema = z.object({
 export const compactionCancelledEventSchema = z.object({
   type: z.literal('compaction.cancelled'),
   agentId: z.string(),
-  cause: z.enum(['cancelled', 'user-abort', 'drift', 'failed']),
-}) satisfies z.ZodType<CompactionCancelledPayload>;
+});
 
 export const compactionCompletedEventSchema = z.object({
   type: z.literal('compaction.completed'),

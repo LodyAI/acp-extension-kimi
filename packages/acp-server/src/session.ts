@@ -462,15 +462,15 @@ export class AcpSession {
       // Compaction runs as a background LLM task outside any turn, so these
       // are not turn-scoped; the subscription is already agent-grained (this
       // session's main agent), which keeps other sessions' events out.
+      // A blocked turn waits for the same compaction to finish.
       events.on('compaction.started', (event) => {
         this.onCompactionStarted(event);
       }),
       events.on('compaction.completed', (event) => {
         this.onCompactionCompleted(event);
       }),
-      // A blocked turn waits for the same compaction to finish.
-      events.on('compaction.cancelled', (event) => {
-        this.onCompactionCancelled(event);
+      events.on('compaction.cancelled', () => {
+        this.onCompactionCancelled();
       }),
     );
     // Session-scope stream: title changes surface as `session_info_update`.
@@ -1147,24 +1147,16 @@ export class AcpSession {
     });
   }
 
-  private onCompactionCancelled(event: AgentEventPayloads['compaction.cancelled']): void {
+  private onCompactionCancelled(): void {
     const active = this.activeCompaction;
     if (active === undefined) return;
     this.activeCompaction = undefined;
-    const cause = event.cause ?? 'cancelled';
-    const cancellationReason = cause === 'cancelled' || cause === 'user-abort' ? cause : undefined;
-    const titles = {
-      cancelled: 'Context compaction cancelled',
-      'user-abort': 'Context compaction stopped by user',
-      drift: 'Context changed during compaction',
-      failed: 'Context compaction failed',
-    };
-    const title = titles[cause];
+    const title = 'Compaction cancelled';
     const activity: LodyActivityMeta = {
       version: 1,
       kind: 'context_compaction',
       automatic: active.automatic,
-      failureReason: cancellationReason === undefined ? title : undefined,
+      failureReason: title,
     };
     this.emit({
       sessionId: this.sessionId,
@@ -1173,8 +1165,7 @@ export class AcpSession {
         toolCallId: active.id,
         title,
         status: 'failed',
-        // ACP v1 has no cancelled tool status. Preserve the cancellation in activity metadata.
-        _meta: { lody: { activity: { ...activity, cancellationReason } } },
+        _meta: { lody: { activity } },
       },
     });
   }
