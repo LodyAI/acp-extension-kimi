@@ -149,6 +149,7 @@ export const compactionBlockedEventSchema = z.object({
 export const compactionCancelledEventSchema = z.object({
   type: z.literal('compaction.cancelled'),
   time: z.number().optional(),
+  cause: z.enum(['cancelled', 'user-abort', 'drift', 'failed']).optional(),
 });
 
 /**

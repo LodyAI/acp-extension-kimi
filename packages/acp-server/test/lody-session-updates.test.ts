@@ -481,6 +481,7 @@ describe('fork positions on the wire', () => {
 });
 
 describe('context compaction tool calls', () => {
+  const result = { result: { tokensBefore: 900, tokensAfter: 300 } };
   const compactionUpdates = (updates: readonly SessionNotification[]) =>
     updates
       .map((entry) => entry.update)
@@ -490,16 +491,21 @@ describe('context compaction tool calls', () => {
             ?.kind === 'context_compaction',
       ) as Array<{ sessionUpdate: string; toolCallId: string; status: string }>;
 
-  it('keeps one tool call when a compaction already in flight is re-announced', async () => {
-    // History merges tool calls by id, so a fresh id per announcement rendered
-    // one compaction as n stacked "Compacting context" rows, and only the last
-    // id was still correlated when the terminal event landed.
+  it('keeps one running tool call through blocked and repeated start events', async () => {
     const { fake, updates } = await startSession();
 
     fake.emit('compaction.started', { trigger: 'auto' });
+    fake.emit('compaction.blocked', { turnId: 1 });
     fake.emit('compaction.started', { trigger: 'auto' });
-    fake.emit('compaction.started', { trigger: 'auto' });
-    fake.emit('compaction.completed', { result: { tokensBefore: 900, tokensAfter: 300 } });
+    fake.emit('compaction.blocked', { turnId: 1 });
+    await flush();
+    expect(compactionUpdates(updates)).toMatchObject([
+      { sessionUpdate: 'tool_call', status: 'in_progress' },
+    ]);
+
+    fake.emit('compaction.completed', result);
+    fake.emit('compaction.completed', result);
+    fake.emit('compaction.cancelled', { cause: 'failed' });
     await flush();
 
     const compaction = compactionUpdates(updates);
@@ -509,16 +515,58 @@ describe('context compaction tool calls', () => {
       sessionUpdate: 'tool_call_update',
       status: 'completed',
       toolCallId: compaction[0]?.toolCallId,
+      _meta: { lody: { activity: { automatic: true, usedTokensBefore: 900, usedTokensAfter: 300 } } },
     });
   });
 
-  it('opens a new tool call for the compaction that follows a settled one', async () => {
+  it.each([
+    ['cancelled', 'Context compaction cancelled'],
+    ['user-abort', 'Context compaction stopped by user'],
+    ['failed', 'Context compaction failed'],
+    ['drift', 'Context changed during compaction'],
+    [undefined, 'Context compaction cancelled'],
+  ])('settles %s on the original tool call', async (cause, title) => {
+    const { fake, updates } = await startSession();
+    const cancelled = cause === 'cancelled' || cause === 'user-abort' || cause === undefined;
+
+    fake.emit('compaction.started', { trigger: 'manual' });
+    fake.emit('compaction.cancelled', { cause });
+    fake.emit('compaction.cancelled', { cause });
+    fake.emit('compaction.completed', result);
+    await flush();
+
+    const compaction = compactionUpdates(updates);
+    expect(compaction).toHaveLength(2);
+    expect(compaction[1]).toMatchObject({
+      sessionUpdate: 'tool_call_update',
+      toolCallId: compaction[0]?.toolCallId,
+      title,
+      status: 'failed',
+      _meta: {
+        lody: {
+          activity: {
+            automatic: false,
+            cancellationReason: cancelled ? (cause ?? 'cancelled') : undefined,
+            failureReason: cancelled ? undefined : title,
+          },
+        },
+      },
+    });
+  });
+
+  it('ignores events without an opening and assigns a fresh ID to a later compaction', async () => {
     const { fake, updates } = await startSession();
 
-    fake.emit('compaction.started', { trigger: 'auto' });
     fake.emit('compaction.blocked', {});
+    fake.emit('compaction.completed', result);
+    fake.emit('compaction.cancelled', { cause: 'failed' });
+    await flush();
+    expect(compactionUpdates(updates)).toEqual([]);
+
     fake.emit('compaction.started', { trigger: 'auto' });
-    fake.emit('compaction.completed', { result: { tokensBefore: 900, tokensAfter: 300 } });
+    fake.emit('compaction.cancelled', { cause: 'failed' });
+    fake.emit('compaction.started', { trigger: 'auto' });
+    fake.emit('compaction.completed', result);
     await flush();
 
     const compaction = compactionUpdates(updates);
@@ -528,7 +576,9 @@ describe('context compaction tool calls', () => {
       'in_progress',
       'completed',
     ]);
+    expect(compaction[1]?.toolCallId).toBe(compaction[0]?.toolCallId);
     expect(compaction[2]?.toolCallId).not.toBe(compaction[0]?.toolCallId);
+    expect(compaction[3]?.toolCallId).toBe(compaction[2]?.toolCallId);
   });
 });
 

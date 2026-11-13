@@ -646,6 +646,7 @@ describe('event hub', () => {
     const started = { type: 'compaction.started', trigger: 'auto' };
     const blocked = { type: 'compaction.blocked', turnId: 2 };
     const cancelled = { type: 'compaction.cancelled' };
+    const failed = { type: 'compaction.cancelled', cause: 'failed' };
     const completed = {
       type: 'compaction.completed',
       result: { summary: 's', compactedCount: 3, tokensBefore: 100, tokensAfter: 40 },
@@ -655,6 +656,7 @@ describe('event hub', () => {
     channel.emit(0, started);
     channel.emit(0, blocked);
     channel.emit(0, cancelled);
+    channel.emit(0, failed);
     channel.emit(0, completed);
     channel.emit(0, { type: 'tool.progress', turnId: 1, toolCallId: 'tc1' }); // missing update
     channel.emit(0, { type: 'unregistered.type', turnId: 1 });
@@ -664,7 +666,7 @@ describe('event hub', () => {
     expect(seen.progress).toEqual([progress]);
     expect(seen.started).toEqual([started]);
     expect(seen.blocked).toEqual([blocked]);
-    expect(seen.cancelled).toEqual([cancelled]);
+    expect(seen.cancelled).toEqual([cancelled, failed]);
     expect(seen.completed).toEqual([completed]);
     expect(errors).toHaveLength(1);
     expect(errors[0]).toBeInstanceOf(KlientValidationError);

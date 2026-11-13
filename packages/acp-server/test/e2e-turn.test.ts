@@ -1252,6 +1252,57 @@ describe('acp-server builtin slash commands (local execution, no LLM turn)', () 
     expect(completion._meta.lody.activity.usedTokensAfter).toBeTypeOf('number');
   }, 30_000);
 
+  it('settles one ACP activity when auto compaction blocks a real turn', async () => {
+    const c = await boot();
+    const sessionId = await newSession(c);
+    const session = getLiveSessionById(c.server.core.accessor, sessionId);
+    const agent = session?.accessor.get(IAgentLifecycleService).handleOf('main');
+    const bus = agent?.accessor.get(IEventBus);
+    if (!bus) throw new Error('Missing main agent event bus');
+    const blocked: unknown[] = [];
+    const subscription = bus.subscribe('compaction.blocked', (event) => {
+      blocked.push(event);
+    });
+
+    try {
+      // Populate the next turn's context with an assistant reply above the fake
+      // model's compaction threshold. The compacted reply can then be dropped.
+      scripted!.mockNextProviderResponse({
+        parts: [{ type: 'text', text: 'long assistant output '.repeat(4_000) }],
+        usage: { inputOther: 100, output: 8_000, inputCacheRead: 0, inputCacheCreation: 0 },
+      });
+      await c.send('session/prompt', { sessionId, prompt: [{ type: 'text', text: 'Start' }] });
+      scripted!.mockNextText('compaction summary');
+      scripted!.mockNextText('reply after compaction');
+      const response = await c.send('session/prompt', {
+        sessionId,
+        prompt: [{ type: 'text', text: 'Continue' }],
+      });
+      expect(response).toEqual({ stopReason: 'end_turn' });
+      expect(blocked).toHaveLength(1);
+
+      type Update = {
+        toolCallId?: string;
+        _meta?: { lody?: { activity?: { kind?: string } } };
+      };
+      const compactions = c
+        .sessionUpdates()
+        .map((m) => (m.params as { update: Update }).update)
+        .filter((u) => u._meta?.lody?.activity?.kind === 'context_compaction');
+      expect(compactions).toMatchObject([
+        { sessionUpdate: 'tool_call', status: 'in_progress' },
+        {
+          sessionUpdate: 'tool_call_update',
+          toolCallId: compactions[0]?.toolCallId,
+          status: 'completed',
+          _meta: { lody: { activity: { automatic: true } } },
+        },
+      ]);
+    } finally {
+      subscription.dispose();
+    }
+  }, 30_000);
+
   async function waitForCompletedCompaction(
     c: TestClient,
     timeoutMs = 10_000,
