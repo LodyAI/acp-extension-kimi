@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from 'vitest';
 import {
   clearManagedKimiCodeConfig,
+  OAuthUnauthorizedError,
   resolveKimiCodeOAuthKey,
   resolveKimiCodeRuntimeAuth,
 } from '@moonshot-ai/kimi-code-oauth';
@@ -12,8 +13,10 @@ import {
 import { DisposableStore } from '#/_base/di/lifecycle';
 import { createServices, type TestInstantiationService } from '#/_base/di/test';
 import { Emitter } from '#/_base/event';
+import { Error2 } from '#/errors';
 import { IAuthSummaryService, IOAuthService, IOAuthToolkit } from '#/app/auth/auth';
 import { AuthSummaryService, OAuthService } from '#/app/auth/authService';
+import { AuthErrors } from '#/app/auth/errors';
 import {
   SERVICES_SECTION,
   servicesFromToml,
@@ -295,6 +298,37 @@ describe('OAuthService', () => {
     vi.stubGlobal('fetch', fetchMock);
     return { fetchMock, releaseFetch };
   }
+
+  it('maps a rejected OAuth token to auth.login_required with its cause', async () => {
+    const cause = new OAuthUnauthorizedError('Stored token was rejected; re-login required.');
+    toolkit.tokenProvider.mockReturnValue({
+      getAccessToken: async () => {
+        throw cause;
+      },
+    });
+    const provider = createService().resolveTokenProvider(OAUTH_PROVIDER);
+    if (provider === undefined) throw new Error('expected an OAuth token provider');
+
+    const error = await provider.getAccessToken().catch((error: unknown) => error);
+
+    expect(error).toBeInstanceOf(Error2);
+    expect(error).toMatchObject({ code: AuthErrors.codes.AUTH_LOGIN_REQUIRED, cause });
+  });
+
+  it('rethrows unrecognized token failures without guessing an auth category', async () => {
+    const cause = new Error('token storage failed');
+    toolkit.tokenProvider.mockReturnValue({
+      getAccessToken: async () => {
+        throw cause;
+      },
+    });
+    const provider = createService().resolveTokenProvider(OAUTH_PROVIDER);
+    if (provider === undefined) throw new Error('expected an OAuth token provider');
+
+    const error = await provider.getAccessToken().catch((error: unknown) => error);
+
+    expect(error).toBe(cause);
+  });
 
   it('startLogin resolves a device-code flow and flips to authenticated on success', async () => {
     stubManagedModelsFetch();
