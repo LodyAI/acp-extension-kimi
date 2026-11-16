@@ -16,8 +16,14 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { getLiveSessionById, IAgentLifecycleService, IEventBus } from '@moonshot-ai/agent-core-v2';
+import {
+  getLiveSessionById,
+  IAgentLifecycleService,
+  IEventBus,
+  IOAuthToolkit,
+} from '@moonshot-ai/agent-core-v2';
 import { ToolProgress } from '@moonshot-ai/agent-core-v2/agent/toolExecutor/toolExecutorEvents';
+import { OAuthUnauthorizedError } from '@moonshot-ai/kimi-code-oauth';
 import type { SessionUsageUpdate } from 'acp-extension-core';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
@@ -136,6 +142,58 @@ describe('acp-server real prompt turn (scripted LLM)', () => {
     await c.send('session/close', { sessionId: first.sessionId });
     await c.send('session/resume', { sessionId: first.sessionId, cwd: homeDir });
     expect(await prompt(first.sessionId)).not.toContain('Loaded instructions');
+  }, 30_000);
+
+  it('rejects an OAuth token failure with auth_required instead of a silent end_turn', async () => {
+    homeDir = await mkdtemp(join(tmpdir(), 'acp-oauth-turn-'));
+    await writeFile(
+      join(homeDir, 'config.toml'),
+      `defaultModel = "fake"
+
+[providers.test-oauth]
+type = "kimi"
+baseUrl = "https://api.example.com"
+
+[providers.test-oauth.oauth]
+storage = "file"
+key = "test-key"
+
+[models.fake]
+name = "fake-model"
+protocol = "openai"
+provider = "test-oauth"
+maxContextSize = 8192
+`,
+      'utf8',
+    );
+    const tokenError = new OAuthUnauthorizedError('Stored token was rejected; re-login required.');
+    const toolkit = {
+      getCachedAccessToken: async () => 'stale-token',
+      getManagedUsage: async () => ({ kind: 'error', message: 'not configured' }),
+      tokenProvider: () => ({
+        getAccessToken: async () => {
+          throw tokenError;
+        },
+      }),
+    } as unknown as IOAuthToolkit;
+    scripted = createScriptedProvider();
+    client = await createTestClient({
+      homeDir,
+      extraSeeds: [scripted.seed, [IOAuthToolkit, toolkit]],
+    });
+    const c = client;
+    await c.send('initialize', { protocolVersion: 1, clientCapabilities: {} });
+    const created = (await c.send('session/new', { cwd: homeDir, mcpServers: [] })) as {
+      sessionId: string;
+    };
+
+    await expect(
+      c.send('session/prompt', {
+        sessionId: created.sessionId,
+        prompt: [{ type: 'text', text: 'Run a synthetic turn' }],
+      }),
+    ).rejects.toThrow(/"code":-32000/);
+    expect(scripted.callCount()).toBe(0);
   }, 30_000);
 
   it('drives initialize → new → prompt and streams the assistant text as agent_message_chunk', async () => {
