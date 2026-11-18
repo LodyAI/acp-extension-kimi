@@ -28,6 +28,7 @@ import { SessionStateService } from '#/session/state/sessionStateService';
 import {
   workspaceContextAdditionalDirsKey,
   workspaceContextWorkDirKey,
+  workspaceContextRequestAdditionalDirsKey,
 } from '#/session/workspaceContext/workspaceContextService';
 import type { ExecutableToolContext, ExecutableToolResult, ToolExecution } from '#/tool/toolContract';
 import {
@@ -621,6 +622,7 @@ describe('BashTool', () => {
     const sessionState = new SessionStateService();
     sessionState.contributeState(workspaceContextWorkDirKey);
     sessionState.contributeState(workspaceContextAdditionalDirsKey);
+    sessionState.contributeState(workspaceContextRequestAdditionalDirsKey);
     sessionState.set(workspaceContextWorkDirKey, ctx.cwd);
     const shadow = new AgentWorkspaceContextService(sessionState, {
       current: environment,
