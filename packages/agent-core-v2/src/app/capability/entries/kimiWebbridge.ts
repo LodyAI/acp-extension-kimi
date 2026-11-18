@@ -1,5 +1,5 @@
 import { constants } from 'node:fs';
-import { access, chmod, mkdir, mkdtemp, rename, rm } from 'node:fs/promises';
+import { access, chmod, copyFile, mkdir, mkdtemp, rename, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
@@ -9,16 +9,22 @@ import {
   resolveKimiRegion,
 } from '@moonshot-ai/kimi-code-oauth';
 
+import { Error2 } from '#/errors';
+
+import { installResolvedMarketplacePlugin } from '../../plugin/pluginService';
+import { CapabilityErrors } from '../errors';
 import { downloadToFile, runCommand } from '../host';
 import type {
   CapabilityDetectResult,
   CapabilityEntry,
+  CapabilityInstallOptions,
   CapabilityInstallReporter,
   CapabilityStep,
 } from '../types';
 import type { CapabilityEntryContext } from './context';
 
-const PLUGIN_ID = 'kimi-webbridge';
+const PLUGIN_ID = 'kimi-browser-extension';
+const LEGACY_PLUGIN_ID = 'kimi-webbridge';
 const PLUGIN_ZIP_PATH = 'plugins/official/kimi-webbridge.zip';
 const BINARY_CDN_PATH = 'webbridge/latest/releases';
 const DEFAULT_DAEMON_BASE_URL = 'http://127.0.0.1:10086';
@@ -138,7 +144,9 @@ export function createKimiWebbridgeEntry(ctx: CapabilityEntryContext): Capabilit
     });
 
     const installed = await ctx.plugins.listPlugins();
-    const plugin = installed.find((p) => p.id === PLUGIN_ID);
+    const plugin =
+      installed.find((p) => p.id === PLUGIN_ID) ??
+      installed.find((p) => p.id === LEGACY_PLUGIN_ID);
     const mcpGap =
       plugin !== undefined && plugin.enabledMcpServerCount < plugin.mcpServerCount
         ? `mcp ${plugin.enabledMcpServerCount}/${plugin.mcpServerCount} enabled`
@@ -192,11 +200,59 @@ export function createKimiWebbridgeEntry(ctx: CapabilityEntryContext): Capabilit
     throw new Error(`WebBridge daemon did not come up on ${baseUrl} — check ~/.kimi-webbridge/logs`);
   }
 
-  async function install(report: CapabilityInstallReporter): Promise<string | undefined> {
+  async function waitForDaemonStopped(): Promise<void> {
+    let unavailableResponses = 0;
+    for (let attempt = 0; attempt < START_POLL_ATTEMPTS; attempt += 1) {
+      const status = await fetchDaemonStatus();
+      if (status === undefined) {
+        unavailableResponses += 1;
+        if (unavailableResponses >= 2) return;
+      } else {
+        unavailableResponses = 0;
+      }
+      await new Promise((resolve) => {
+        setTimeout(resolve, START_POLL_INTERVAL_MS);
+      });
+    }
+    throw new Error2(
+      CapabilityErrors.codes.CAPABILITY_PROCESS_CONTROL_FAILED,
+      'WebBridge daemon did not stop; retry the update',
+    );
+  }
+
+  async function install(
+    report: CapabilityInstallReporter,
+    options: CapabilityInstallOptions = {},
+  ): Promise<string | undefined> {
     const asset = binaryAssetName(ctx.platform, ctx.arch);
     if (asset === undefined) {
       throw new Error(`kimi-webbridge is not supported on ${ctx.platform}/${ctx.arch}`);
     }
+
+    const defaultCatalog = await ctx.marketplace.isDefaultMarketplace().catch(() => false);
+    const marketplace = defaultCatalog
+      ? await ctx.marketplace.listMarketplace().catch(() => undefined)
+      : undefined;
+    const entry = marketplace?.plugins.find((candidate) => candidate.id === PLUGIN_ID);
+    if (marketplace !== undefined && entry === undefined) {
+      throw new Error(`Marketplace plugin "${PLUGIN_ID}" was not found in the current catalog`);
+    }
+    const resolved = marketplace === undefined
+      ? {
+          source: `${kimiRegionProfile((await ctx.resolveRegion?.()) ?? resolveKimiRegion()).cdnBase}/${PLUGIN_ZIP_PATH}`,
+          version: undefined,
+          sha256sum: undefined,
+          catalogId: PLUGIN_ID,
+          marketplaceSource: undefined,
+          origin: 'marketplace' as const,
+          expectedPluginId: PLUGIN_ID,
+          fetchImpl: fetch,
+        }
+      : await ctx.marketplace.resolveInstall(PLUGIN_ID, entry!.version, entry!.sha256sum);
+    const installed = await ctx.plugins.listPlugins();
+    const migrateFrom = installed.some((plugin) => plugin.id === LEGACY_PLUGIN_ID)
+      ? LEGACY_PLUGIN_ID
+      : undefined;
 
     const before = await detect();
     const stepStates = new Map(before.steps.map((step) => [step.id, step.state]));
@@ -205,27 +261,87 @@ export function createKimiWebbridgeEntry(ctx: CapabilityEntryContext): Capabilit
       .every((step) => step.state === 'ok');
     const standaloneSkillMigrationPending =
       stepStates.get('standalone-skill-migration') === 'missing';
-    if (stepStates.get('daemon-binary') !== 'ok' || readyBefore) {
-      await installBinary(report, asset);
+    const installNewBinary =
+      stepStates.get('daemon-binary') !== 'ok' ||
+      readyBefore ||
+      (ctx.platform === 'win32' && options.stopRunningProcesses === true);
+    const stopRunningDaemon =
+      ctx.platform === 'win32' &&
+      installNewBinary &&
+      stepStates.get('daemon') === 'ok' &&
+      (await exists(binPath));
+    if (stopRunningDaemon && options.stopRunningProcesses !== true) {
+      throw new Error2(
+        CapabilityErrors.codes.CAPABILITY_PROCESSES_RUNNING,
+        'WebBridge daemon must be stopped before updating its binary',
+      );
     }
-
-    const status = await fetchDaemonStatus();
-    if (status?.running !== true) {
-      report('daemon');
-      const started = await runCommand(ctx.hostProcess, binPath, ['start'], {
-        timeout: START_TIMEOUT_MS,
-      });
-      if (started.code !== 0) {
-        throw new Error(`kimi-webbridge start failed: ${started.stderr || started.stdout}`);
+    const staging = installNewBinary ? await downloadBinary(report, asset) : undefined;
+    const backup = stopRunningDaemon
+      ? `${binPath}.${process.pid}.${Date.now()}.backup`
+      : undefined;
+    let recoveryAttempted = false;
+    try {
+      if (backup !== undefined) await copyFile(binPath, backup, constants.COPYFILE_EXCL);
+      if (stopRunningDaemon) {
+        report('stop-processes');
+        const stopped = await runCommand(ctx.hostProcess, binPath, ['stop'], {
+          timeout: START_TIMEOUT_MS,
+        });
+        if (stopped.code !== 0) {
+          throw new Error2(
+            CapabilityErrors.codes.CAPABILITY_PROCESS_CONTROL_FAILED,
+            `kimi-webbridge stop failed: ${stopped.stderr || stopped.stdout}`,
+          );
+        }
+        await waitForDaemonStopped();
       }
-      await waitForDaemon();
+      try {
+        if (staging !== undefined) await installBinary(staging);
+        const status = await fetchDaemonStatus();
+        if (status?.running !== true) {
+          report('daemon');
+          const started = await runCommand(ctx.hostProcess, binPath, ['start'], {
+            timeout: START_TIMEOUT_MS,
+          });
+          if (started.code !== 0) {
+            throw new Error(`kimi-webbridge start failed: ${started.stderr || started.stdout}`);
+          }
+          await waitForDaemon();
+        }
+      } catch (error) {
+        if (backup !== undefined) {
+          recoveryAttempted = true;
+          const restored = await rename(backup, binPath).then(
+            () => true,
+            () => false,
+          );
+          if (restored) {
+            await runCommand(ctx.hostProcess, binPath, ['start'], {
+              timeout: START_TIMEOUT_MS,
+            }).catch(() => undefined);
+          }
+        }
+        throw error;
+      }
+    } finally {
+      if (staging !== undefined) await rm(staging, { force: true }).catch(() => undefined);
+      if (backup !== undefined && !recoveryAttempted) {
+        await rm(backup, { force: true }).catch(() => undefined);
+      }
     }
 
     report('skill');
-    const region = (await ctx.resolveRegion?.()) ?? resolveKimiRegion();
-    const summary = await ctx.plugins.installPlugin({
-      source: `${kimiRegionProfile(region).cdnBase}/${PLUGIN_ZIP_PATH}`,
-    });
+    const summary = await installResolvedMarketplacePlugin(
+      ctx.plugins,
+      {
+        marketplaceId: PLUGIN_ID,
+        expectedVersion: resolved.version,
+        migrateFrom,
+      },
+      resolved,
+      LEGACY_PLUGIN_ID,
+    );
     if (!summary.enabled) {
       await ctx.plugins.setPluginEnabled({ id: PLUGIN_ID, enabled: true });
     }
@@ -245,10 +361,10 @@ export function createKimiWebbridgeEntry(ctx: CapabilityEntryContext): Capabilit
       : undefined;
   }
 
-  async function installBinary(
+  async function downloadBinary(
     report: CapabilityInstallReporter,
     asset: string,
-  ): Promise<void> {
+  ): Promise<string> {
     report('download', 0);
     const url = kimiCdnContentUrl(`${BINARY_CDN_PATH}/${asset}`);
     const staging = path.join(
@@ -264,15 +380,20 @@ export function createKimiWebbridgeEntry(ctx: CapabilityEntryContext): Capabilit
         },
         ctx.fetchImpl,
       );
-      await mkdir(binDir, { recursive: true });
-      await rename(staging, binPath).catch(async (error: NodeJS.ErrnoException) => {
-        if (error.code !== 'EXDEV') throw error;
-        await renameAcrossDevicesFallback(staging, binPath);
-      });
-      if (ctx.platform !== 'win32') await chmod(binPath, 0o755);
-    } finally {
+      return staging;
+    } catch (error) {
       await rm(staging, { force: true }).catch(() => undefined);
+      throw error;
     }
+  }
+
+  async function installBinary(staging: string): Promise<void> {
+    await mkdir(binDir, { recursive: true });
+    await rename(staging, binPath).catch(async (error: NodeJS.ErrnoException) => {
+      if (error.code !== 'EXDEV') throw error;
+      await renameAcrossDevicesFallback(staging, binPath);
+    });
+    if (ctx.platform !== 'win32') await chmod(binPath, 0o755);
   }
 
   return {

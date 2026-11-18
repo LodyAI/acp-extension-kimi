@@ -5,20 +5,19 @@ import { defineState } from '#/state/state';
 import { isPlainRecord } from '#/_base/utils/canonical-args';
 import { IAgentScopeContext } from '#/agent/scopeContext/scopeContext';
 import { IAgentStateService } from '#/agent/state/agentState';
-import { IAgentTaskService, type AgentTaskInfo, type AgentTaskNotificationContext } from '#/agent/task/task';
-import { IAgentContextMemoryService } from '#/agent/contextMemory/contextMemory';
+import { historyEntryFromContext } from '#/agent/loop/history';
 import { USER_PROMPT_ORIGIN } from '#/agent/contextMemory/types';
 import {
   IAgentFullCompactionService,
   type FullCompactionTask,
 } from '#/agent/fullCompaction/fullCompaction';
 import type { CompactionResult } from '#/agent/fullCompaction/types';
-import { IAgentLoopService, type AfterStepContext } from '#/agent/loop/loop';
+import { IAgentLoopService, type AfterStepContext, type PromptSubmitContext } from '#/agent/loop/loop';
 import { TurnStarted } from '#/agent/loop/turnEvents';
 import { TurnEnded } from '#/agent/loop/turnOps';
-import { type PromptSubmitContext } from '#/agent/loop/loop';
 import { PromptQueued } from '#/agent/prompt/promptEvents';
-import { TaskNotified, TaskStarted } from '#/agent/task/taskOps';
+import type { AgentTaskInfo } from '#/agent/task/task';
+import { TaskStarted } from '#/agent/task/taskOps';
 import {
   PermissionApprovalRequested,
   PermissionApprovalResolved,
@@ -29,13 +28,16 @@ import type { ExecutableToolResult } from '#/tool/toolContract';
 import type { ResolvedToolExecutionHookContext, ToolDidExecuteContext } from '#/agent/toolExecutor/toolHooks';
 import { denyToolExecution } from '#/agent/toolExecutor/beforeToolExecuteEvent';
 import { IAgentToolExecutorService } from '#/agent/toolExecutor/toolExecutor';
+import { legacyDidExecuteContext, registerLegacyStarting } from '#/agent/toolExecutor/legacyHooks';
 import { toKimiErrorPayload } from '#/errors';
+import { fromCorePart } from '#human/message';
+import { MAIN_AGENT_ID } from '#/session/agentLifecycle/agentLifecycle';
 import { ISessionContext } from '#/session/sessionContext/sessionContext';
 import { ISessionMetadata } from '#/session/sessionMetadata/sessionMetadata';
 import { IEventDispatcher } from '#/state/eventDispatcher';
 
 import { IAgentExternalHooksService } from './agentExternalHooks';
-import { IExternalHooksRunnerService } from '../app/externalHooksRunner';
+import { IExternalHooksRunnerService, type HookExecutionError } from '../app/externalHooksRunner';
 import type { HookMatcherValue } from '../internal/types';
 import {
   renderUserPromptHookBlockResult,
@@ -65,12 +67,19 @@ export const externalHooksStopHookContinuationUsedKey = defineState<boolean>(
   () => false,
 );
 
+type StepFacts = Pick<AfterStepContext, 'turnId' | 'step' | 'firstStepOfTurn' | 'finishReason' | 'usage'>;
+
 export class AgentExternalHooksService extends Service implements IAgentExternalHooksService {
   declare readonly _serviceBrand: undefined;
 
+  private readonly stepFactsByTurn = new Map<number, StepFacts>();
+  private readonly stopHookContinuationTurnIds = new Set<number>();
+  private readonly stopHookAbortController = new AbortController();
+  private stopHookQueue: Promise<void> = Promise.resolve();
+
   constructor(
     @IExternalHooksRunnerService private readonly runner: IExternalHooksRunnerService,
-    @IAgentContextMemoryService private readonly context: IAgentContextMemoryService,
+    @IAgentLoopService private readonly loop: IAgentLoopService,
     @IEventBus private readonly eventBus: IEventBus,
     @IInstantiationService private readonly instantiation: IInstantiationService,
     @ISessionContext private readonly sessionContext: ISessionContext,
@@ -81,6 +90,13 @@ export class AgentExternalHooksService extends Service implements IAgentExternal
   ) {
     super();
     this.states.contributeState(externalHooksStopHookContinuationUsedKey);
+    this._register({
+      dispose: () => {
+        this.stopHookAbortController.abort();
+        this.stepFactsByTurn.clear();
+        this.stopHookContinuationTurnIds.clear();
+      },
+    });
     void this.sessionMetadata
       .read()
       .then((meta) => {
@@ -103,6 +119,8 @@ export class AgentExternalHooksService extends Service implements IAgentExternal
 
   private sessionTitle: string | undefined;
 
+  private hookFailureWarned = false;
+
   private withSessionFacts(inputData: Record<string, unknown>): Record<string, unknown> {
     return { sessionTitle: this.sessionTitle, ...inputData };
   }
@@ -115,6 +133,11 @@ export class AgentExternalHooksService extends Service implements IAgentExternal
     this.states.set(externalHooksStopHookContinuationUsedKey, value);
   }
 
+  private async hookCwd(): Promise<string> {
+    await this.sessionMetadata.ready;
+    return this.sessionMetadata.effectiveCwd;
+  }
+
   private fireAndForget(
     event: string,
     inputData: Record<string, unknown>,
@@ -122,16 +145,39 @@ export class AgentExternalHooksService extends Service implements IAgentExternal
     signal?: AbortSignal,
   ): void {
     try {
-      void this.runner.fireAndForgetTrigger(event, {
-        matcherValue,
-        signal,
-        sessionId: this.sessionContext.sessionId,
-        inputData: this.withSessionFacts(inputData),
-      });
+      void this.hookCwd()
+        .then((cwd) =>
+          this.runner.fireAndForgetTrigger(event, {
+            matcherValue,
+            signal,
+            cwd,
+            sessionId: this.sessionContext.sessionId,
+            inputData: this.withSessionFacts(inputData),
+          }),
+        )
+        .catch(() => undefined);
     } catch {}
   }
 
+  private warnHookFailure(failure: HookExecutionError): void {
+    if (this.scopeContext.agentId !== MAIN_AGENT_ID) return;
+    if (failure.sessionId !== undefined && failure.sessionId !== this.sessionContext.sessionId) {
+      return;
+    }
+    if (this.hookFailureWarned) return;
+    this.hookFailureWarned = true;
+    void this.dispatcher.dispatch(
+      new HookResult({
+        agentId: this.scopeContext.agentId,
+        hookEvent: failure.event,
+        content: `A ${failure.event} hook failed to execute: ${failure.message}. Hooks always run on this local machine; check that the hook command works locally. Later hook failures in this session are logged without another warning.`,
+      }),
+    );
+  }
+
   private registerListeners(): void {
+    this._register(this.runner.onDidHookError((failure) => this.warnHookFailure(failure)));
+
     this.registerPermissionHooks();
 
     this.registerToolHooks(
@@ -152,26 +198,19 @@ export class AgentExternalHooksService extends Service implements IAgentExternal
       this.instantiation.invokeFunction((accessor) => accessor.get(IAgentFullCompactionService)),
     );
 
-    this.registerTaskHooks(
-      this.instantiation.invokeFunction((accessor) => accessor.get(IAgentTaskService)),
-    );
+    this.registerTaskHooks();
   }
 
   private registerToolHooks(toolExecutor: IAgentToolExecutorService): void {
-    this._register(
-      toolExecutor.onBeforeExecuteTool(async (event) => {
-        const reason = await this.runPreToolUse(event);
-        if (reason !== undefined) {
-          event.veto(denyToolExecution(reason));
-        }
-      }),
-    );
-    this._register(
-      toolExecutor.hooks.onDidExecuteTool.register('externalHooks', async (ctx, next) => {
-        this.notifyPostToolUse(ctx);
-        await next();
-      }),
-    );
+    this._register(registerLegacyStarting(toolExecutor, async (event) => {
+      const reason = await this.runPreToolUse(event);
+      if (reason !== undefined) event.veto(denyToolExecution(reason));
+    }));
+    this._register(toolExecutor.registerHook({
+      afterExecute: (context) => {
+        this.notifyPostToolUse(legacyDidExecuteContext(context));
+      },
+    }));
   }
 
   private registerPermissionHooks(): void {
@@ -203,7 +242,11 @@ export class AgentExternalHooksService extends Service implements IAgentExternal
       this.eventBus.subscribe(PromptQueued, (e) => {
         this.fireAndForget(
           'UserPromptQueued',
-          { promptId: e.promptId, prompt: e.content, queueLength: e.queueLength },
+          {
+            promptId: e.promptId,
+            prompt: e.content.map((part) => fromCorePart(part)),
+            queueLength: e.queueLength,
+          },
           e.content,
         );
       }),
@@ -220,6 +263,9 @@ export class AgentExternalHooksService extends Service implements IAgentExternal
   }
 
   private notifyTurnStarted(event: TurnStarted): void {
+    if (event.origin.kind === 'system_trigger' && event.origin.name === 'stop_hook') {
+      this.stopHookContinuationTurnIds.add(event.turnId);
+    }
     this.fireAndForget(
       'TurnStarted',
       {
@@ -236,25 +282,13 @@ export class AgentExternalHooksService extends Service implements IAgentExternal
     this._register(
       loop.hooks.onDidFinishStep.register('externalHooks', async (ctx, next) => {
         await next();
-        if (
-          ctx.finishReason === 'tool_calls' ||
-          ctx.finishReason === 'filtered' ||
-          loop.snapshot().hasPendingRequests
-        ) {
-          return;
-        }
-        const reason = await this.runStop(ctx);
-        if (reason !== undefined) {
-          this.stopHookContinuationUsed = true;
-          this.context.append({
-            role: 'user',
-            content: [{ type: 'text', text: reason }],
-            toolCalls: [],
-            origin: { kind: 'system_trigger', name: 'stop_hook' },
-          });
-          loop.notify();
-          return;
-        }
+        this.stepFactsByTurn.set(ctx.turnId, {
+          turnId: ctx.turnId,
+          step: ctx.step,
+          firstStepOfTurn: ctx.firstStepOfTurn,
+          finishReason: ctx.finishReason,
+          usage: ctx.usage,
+        });
       }),
     );
   }
@@ -271,13 +305,7 @@ export class AgentExternalHooksService extends Service implements IAgentExternal
     );
   }
 
-  private registerTaskHooks(_tasks: IAgentTaskService): void {
-    this._register(
-      this.eventBus.subscribe(TaskNotified, (e) => {
-        const { type: _type, time: _time, ...ctx } = e;
-        this.notifyTaskNotification(ctx);
-      }),
-    );
+  private registerTaskHooks(): void {
     this._register(
       this.eventBus.subscribe(TaskStarted, (e) => this.notifyTaskStarted(e.info)),
     );
@@ -304,6 +332,7 @@ export class AgentExternalHooksService extends Service implements IAgentExternal
     const block = await this.runner.triggerBlock('PreToolUse', {
       matcherValue: ctx.toolCall.name,
       signal: ctx.signal,
+      cwd: await this.hookCwd(),
       sessionId: this.sessionContext.sessionId,
       inputData: this.withSessionFacts({
         toolName: ctx.toolCall.name,
@@ -343,19 +372,23 @@ export class AgentExternalHooksService extends Service implements IAgentExternal
     const results = await this.runner.trigger('UserPromptSubmit', {
       matcherValue: input,
       signal,
+      cwd: await this.hookCwd(),
       sessionId: this.sessionContext.sessionId,
-      inputData: this.withSessionFacts({ prompt: input, isSteer: ctx.isSteer }),
+      inputData: this.withSessionFacts({
+        prompt: input.map((part) => fromCorePart(part)),
+        isSteer: ctx.isSteer,
+      }),
     });
     signal.throwIfAborted();
 
     const block = renderUserPromptHookBlockResult(results);
     if (block !== undefined) {
-      this.context.append({
+      this.loop.remind(historyEntryFromContext({
         role: 'assistant',
         content: [{ type: 'text', text: block.text }],
         toolCalls: [],
         origin: { kind: 'hook_result', event: block.event, blocked: true },
-      });
+      }));
       void this.dispatcher.dispatch(
         new HookResult({
           agentId: this.scopeContext.agentId,
@@ -369,31 +402,42 @@ export class AgentExternalHooksService extends Service implements IAgentExternal
 
     const append = renderUserPromptHookResult(results);
     if (append !== undefined) {
-      this.context.append({
-        role: 'user',
-        content: [{ type: 'text', text: append.text }],
-        toolCalls: [],
-        origin: { kind: 'hook_result', event: append.event },
-      });
-      void this.dispatcher.dispatch(
-        new HookResult({
-          agentId: this.scopeContext.agentId,
-          hookEvent: append.event,
-          content: append.message,
-        }),
-      );
+      ctx.hookParts.push(...append.parts);
+      for (const message of append.messages) {
+        void this.dispatcher.dispatch(
+          new HookResult({
+            agentId: this.scopeContext.agentId,
+            hookEvent: append.event,
+            content: message,
+          }),
+        );
+      }
     }
     return false;
   }
 
   private notifyTurnEnded(event: TurnEnded): void {
-    this.stopHookContinuationUsed = false;
+    const stopHookContinuation = this.stopHookContinuationTurnIds.delete(event.turnId);
+    const facts = this.stepFactsByTurn.get(event.turnId);
+    this.stepFactsByTurn.delete(event.turnId);
     if (event.reason === 'failed' && event.error !== undefined) {
       this.notifyStopFailure(event.error, new AbortController().signal);
     }
     if (event.reason === 'cancelled') {
       this.fireAndForget('Interrupt', { turnId: event.turnId, reason: 'cancelled' });
     }
+    if (event.reason !== 'completed' || facts === undefined) return;
+    if (this.loop.snapshot().hasPendingRequests) return;
+    this.stopHookQueue = this.stopHookQueue
+      .then(() => this.runStop(facts, stopHookContinuation))
+      .catch((error: unknown) => {
+        if (this.stopHookAbortController.signal.aborted) return;
+        this.warnHookFailure({
+          event: 'Stop',
+          sessionId: this.sessionContext.sessionId,
+          message: toKimiErrorPayload(error).message,
+        });
+      });
   }
 
   private notifyStopFailure(error: unknown, signal: AbortSignal): void {
@@ -409,17 +453,35 @@ export class AgentExternalHooksService extends Service implements IAgentExternal
     );
   }
 
-  private async runStop(ctx: AfterStepContext): Promise<string | undefined> {
-    ctx.signal.throwIfAborted();
-    if (this.stopHookContinuationUsed) return undefined;
+  private async runStop(facts: StepFacts, stopHookContinuation: boolean): Promise<void> {
+    const signal = this.stopHookAbortController.signal;
+    signal.throwIfAborted();
+    if (stopHookContinuation && this.stopHookContinuationUsed) return;
 
     const block = await this.runner.triggerBlock('Stop', {
-      signal: ctx.signal,
+      signal,
+      cwd: await this.hookCwd(),
       sessionId: this.sessionContext.sessionId,
-      inputData: this.withSessionFacts({ stopHookActive: false }),
+      inputData: this.withSessionFacts({
+        turnId: facts.turnId,
+        step: facts.step,
+        firstStepOfTurn: facts.firstStepOfTurn,
+        finishReason: facts.finishReason,
+        usage: facts.usage,
+        stopHookActive: false,
+      }),
     });
-    ctx.signal.throwIfAborted();
-    return block?.reason;
+    signal.throwIfAborted();
+    const reason = block?.reason;
+    if (reason === undefined) return;
+    this.stopHookContinuationUsed = true;
+    this.loop.notify({
+      message: {
+        role: 'user',
+        content: [{ type: 'text', text: reason }],
+        origin: { kind: 'system_trigger', name: 'stop_hook' },
+      },
+    });
   }
 
   private async runPreCompact(ctx: FullCompactionTask): Promise<void> {
@@ -428,6 +490,7 @@ export class AgentExternalHooksService extends Service implements IAgentExternal
     await this.runner.trigger('PreCompact', {
       matcherValue: ctx.trigger,
       signal,
+      cwd: await this.hookCwd(),
       sessionId: this.sessionContext.sessionId,
       inputData: this.withSessionFacts({
         trigger: ctx.trigger,
@@ -448,15 +511,6 @@ export class AgentExternalHooksService extends Service implements IAgentExternal
     );
   }
 
-  private notifyTaskNotification(ctx: AgentTaskNotificationContext): void {
-    const signal = new AbortController().signal;
-    this.fireAndForget(
-      'Notification',
-      { sink: 'context', ...ctx },
-      ctx.notificationType,
-      signal,
-    );
-  }
 }
 
 function toolOutputText(output: ExecutableToolResult['output']): string {

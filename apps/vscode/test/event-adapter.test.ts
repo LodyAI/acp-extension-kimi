@@ -7,7 +7,7 @@
 
 import { describe, expect, it } from 'vitest';
 
-import { isPreflightError } from '../shared/errors';
+import { isPreflightError, getUserMessage } from '../shared/errors';
 import {
   adaptSdkEvent,
   createEventAdapterState,
@@ -29,7 +29,7 @@ describe('event adapter (projects SDK events into the legacy Webview contract)',
 
     expect(result.event).toEqual({
       type: 'TurnBegin',
-      payload: { user_input: 'Fix the failing test' },
+      payload: { user_input: 'Fix the failing test', turnIndex: 7 },
       _sessionId: 'session-1',
     });
   });
@@ -94,6 +94,7 @@ describe('event adapter (projects SDK events into the legacy Webview contract)',
     const result = adaptSdkEvent(createEventAdapterState(), {
       type: 'tool.call.started',
       sessionId: 'session-1',
+      origin: 'loop',
       agentId: 'main',
       turnId: 7,
       toolCallId: 'tool-1',
@@ -154,6 +155,7 @@ describe('event adapter (projects SDK events into the legacy Webview contract)',
     const result = adaptSdkEvent(createEventAdapterState(), {
       type: 'tool.result',
       sessionId: 'session-1',
+      origin: 'loop',
       agentId: 'main',
       turnId: 7,
       toolCallId: 'tool-1',
@@ -180,6 +182,7 @@ describe('event adapter (projects SDK events into the legacy Webview contract)',
     const started = adaptSdkEvent(createEventAdapterState(), {
       type: 'tool.call.started',
       sessionId: 'session-1',
+      origin: 'loop',
       agentId: 'main',
       turnId: 7,
       toolCallId: 'tool-1',
@@ -195,6 +198,7 @@ describe('event adapter (projects SDK events into the legacy Webview contract)',
     const finished = adaptSdkEvent(started.state, {
       type: 'tool.result',
       sessionId: 'session-1',
+      origin: 'loop',
       agentId: 'main',
       turnId: 7,
       toolCallId: 'tool-1',
@@ -220,6 +224,7 @@ describe('event adapter (projects SDK events into the legacy Webview contract)',
     const started = adaptSdkEvent(createEventAdapterState(), {
       type: 'tool.call.started',
       sessionId: 'session-1',
+      origin: 'loop',
       agentId: 'main',
       turnId: 7,
       toolCallId: 'todo-1',
@@ -233,6 +238,7 @@ describe('event adapter (projects SDK events into the legacy Webview contract)',
     const unrelated = adaptSdkEvent(started.state, {
       type: 'tool.result',
       sessionId: 'session-1',
+      origin: 'loop',
       agentId: 'main',
       turnId: 7,
       toolCallId: 'other',
@@ -248,6 +254,7 @@ describe('event adapter (projects SDK events into the legacy Webview contract)',
     const matching = adaptSdkEvent(unrelated.state, {
       type: 'tool.result',
       sessionId: 'session-1',
+      origin: 'loop',
       agentId: 'main',
       turnId: 7,
       toolCallId: 'todo-1',
@@ -427,6 +434,7 @@ describe('event adapter (projects SDK events into the legacy Webview contract)',
     const childEvent = adaptSdkEvent(spawned.state, {
       type: 'tool.call.started',
       sessionId: 'session-1',
+      origin: 'loop',
       agentId: 'child-1',
       turnId: 1,
       toolCallId: 'tool-1',
@@ -566,5 +574,14 @@ describe('event adapter (projects SDK events into the legacy Webview contract)',
 
   it('classifies a missing Windows Git Bash runtime as a preflight error', () => {
     expect(isPreflightError('shell.git_bash_not_found')).toBe(true);
+  });
+
+  it('classifies session occupancy conflicts as preflight errors with user-visible copy', () => {
+    expect(isPreflightError('session.occupied')).toBe(true);
+    expect(isPreflightError('session.stale')).toBe(true);
+    expect(getUserMessage('session.occupied', 'fallback')).toBe(
+      'This session is in use by another Kimi Code process. Stop the session in that process or exit it, then try again.',
+    );
+    expect(getUserMessage('session.stale', 'fallback')).not.toBe('fallback');
   });
 });

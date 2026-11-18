@@ -4,6 +4,7 @@ import { join } from 'node:path';
 
 import {
   ConfigChanged,
+  ConfigWarning,
   IConfigService,
   IEventService,
   type ConfigSectionChangedEvent,
@@ -109,6 +110,30 @@ describe('server-v2 /api/v1/config', () => {
     expect(after.yolo).toBe(false);
   });
 
+  it('POST { auto_session_title: false } persists and GET echoes it', async () => {
+    await boot();
+    const cfg = await patchConfig({ auto_session_title: false });
+    expect(cfg.auto_session_title).toBe(false);
+
+    const after = await getConfig();
+    expect(after.auto_session_title).toBe(false);
+  });
+
+  it('GET omits auto_session_title when the field is absent from config.toml', async () => {
+    await boot();
+    const cfg = await getConfig();
+    expect(cfg.auto_session_title).toBeUndefined();
+  });
+
+  it('POST { disable_feedback_survey: true } persists and GET echoes it', async () => {
+    await boot();
+    const cfg = await patchConfig({ disable_feedback_survey: true });
+    expect(cfg.disable_feedback_survey).toBe(true);
+
+    const after = await getConfig();
+    expect(after.disable_feedback_survey).toBe(true);
+  });
+
   it('POST { secondary_model } persists the subagent model pool and GET echoes it', async () => {
     await boot();
     const cfg = await patchConfig({
@@ -140,6 +165,32 @@ describe('server-v2 /api/v1/config', () => {
     expect(
       Object.keys((after.secondary_model as { models: Record<string, string> }).models),
     ).not.toContain('provider/fastModel');
+  });
+
+  it('POST { secondary_model: null } clears the section and preserves other domains', async () => {
+    await boot(
+      [
+        'default_model = "provider/main"',
+        '',
+        '[secondary_model]',
+        'default_model = "provider/fast"',
+        'default_effort = "high"',
+        '',
+        '[secondary_model.models]',
+        '"provider/fast" = "fast and cheap"',
+        '"provider/main" = "main model"',
+        '',
+      ].join('\n'),
+    );
+
+    const cfg = await patchConfig({ secondary_model: null });
+    expect(cfg.secondary_model).toBeUndefined();
+    expect(cfg.default_model).toBe('provider/main');
+
+    await (server as RunningServer).core.accessor.get(IConfigService).reload();
+    const after = await getConfig();
+    expect(after.secondary_model).toBeUndefined();
+    expect(after.default_model).toBe('provider/main');
   });
 
   it('POST { providers } converts fields of a provider id colliding with a map-valued key', async () => {
@@ -255,7 +306,6 @@ describe('server-v2 config changed WS notifications', () => {
       if (frame.type === 'event.config.changed') frames.push(frame as ConfigChangedFrame);
     });
     await new Promise((resolve) => ws.on('open', resolve));
-    ws.send(JSON.stringify({ type: 'client_hello', payload: { client_id: 'config-ws-test' } }));
     return frames;
   }
 
@@ -298,9 +348,16 @@ describe('server-v2 config changed WS notifications', () => {
     expect(last.payload.config['default_model']).toBe('k2');
   });
 
-  it('publishes an event when config.toml is edited outside the process and reloaded', async () => {
+  it('publishes change and error diagnostic events when config.toml is edited outside the process and reloaded', async () => {
     await boot('default_permission_mode = "auto"\n');
     const frames = await openWs();
+    const warnings: string[] = [];
+    const events = (server as RunningServer).core.accessor.get(IEventService);
+    const subscription = events.subscribe((event) => {
+      if (event instanceof ConfigWarning) {
+        warnings.push(...event.payload.warnings.map((warning) => warning.message));
+      }
+    });
 
     await writeFile(
       join(home as string, 'config.toml'),
@@ -315,6 +372,13 @@ describe('server-v2 config changed WS notifications', () => {
     const last = frames.at(-1) as ConfigChangedFrame;
     expect(last.payload.changedFields).toContain('defaultPermissionMode');
     expect(last.payload.config['default_permission_mode']).toBe('yolo');
+
+    await writeFile(join(home as string, 'config.toml'), '= broken =', 'utf-8');
+    await config.reload();
+    await vi.waitFor(() => {
+      expect(warnings).toContainEqual(expect.stringMatching(/failed to (parse|decode)/i));
+    });
+    subscription.dispose();
   });
 
   it('closes the config publisher before the app, so a pending change is never delivered during shutdown', async () => {

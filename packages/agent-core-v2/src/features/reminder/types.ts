@@ -8,6 +8,7 @@ export interface ContextInjectionContext<D = unknown> {
   readonly lastInjection?: ContextMessage;
   readonly lastDisclosure?: D;
   readonly isNewTurn: boolean;
+  readonly signal?: AbortSignal;
 }
 
 export interface ContextInjectionMessage {
@@ -24,6 +25,7 @@ export type ContextInjectionContent =
 export interface ContextInjectionResult<D = unknown> {
   readonly content: ContextInjectionContent;
   readonly disclosure?: D;
+  readonly ownerPromptId?: string;
 }
 
 export type ContextInjectionProvider<D = unknown> = (

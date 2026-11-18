@@ -2,7 +2,7 @@ import type { SessionNotification, ToolCallUpdate } from '@agentclientprotocol/s
 import type {
   ToolCallStartedEvent,
   ToolCallDeltaEvent,
-  ToolProgressEvent,
+  ToolUpdatedEvent,
 } from '@moonshot-ai/agent-core-v2/agent/toolExecutor/toolExecutorEvents';
 import type { ToolResultEvent } from '@moonshot-ai/agent-core-v2/events';
 import type { AgentTaskInfo, IDisposable, SessionHandle } from '@moonshot-ai/klient';
@@ -15,7 +15,7 @@ import {
   toolCallStartedUpgradeToSessionUpdate,
   toolCallLazyCreateToSessionUpdate,
   toolCallDeltaToSessionUpdate,
-  toolProgressToSessionUpdate,
+  toolUpdatedToSessionUpdate,
   toolResultToSessionUpdate,
 } from './events-map';
 
@@ -182,10 +182,10 @@ export class KimiSubagentEvents {
         );
         args.set(id, { args: JSON.stringify(event.args) ?? '' });
       }),
-      events.on('tool.progress', (event) =>
+      events.on('tool.updated', (event) =>
         output(
           event.turnId,
-          toolProgressToSessionUpdate(this.sessionId, event as ToolProgressEvent),
+          toolUpdatedToSessionUpdate(this.sessionId, event as ToolUpdatedEvent),
         ),
       ),
       events.on('tool.result', (event) => {

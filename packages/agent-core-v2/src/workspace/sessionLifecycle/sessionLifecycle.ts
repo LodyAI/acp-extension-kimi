@@ -5,10 +5,9 @@ import type { BindAgentInput } from '#/agent/profile/profile';
 import type { McpServerConfig } from '#/mcpCore/config-schema';
 import type { SessionMeta } from '#/session/sessionMetadata/sessionMetadata';
 
+export type SessionCreateSource = 'startup' | 'resume' | 'reclaimed' | 'fork';
 
-export type SessionCreateSource = 'startup' | 'resume' | 'fork';
-
-export type SessionCloseReason = 'exit' | 'archive';
+export type SessionCloseReason = 'exit' | 'reclaim' | 'archive';
 
 export interface CreateSessionOptions {
   readonly sessionId?: string;
@@ -16,7 +15,11 @@ export interface CreateSessionOptions {
   readonly additionalDirs?: readonly string[];
   readonly requestAdditionalDirs?: readonly string[];
   readonly mainAgentBinding?: BindAgentInput;
+  readonly ensureMainAgent?: boolean;
+  readonly environmentId?: string;
+  readonly environmentCwd?: string;
   readonly mcpServers?: Readonly<Record<string, McpServerConfig>>;
+  readonly prepare?: (session: ISessionScopeHandle) => Promise<void>;
 }
 
 export interface ForkTurnSummary {
@@ -96,6 +99,7 @@ export interface SessionForkedEvent {
 
 export interface SessionWillCreateEvent {
   readonly sessionId: string;
+  readonly onDidCreateScope: Event<ISessionScopeHandle>;
   readSeed<T>(id: ServiceIdentifier<T>): T;
   contributeSeed<T>(id: ServiceIdentifier<T>, value: T): void;
   onSessionDispose(dispose: () => void): void;

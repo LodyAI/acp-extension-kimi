@@ -1,3 +1,4 @@
+import { IAgentEnvironmentService } from '#/agent/environmentBinding/agentEnvironment';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { SyncDescriptor } from '#/_base/di/descriptors';
@@ -5,9 +6,23 @@ import { DisposableStore } from '#/_base/di/lifecycle';
 import { TestInstantiationService } from '#/_base/di/test';
 import { Event } from '#/_base/event';
 import { IAgentProfileService } from '#/agent/profile/profile';
-import { IAgentRuntimeService } from '#/agent/runtimeBinding/agentRuntime';
+import type {
+  EffectiveProfileReader,
+  ProfileBindingSnapshot,
+  ProfileServiceOptions,
+  ProfileUpdateData,
+} from '#/agent/profile/profile';
+import { IAgentLoopService } from '#/agent/loop/loop';
 import { AgentProfileService } from '#/agent/profile/profileService';
-import { profileActiveToolsKey, profileKey } from '#/agent/profile/profileOps';
+import {
+  ConfigUpdate,
+  EMPTY_LOOP_PROFILE,
+  ProfileBind,
+  reduceLoopActiveTools,
+  reduceLoopConfigUpdate,
+} from '#/agent/profile/profileOps';
+import { restoreLoopJournal, type LoopJournalSnapshot } from '#/agent/loop/journal';
+import { IWireService } from '#/wire/wire';
 import {
   DEFAULT_AGENT_PROFILE_NAME,
   type EnvironmentDisclosureSnapshot,
@@ -16,6 +31,7 @@ import { IAgentAgentsMdReminderService } from '#/agent/agentsMdReminder/agentsMd
 import { ISessionAgentProfileCatalog } from '#/session/sessionAgentProfileCatalog/sessionAgentProfileCatalog';
 import { IBootstrapService } from '#/app/bootstrap/bootstrap';
 import { IConfigService } from '#/app/config/config';
+import { IProviderDiscoveryService } from '#/app/kosongConfig/discovery';
 import { IModelCatalog, type Model } from '#/llm-adapter/model/catalog';
 import { IProtocolAdapterRegistry, type Protocol } from '#/llm-adapter/protocol/protocol';
 import { ITelemetryService } from '#/app/telemetry/telemetry';
@@ -40,9 +56,16 @@ import { AGENT_WIRE_RECORD_KEY, type WireRecord } from '#/wire/record';
 import {
   registerTestAgentWire,
   registerTestEventDispatcher,
-  restoreTestEventDispatcher,
   testWireScope,
 } from '../../wire/stubs';
+import { stubProviderDiscovery, type StubProviderDiscovery } from '../../stubs';
+import {
+  agentService,
+  appService,
+  createTestAgent,
+  hostEnvironmentServices,
+  InMemoryWireRecordPersistence,
+} from '../../harness';
 
 const SCOPE = 'wire';
 const KEY = 'profile-test';
@@ -103,15 +126,6 @@ function createModelCatalogStub(models: Readonly<Record<string, Model>> = {}): I
       const model = models[id];
       if (model === undefined) throw new Error(`Unknown model: ${id}`);
       return model;
-    },
-    getRequester: () => {
-      throw new Error('not exercised');
-    },
-    generate: () => {
-      throw new Error('not exercised');
-    },
-    ping: () => {
-      throw new Error('not exercised');
     },
     findByName: () => [],
     listModels: () => {
@@ -176,19 +190,110 @@ function createSessionContextStub(): ISessionContext {
   };
 }
 
+class TestLoopProfileReader implements EffectiveProfileReader {
+  snapshot: LoopJournalSnapshot = restoreLoopJournal([]);
+  private records: WireRecord[] = [];
+
+  constructor(
+    private readonly profile: IAgentProfileService,
+    private readonly dispatcher: IEventDispatcher,
+  ) {}
+
+  configure(options: ProfileServiceOptions): void {
+    this.profile.configure(options);
+  }
+
+  prepareDefault(snapshot: ProfileBindingSnapshot): ProfileBindingSnapshot {
+    return this.profile.applyBindingSnapshot(snapshot);
+  }
+
+  update(changed: ProfileUpdateData): void {
+    const plan = this.profile.prepareUpdate(changed, this.snapshot.profile);
+    let profile = this.snapshot.profile ?? EMPTY_LOOP_PROFILE;
+    if (plan.config !== undefined) {
+      const event = new ConfigUpdate(plan.config);
+      void this.dispatcher.dispatch(event);
+      this.records.push(event.serialize());
+      profile = reduceLoopConfigUpdate(profile, plan.config);
+    }
+    if (plan.tools !== undefined) {
+      void this.dispatcher.dispatch(plan.tools);
+      this.records.push(plan.tools.serialize());
+      profile = reduceLoopActiveTools(profile, 'names' in plan.tools ? plan.tools.names : undefined);
+    }
+    this.snapshot = {
+      ...this.snapshot,
+      profile,
+      input: {
+        ...this.snapshot.input,
+        profile: { systemPrompt: profile.systemPrompt, tools: [] },
+      },
+    };
+    if (plan.config !== undefined) {
+      const { activeToolNames: _activeToolNames, ...configChanged } = changed;
+      this.profile.afterConfigDispatch(configChanged, this.snapshot.profile);
+    }
+  }
+
+  applyBindingSnapshot(snapshot: ProfileBindingSnapshot): ProfileBindingSnapshot {
+    const event = new ProfileBind({
+      agentId: 'test-agent',
+      modelAlias: snapshot.modelAlias,
+      profileName: snapshot.profileName,
+      thinkingEffort: snapshot.thinkingLevel as never,
+      systemPrompt: snapshot.systemPrompt,
+      environmentDisclosure: snapshot.environmentDisclosure,
+      renderGeneration: snapshot.renderGeneration,
+      agentsMdPaths: snapshot.agentsMdPaths,
+      activeToolNames: snapshot.activeToolNames,
+      disallowedTools: snapshot.disallowedTools ?? [],
+      subagents: snapshot.subagents,
+    });
+    void this.dispatcher.dispatch(event);
+    this.records.push(event.serialize());
+    this.snapshot = restoreLoopJournal(this.records);
+    return this.snapshot.profile!;
+  }
+
+  restore(records: readonly WireRecord[]): void {
+    this.records = [...records];
+    this.snapshot = restoreLoopJournal(this.records);
+  }
+
+  data() { return this.profile.data(this.snapshot.profile ?? EMPTY_LOOP_PROFILE); }
+  getEffectiveThinkingLevel() { return this.profile.getEffectiveThinkingLevel(this.snapshot.profile); }
+  resolveModelContext() { return this.profile.resolveModelContext(this.snapshot.profile); }
+  resolveRequestParams() { return this.profile.resolveRequestParams(this.snapshot.profile); }
+  getModelCapabilities() { return this.data().modelCapabilities; }
+  getModelProviderType(alias?: string) { return this.profile.getModelProviderType(alias, this.snapshot.profile); }
+  getMaxOutputSize() { return this.profile.getMaxOutputSize(this.snapshot.profile); }
+  hasModel() { return this.profile.hasModel(this.snapshot.profile); }
+  isRunnable() { return this.profile.isRunnable(this.snapshot.profile); }
+  hasProvider() { return this.profile.hasProvider(this.snapshot.profile); }
+  getModel() { return this.profile.getModel(this.snapshot.profile); }
+  getSystemPrompt() { return this.profile.getSystemPrompt(this.snapshot.profile); }
+  getActiveToolNames() { return this.data().activeToolNames; }
+  getAgentsMdWarning() { return this.profile.getAgentsMdWarning(); }
+  republishStatus(): void { this.profile.republishStatus(this.snapshot.profile); }
+}
+
+const readers = new WeakMap<IAgentStateService, TestLoopProfileReader>();
+const dispatchReaders = new WeakMap<IEventDispatcher, TestLoopProfileReader>();
+
 let disposables: DisposableStore;
 let ix: TestInstantiationService;
 let log: IAppendLogStore;
 let dispatcher: IEventDispatcher;
 let agentState: IAgentStateService;
-let svc: IAgentProfileService;
+let svc: TestLoopProfileReader;
 let configValues: Record<string, unknown>;
 let modelCatalog: IModelCatalog;
+let discovery: StubProviderDiscovery;
 
 function buildHost(key: string): {
   ix: TestInstantiationService;
   dispatcher: IEventDispatcher;
-  svc: IAgentProfileService;
+  svc: TestLoopProfileReader;
   log: IAppendLogStore;
   agentState: IAgentStateService;
 } {
@@ -200,7 +305,7 @@ function buildHost(key: string): {
   host.stub(IConfigService, createConfigStub());
   host.stub(IModelCatalog, modelCatalog);
   host.stub(IProtocolAdapterRegistry, createProtocolRegistryStub());
-  host.stub(IAgentRuntimeService, { isAvailable: () => false } as IAgentRuntimeService);
+  host.stub(IAgentEnvironmentService, { isAvailable: () => false } as IAgentEnvironmentService);
   host.stub(IHostEnvironment, stubUnused());
   host.stub(IHostFileSystem, stubUnused());
   host.stub(IBootstrapService, stubUnused());
@@ -241,6 +346,7 @@ function buildHost(key: string): {
     disabledTools: () => [],
     setDisabledTools: () => Promise.resolve(),
   });
+  host.stub(IProviderDiscoveryService, discovery);
   host.set(IAgentStateService, new AgentStateService());
   host.set(IAgentProfileService, new SyncDescriptor(AgentProfileService));
   registerTestAgentWire(host, testWireScope(SCOPE, key), {
@@ -248,11 +354,14 @@ function buildHost(key: string): {
   });
   const dispatcher = registerTestEventDispatcher(host);
   const agentState = host.get(IAgentStateService);
+  const reader = new TestLoopProfileReader(host.get(IAgentProfileService), dispatcher);
+  readers.set(agentState, reader);
+  dispatchReaders.set(dispatcher, reader);
   return {
     agentState,
     ix: host,
     dispatcher,
-    svc: host.get(IAgentProfileService),
+    svc: reader,
     log: host.get(IAppendLogStore),
   };
 }
@@ -261,6 +370,7 @@ beforeEach(() => {
   disposables = new DisposableStore();
   configValues = {};
   modelCatalog = createModelCatalogStub();
+  discovery = stubProviderDiscovery();
   const host = buildHost(KEY);
   ix = host.ix;
   dispatcher = host.dispatcher;
@@ -269,7 +379,21 @@ beforeEach(() => {
   log = host.log;
 });
 
-afterEach(() => disposables.dispose());
+const realAgents: Array<ReturnType<typeof createTestAgent>> = [];
+
+afterEach(async () => {
+  for (const ctx of realAgents.splice(0)) await ctx.dispose();
+  disposables.dispose();
+});
+
+async function restoreTestEventDispatcher(
+  dispatcher: IEventDispatcher,
+  _log: IAppendLogStore,
+  _scope: string,
+  records: readonly WireRecord[],
+): Promise<void> {
+  dispatchReaders.get(dispatcher)?.restore(records);
+}
 
 async function readRecords(key = KEY): Promise<WireRecord[]> {
   await dispatcher.flush();
@@ -281,19 +405,19 @@ async function readRecords(key = KEY): Promise<WireRecord[]> {
 }
 
 function modelOf(target: IAgentStateService) {
-  return target.get(profileKey);
+  return readers.get(target)?.snapshot.profile ?? EMPTY_LOOP_PROFILE;
 }
 
 function activeToolsOf(target: IAgentStateService) {
-  return target.get(profileActiveToolsKey);
+  return readers.get(target)?.snapshot.profile?.activeToolNames;
 }
 
 describe('AgentProfileService (wire-backed config.update)', () => {
-  it('defers unavailable runtime context refresh and rejects a removed profile before reuse', async () => {
-    svc.update({ profileName: 'removed-profile', systemPrompt: 'old roots' });
-    await expect(svc.refreshWorkspaceContext()).resolves.toBeUndefined();
-    await expect(svc.prepareWorkspaceContext()).rejects.toThrow('missing agent profile');
-    expect(svc.workspaceContextVersion).toBe(0);
+  it('rejects a removed profile before rebuilding workspace context', async () => {
+    const profile = ix.get(IAgentProfileService);
+    await expect(profile.renderWorkspaceContext({ ...EMPTY_LOOP_PROFILE,
+      profileName: 'removed-profile', systemPrompt: 'old roots',
+    })).rejects.toThrow('missing agent profile');
   });
 
   it('update persists a flat config.update record and resolves thinkingLevel as wire thinkingEffort at the call site', async () => {
@@ -353,9 +477,9 @@ describe('AgentProfileService (wire-backed config.update)', () => {
     replay.ix.dispose();
   });
 
-  it('persists the rendered prompt and disclosure snapshot in one bind record', async () => {
+  it('restores the rendered prompt and disclosure snapshot from one bind record', async () => {
     const environment: EnvironmentDisclosureSnapshot = { cwd: '/work' };
-    svc.applyBindingSnapshot({
+    const snapshot = svc.prepareDefault({
       modelAlias: 'kimi-code',
       profileName: 'agent',
       thinkingLevel: 'off',
@@ -365,6 +489,21 @@ describe('AgentProfileService (wire-backed config.update)', () => {
       activeToolNames: undefined,
       disallowedTools: [],
     });
+    expect(snapshot.systemPrompt).toBe('rendered prompt');
+    expect(await readRecords()).toHaveLength(0);
+    await dispatcher.dispatch(new ProfileBind({
+      agentId: 'test-agent',
+      modelAlias: snapshot.modelAlias,
+      profileName: snapshot.profileName,
+      thinkingEffort: 'off',
+      systemPrompt: snapshot.systemPrompt,
+      environmentDisclosure: snapshot.environmentDisclosure,
+      renderGeneration: snapshot.renderGeneration,
+      agentsMdPaths: snapshot.agentsMdPaths,
+      activeToolNames: snapshot.activeToolNames,
+      disallowedTools: snapshot.disallowedTools ?? [],
+      subagents: snapshot.subagents,
+    }));
 
     const records = await readRecords();
     expect(records.filter((record) => record.type === 'profile.bind')).toEqual([
@@ -456,8 +595,7 @@ describe('AgentProfileService (wire-backed config.update)', () => {
     )) {
       written.push(record);
     }
-    expect(written[0]).toMatchObject({ type: 'metadata' });
-    expect(written.slice(1)).toEqual(records);
+    expect(written).toEqual([]);
   });
 
   it('replay rebuilds the resolved thinkingLevel without re-reading config', async () => {
@@ -502,6 +640,71 @@ describe('AgentProfileService (wire-backed config.update)', () => {
     );
 
     expect(host.svc.getEffectiveThinkingLevel()).toBe('high');
+  });
+
+  describe('when a refresh retires the default model', () => {
+    function createRetiredAgent(persistence = new InMemoryWireRecordPersistence()) {
+      const ctx = createTestAgent(
+        { persistence, autoConfigure: false, initialConfig: { defaultModel: 'acme/current' } },
+        agentService(IModelCatalog, modelCatalog),
+        appService(IProviderDiscoveryService, discovery),
+      );
+      realAgents.push(ctx);
+      return ctx;
+    }
+
+    beforeEach(() => {
+      modelCatalog = createModelCatalogStub({
+        'acme/current': createTestModel({ id: 'current' }),
+        'acme/next': createTestModel({ id: 'next' }),
+        'acme/other': createTestModel({ id: 'other' }),
+      });
+    });
+
+    it('moves an agent bound to it onto the declared replacement, keeping the effort', async () => {
+      const loop = createRetiredAgent().get(IAgentLoopService);
+      await loop.setProfile({
+        modelAlias: 'acme/current',
+        profileName: DEFAULT_AGENT_PROFILE_NAME,
+        thinkingLevel: 'high',
+        systemPrompt: '',
+        disallowedTools: [],
+      });
+
+      discovery.retire({ from: 'acme/current', to: 'acme/next' });
+
+      expect(loop.getModel()).toBe('acme/next');
+      expect(loop.data().thinkingLevel).toBe('high');
+    });
+
+    it('leaves an agent bound to another model alone', async () => {
+      const loop = createRetiredAgent().get(IAgentLoopService);
+      await loop.setModel('acme/other');
+
+      discovery.retire({ from: 'acme/current', to: 'acme/next' });
+
+      expect(loop.getModel()).toBe('acme/other');
+    });
+
+    it('moves an agent restored onto it after the refresh', async () => {
+      const persistence = new InMemoryWireRecordPersistence();
+      const initial = createRetiredAgent(persistence);
+      await initial.get(IAgentLoopService).setProfile({
+        modelAlias: 'acme/current',
+        profileName: DEFAULT_AGENT_PROFILE_NAME,
+        thinkingLevel: 'high',
+        systemPrompt: '',
+        disallowedTools: [],
+      });
+      await initial.get(IWireService).flush();
+      await initial.dispose();
+      discovery.retired['acme/current'] = 'acme/next';
+      const restored = createRetiredAgent(persistence);
+
+      await restored.restorePersisted();
+
+      expect(restored.get(IAgentLoopService).getModel()).toBe('acme/next');
+    });
   });
 
   it('rejects conflicting config.update thinking aliases during replay', async () => {

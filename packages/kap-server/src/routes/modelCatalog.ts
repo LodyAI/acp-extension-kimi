@@ -427,11 +427,22 @@ export function registerModelCatalogRoutes(app: ModelCatalogRouteHost, core: Sco
             .map((record) => [record.model as string, record] as const),
         );
         for (const entry of req.body.models) {
+          const previous = previousByModel.get(entry.model);
+          let upgrade = previous?.upgrade;
+          if (upgrade !== undefined) {
+            const targetModel = models[upgrade.model]?.model;
+            const target = targetModel === undefined ? undefined : `${newId}/${targetModel}`;
+            upgrade =
+              target !== undefined && newAliasKeys.has(target)
+                ? { ...upgrade, model: target }
+                : undefined;
+          }
           const alias: ModelRecord = {
-            ...previousByModel.get(entry.model),
+            ...previous,
             provider: newId,
             model: entry.model,
             maxContextSize: entry.max_context_size,
+            upgrade,
           };
           alias.displayName = entry.display_name !== undefined ? entry.display_name : undefined;
           alias.capabilities =
@@ -731,11 +742,11 @@ function sendMappedError(
 ): boolean {
   if (!isError2(err)) return false;
   if (err.code === 'provider.not_found') {
-    reply.send(errEnvelope(ErrorCode.PROVIDER_NOT_FOUND, err.message, requestId, err.stack));
+    reply.send(errEnvelope(ErrorCode.PROVIDER_NOT_FOUND, err.message, requestId));
     return true;
   }
   if (err.code === 'model.not_found') {
-    reply.send(errEnvelope(ErrorCode.MODEL_NOT_FOUND, err.message, requestId, err.stack));
+    reply.send(errEnvelope(ErrorCode.MODEL_NOT_FOUND, err.message, requestId));
     return true;
   }
   return false;
@@ -757,7 +768,7 @@ function sendModelsDevImportError(
   if (!isError2(err)) return false;
   const numeric = MODELS_DEV_IMPORT_ERROR_CODES[err.code];
   if (numeric === undefined) return false;
-  reply.send(errEnvelope(numeric, err.message, requestId, err.stack));
+  reply.send(errEnvelope(numeric, err.message, requestId));
   return true;
 }
 

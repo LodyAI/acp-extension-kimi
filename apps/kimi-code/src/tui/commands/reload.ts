@@ -1,9 +1,12 @@
 import type { KimiConfig } from '@moonshot-ai/kimi-code-sdk';
+import { TuiAltScreen } from '@moonshot-ai/pi-tui';
 
 import { currentTheme, lightColors } from '#/tui/theme';
-import { DEFAULT_MARKDOWN_CONFIG, loadTuiConfig, type TuiConfig } from '../config';
+import { DEFAULT_MARKDOWN_CONFIG, loadTuiConfig, resolveTuiMode, type TuiConfig } from '../config';
+import { TUI_MODE_RESTART_NOTICE } from '../constant/kimi-tui';
 import { setMarkdownMermaidMode, setMarkdownRenderLatex } from '../utils/markdown-options';
 import type { SlashCommandHost } from './dispatch';
+import { applyTranscriptPresentation } from './config';
 import { setExperimentalFeatures } from './experimental-flags';
 
 export async function handleReloadTuiCommand(host: SlashCommandHost): Promise<void> {
@@ -38,6 +41,9 @@ export async function handleReloadCommand(host: SlashCommandHost): Promise<void>
   }
   host.refreshSlashCommandAutocomplete();
   applyRuntimeConfig(host, config);
+  host.setAppState({
+    disableFeedbackSurvey: config.disableFeedbackSurvey ?? tuiConfig.disableFeedbackSurvey,
+  });
   await applyReloadedTuiConfig(host, tuiConfig);
 
   if (session === undefined) {
@@ -46,7 +52,7 @@ export async function handleReloadCommand(host: SlashCommandHost): Promise<void>
     // reach the first lazy-created session instead of staying stale.
     await host.hydrateLazyConfigDefaults();
     host.showStatus(
-      'Runtime and TUI config reloaded; no active session.',
+      'Environment and TUI config reloaded; no active session.',
       'success',
     );
   }
@@ -68,16 +74,26 @@ export async function applyReloadedTuiConfig(
   host.refreshTerminalThemeTracking();
   host.setAppState({
     editorCommand: config.editorCommand,
+    tuiMode: config.tuiMode,
     disablePasteBurst: config.disablePasteBurst,
+    copyOnSelect: config.copyOnSelect,
     renderLatex: config.renderLatex,
     cacheExpiryHint: config.cacheExpiryHint,
-    disableFeedbackSurvey: config.disableFeedbackSurvey,
+    autoSessionTitle: config.autoSessionTitle,
     notifications: config.notifications,
     upgrade: config.upgrade,
     statusLine: config.statusLine,
     markdown: config.markdown,
+    transcript: config.transcript,
   });
+  applyTranscriptPresentation(host);
   host.state.editor.setDisablePasteBurst(config.disablePasteBurst);
+  if (host.state.ui instanceof TuiAltScreen) {
+    host.state.ui.setCopyOnSelect(config.copyOnSelect !== false);
+  }
+  if (resolveTuiMode(config.tuiMode).mode !== host.state.ui.mode) {
+    host.showNotice(TUI_MODE_RESTART_NOTICE);
+  }
 }
 
 function applyRuntimeConfig(host: SlashCommandHost, config: KimiConfig): void {

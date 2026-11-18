@@ -84,6 +84,7 @@ export type {
   PromptWithSkillsResult,
   SetModelResult,
   ShellCommandResult,
+  SteerResult,
   ThinkingLevel,
   UsageStatus,
 } from './core/facade/agent.js';
@@ -93,6 +94,7 @@ export type {
   KlientEventName,
   KlientEventPayloads,
   SessionArchivedPayload,
+  SessionRestoredPayload,
   SessionMetaUpdatedPayload,
 } from './contract/global/events.js';
 export type { SessionEventPayloads } from './contract/session/events.js';
@@ -124,10 +126,12 @@ export type { FileMeta } from '@moonshot-ai/agent-core-v2/app/file/fileService';
 export type {
   PluginCommandDef,
   PluginInfo,
+  PluginOrigin,
   PluginSummary,
   PluginUpdateStatus,
   ReloadSummary,
 } from '@moonshot-ai/agent-core-v2/app/plugin/types';
+export type { InstallPluginInput } from '@moonshot-ai/agent-core-v2/app/plugin/plugin';
 export type {
   AgentMeta,
   SessionMeta,
@@ -157,5 +161,5 @@ export type {
   McpServerTestResult,
   McpServerTestTarget,
 } from '@moonshot-ai/agent-core-v2/app/mcpManagement/mcpManagement';
-export type { ContentPart } from '@moonshot-ai/agent-core-v2/human/llm/message';
+export type { ContentPart } from '@moonshot-ai/agent-core-v2/human/message';
 export type { PermissionMode } from '@moonshot-ai/agent-core-v2/agent/permissionPolicy/types';

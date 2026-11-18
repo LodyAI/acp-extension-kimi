@@ -68,8 +68,10 @@ function createFakeOAuthToolkit(): {
 describe('acp-server session lifecycle', () => {
   let homeDir: string | undefined;
   let client: TestClient | undefined;
+  const workspaceLeases: { dispose(): void }[] = [];
 
   afterEach(async () => {
+    for (const lease of workspaceLeases.splice(0)) lease.dispose();
     if (client !== undefined) {
       await client.close();
       client = undefined;
@@ -80,8 +82,9 @@ describe('acp-server session lifecycle', () => {
     }
   });
 
-  async function boot(): Promise<TestClient> {
+  async function boot(configToml?: string): Promise<TestClient> {
     homeDir = await mkdtemp(join(tmpdir(), 'acp-lifecycle-'));
+    if (configToml !== undefined) await writeFile(join(homeDir, 'config.toml'), configToml, 'utf-8');
     client = await createTestClient({ homeDir });
     await client.send('initialize', { protocolVersion: 1, clientCapabilities: {} });
     return client;
@@ -96,14 +99,18 @@ describe('acp-server session lifecycle', () => {
     c: TestClient,
     sessionId: string,
   ): Promise<readonly { readonly name: string; readonly status: string; readonly error?: string }[]> {
-    await c.server.core.accessor
+    const lease = await c.server.core.accessor
       .get(IWorkspaceInstanceManager)
-      .getOrCreate({ root: homeDir! });
-    const handle = c.server.core.accessor.get(ISessionManager).get(sessionId);
-    expect(handle).toBeDefined();
-    const mcp = handle!.accessor.get(ISessionMcpHandle);
-    await mcp.ready;
-    return mcp.connectionManager.list();
+      .acquire({ root: homeDir! });
+    try {
+      const handle = c.server.core.accessor.get(ISessionManager).get(sessionId);
+      expect(handle).toBeDefined();
+      const mcp = handle!.accessor.get(ISessionMcpHandle);
+      await mcp.ready;
+      return mcp.connectionManager.list();
+    } finally {
+      lease.dispose();
+    }
   }
 
   it(
@@ -119,6 +126,18 @@ describe('acp-server session lifecycle', () => {
         sessions: { sessionId: string }[];
       };
       expect(listed.sessions.some((s) => s.sessionId === created.sessionId)).toBe(true);
+    },
+    30_000,
+  );
+
+  it(
+    'session/new bypasses an invalid configured environment default',
+    async () => {
+      const c = await boot('[environments]\ndefault = "missing"\n');
+      const created = (await c.send('session/new', { cwd: homeDir, mcpServers: [] })) as {
+        sessionId: string;
+      };
+      expect(created.sessionId).toMatch(/^session_/);
     },
     30_000,
   );
@@ -449,8 +468,10 @@ describe('acp-server session lifecycle', () => {
       assertRoots(first.sessionId, [a]);
       assertRoots(sibling.sessionId, [b]);
       assertRoots(empty.sessionId, []);
-      const workspace = await c.server.core.accessor
-        .get(IWorkspaceInstanceManager).getOrCreate({ root: cwd });
+      const lease = await c.server.core.accessor
+        .get(IWorkspaceInstanceManager).acquire({ root: cwd });
+      workspaceLeases.push(lease);
+      const workspace = lease.instance;
       expect(workspace.program.dirs.additionalDirs).toEqual([]);
 
       for (const cold of [false, true]) {
@@ -475,10 +496,15 @@ describe('acp-server session lifecycle', () => {
     const native = join(homeDir!, 'native');
     const requested = join(homeDir!, 'requested');
     await Promise.all([cwd, native, requested].map((dir) => mkdir(dir)));
-    const workspace = await c.server.core.accessor
-      .get(IWorkspaceInstanceManager).getOrCreate({ root: cwd });
-    const saved = await workspace.program.dirs.addDir({ path: native, persist: true });
-    const originalConfig = await readFile(saved.configPath, 'utf8');
+    const lease = await c.server.core.accessor
+      .get(IWorkspaceInstanceManager).acquire({ root: cwd });
+    workspaceLeases.push(lease);
+    const workspace = lease.instance;
+    const configPath = join(cwd, '.kimi-code', 'local.toml');
+    const originalConfig = '[workspace]\nadditional_dir = ["../native"]\n';
+    await mkdir(join(cwd, '.kimi-code'));
+    await writeFile(configPath, originalConfig);
+    await workspace.program.dirs.reload();
     const created = await c.send('session/new', {
       cwd, mcpServers: [], additionalDirectories: [requested],
     }) as { sessionId: string };
@@ -500,7 +526,7 @@ describe('acp-server session lifecycle', () => {
     expect(roots(created.sessionId)).toEqual([native, requested]);
     await c.send('session/resume', { sessionId: created.sessionId, cwd, mcpServers: [] });
     expect(roots(created.sessionId)).toEqual([native]);
-    expect(await readFile(saved.configPath, 'utf8')).toBe(originalConfig);
+    expect(await readFile(configPath, 'utf8')).toBe(originalConfig);
   }, 30_000);
 
   it('session/fork applies only the target roots and cwd to each independent child', async () => {
