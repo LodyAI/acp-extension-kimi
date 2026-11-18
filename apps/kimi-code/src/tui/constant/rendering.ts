@@ -22,7 +22,17 @@ export const RESULT_PREVIEW_LINES = 3;
 export const SHELL_OUTPUT_PREVIEW_LINES = 10;
 export const THINKING_PREVIEW_LINES = 2;
 export const COMMAND_PREVIEW_LINES = 10;
-export const NOTIFY_PANEL_PAGE_LINES = 8;
+
+// Fullscreen dock caps: rows a panel body shows before it scrolls, so the
+// dock never crowds the transcript out or pushes the editor off screen.
+export const DOCK_QUEUE_ROWS = 3;
+export const DOCK_UPDATES_ROWS = 6;
+export const DOCK_APPROVAL_ROWS = 6;
+export const DOCK_PREVIEW_ROWS = Number.POSITIVE_INFINITY;
+// Below this terminal height, docked Updates folds to its one-line stub while
+// an approval or question waits: a typical approval (13 rows) plus expanded
+// Updates (7) and the activity rows (2) would leave the transcript under 10.
+export const UPDATES_PROMPT_FOLD_SCREEN_ROWS = 32;
 
 // The ellipsis marking a single-row line (card header, outcome row) that was
 // cut to the terminal width or that stands in for hidden output lines.
@@ -65,6 +75,11 @@ export const SUBAGENT_TOOL_OUTPUT_MAX_CHARS = 8000;
 // chips read args, so long values are truncated; chips become approximate
 // beyond the cap.
 export const SUBAGENT_ARG_STRING_MAX_CHARS = 16 * 1024;
+// The foreground subagent card only ever shows a two-row window of the child
+// agent's streamed text, so the transcript keeps a bounded trailing slice for
+// display. Wrapping cost then stays flat instead of growing with the whole
+// run's output.
+export const SUBAGENT_PREVIEW_TEXT_MAX_CHARS = 8000;
 
 // Retention caps for an agent-swarm member's terminal-state label: terminal
 // cells render a single-line label, so only a bounded prefix of the final
@@ -74,9 +89,28 @@ export const SUBAGENT_ARG_STRING_MAX_CHARS = 16 * 1024;
 export const MAX_FINAL_OUTPUT_LABEL_CHARS = 400;
 export const MAX_FINAL_OUTPUT_LABEL_CODE_UNITS = 2_000;
 
-// Animation frames are shared by the login/update loaders and live thinking.
 export const BRAILLE_SPINNER_FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 export const BRAILLE_SPINNER_INTERVAL_MS = 80;
 
+export const TRANSCRIPT_GROUP_SWEEP_START_DELAY_MS = 600;
+export const TRANSCRIPT_GROUP_SWEEP_INTERVAL_MS = 4_000;
+export const TRANSCRIPT_GROUP_SWEEP_DURATION_MS = 1_600;
+export const TRANSCRIPT_GROUP_SWEEP_HALF_WIDTH_RATIO = 0.2;
+export const TRANSCRIPT_GROUP_SWEEP_MIN_HALF_WIDTH = 5;
+export const TRANSCRIPT_GROUP_SWEEP_LIGHT_REST_TEXT_RATIO = 0.6;
+export const TRANSCRIPT_GROUP_SWEEP_LIGHT_REST_MIN_CONTRAST = 4.5;
+// Every 150 ms the title highlight closes half of what is left to full or off, so it fades out
+// in about a second: the speed it was tuned to on 50 ms frames.
+export const TRANSCRIPT_GROUP_FADE_HALF_LIFE_MS = 150;
+export const TRANSCRIPT_GROUP_TAIL_ELAPSED_MS = 2_000;
+export const TRANSCRIPT_GROUP_COUNT_DELAY_MS = 200;
+export const TRANSCRIPT_TAIL_ENTER_MS = 1_000;
+export const TRANSCRIPT_TAIL_THOUGHT_HOLD_MS = 2_000;
+export const TRANSCRIPT_TAIL_MIN_NAME_COLUMNS = 12;
+export const TRANSCRIPT_TAIL_TIMER_COLUMNS = ' · 99s'.length;
+export const TRANSCRIPT_TAIL_THINKING_THROTTLE_MS = 150;
+export const FOREGROUND_BASH_HINT_DELAY_MS = 10_000;
+export const DETACH_HINT_TEXT = 'Press Ctrl+B to run in background';
+
 export const MOON_SPINNER_FRAMES = ['🌑', '🌒', '🌓', '🌔', '🌕', '🌖', '🌗', '🌘'];
-export const MOON_SPINNER_INTERVAL_MS = 120;
+export const MOON_LOADER_FRAME_MS = 120;

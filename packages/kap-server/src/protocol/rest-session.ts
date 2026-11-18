@@ -1,35 +1,34 @@
 import { z } from 'zod';
 
-import { messageSchema } from './message';
 import {
-  sessionStatusResponseSchema,
+  sessionAgentConfigPartialSchema,
   sessionWarningSchema,
   sessionWarningsResponseSchema,
-  updateSessionProfileRequestSchema,
-  type UpdateSessionProfileRequest,
+  updateSessionProfileRequestSchema as engineUpdateSessionProfileRequestSchema,
 } from '@moonshot-ai/agent-core-v2/app/sessionLegacy/sessionProtocol';
 
 import { goalSnapshotSchema } from './goal';
 import { cursorQuerySchema, pageResponseSchema } from './pagination';
 import {
+  creationOnlyProfileSchema,
   sessionChildCreateSchema,
   sessionCreateSchema,
   sessionForkSchema,
   sessionSchema,
 } from './session';
 
-export {
-  sessionStatusResponseSchema,
-  sessionWarningSchema,
-  sessionWarningsResponseSchema,
-  updateSessionProfileRequestSchema,
-};
+export { sessionWarningSchema, sessionWarningsResponseSchema };
 export type {
-  SessionStatusResponse,
   SessionWarning,
   SessionWarningsResponse,
-  UpdateSessionProfileRequest,
 } from '@moonshot-ai/agent-core-v2/app/sessionLegacy/sessionProtocol';
+
+export const updateSessionProfileRequestSchema = engineUpdateSessionProfileRequestSchema.extend({
+  agent_config: sessionAgentConfigPartialSchema
+    .extend({ profile: creationOnlyProfileSchema })
+    .optional(),
+});
+export type UpdateSessionProfileRequest = z.infer<typeof updateSessionProfileRequestSchema>;
 
 export const createSessionRequestSchema = sessionCreateSchema;
 export type CreateSessionRequest = z.infer<typeof createSessionRequestSchema>;
@@ -128,6 +127,14 @@ export type CreateSessionChildResponse = z.infer<typeof createSessionChildRespon
 export const getSessionGoalResponseSchema = goalSnapshotSchema.nullable();
 export type GetSessionGoalResponse = z.infer<typeof getSessionGoalResponseSchema>;
 
+export const editSessionGoalRequestSchema = z.object({
+  objective: z.string(),
+});
+export type EditSessionGoalRequest = z.infer<typeof editSessionGoalRequestSchema>;
+
+export const editSessionGoalResponseSchema = goalSnapshotSchema;
+export type EditSessionGoalResponse = z.infer<typeof editSessionGoalResponseSchema>;
+
 export const compactSessionRequestSchema = z.preprocess(
   (value) => value === undefined ? {} : value,
   z.object({
@@ -139,18 +146,14 @@ export type CompactSessionRequest = z.infer<typeof compactSessionRequestSchema>;
 export const compactSessionResponseSchema = z.object({});
 export type CompactSessionResponse = z.infer<typeof compactSessionResponseSchema>;
 
-export const undoSessionRequestSchema = z.preprocess(
-  (value) => value === undefined ? {} : value,
-  z.object({
-    count: z.number().int().positive().default(1),
-    page_size: z.number().int().min(1).max(100).optional(),
-  }),
-);
+export const undoSessionRequestSchema = z.object({
+  turn_id: z.string().min(1),
+  agent_id: z.string().min(1).optional(),
+});
 export type UndoSessionRequest = z.infer<typeof undoSessionRequestSchema>;
 
 export const undoSessionResponseSchema = z.object({
-  messages: pageResponseSchema(messageSchema),
-  status: sessionStatusResponseSchema,
+  removed_turn_ids: z.array(z.string().min(1)),
 });
 export type UndoSessionResponse = z.infer<typeof undoSessionResponseSchema>;
 
@@ -158,6 +161,11 @@ export const archiveSessionResponseSchema = z.object({
   archived: z.literal(true),
 });
 export type ArchiveSessionResponse = z.infer<typeof archiveSessionResponseSchema>;
+
+export const takeoverSessionResponseSchema = z.object({
+  taken_over: z.literal(true),
+});
+export type TakeoverSessionResponse = z.infer<typeof takeoverSessionResponseSchema>;
 
 export const restoreSessionResponseSchema = sessionSchema;
 export type RestoreSessionResponse = z.infer<typeof restoreSessionResponseSchema>;

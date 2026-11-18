@@ -152,6 +152,38 @@ export function applySectionEnv(
   return target;
 }
 
+function collectEnvNames(bindings: AnyEnvBindings, into: string[]): void {
+  if (isEnvBinding(bindings)) {
+    if (typeof bindings === 'string') {
+      into.push(bindings);
+      return;
+    }
+    into.push(bindings.env);
+    if (bindings.deprecatedEnv !== undefined) into.push(bindings.deprecatedEnv);
+    return;
+  }
+  for (const child of Object.values(bindings)) {
+    if (child !== undefined) collectEnvNames(child, into);
+  }
+}
+
+function sameEnvValues(
+  a: readonly (string | undefined)[],
+  b: readonly (string | undefined)[],
+): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i += 1) {
+    if (a[i] !== b[i]) return false;
+  }
+  return true;
+}
+
+interface EnvSectionResolution {
+  readonly base: unknown;
+  readonly envValues: readonly (string | undefined)[];
+  readonly value: unknown;
+}
+
 function isSameSection(
   existing: ConfigSection,
   schema: ConfigSchema<unknown>,
@@ -332,7 +364,9 @@ export class ConfigService extends Disposable implements IConfigService {
   private readonly diagnosticsList: ConfigDiagnostic[] = [];
   private lastDiagnosticsSnapshot = '[]';
   private readonly configKey: string;
-  private tainted = false;
+  private readError?: unknown;
+  private readonly envNamesBySection = new WeakMap<ConfigSection, readonly string[]>();
+  private readonly envSectionResolutions = new WeakMap<ConfigSection, EnvSectionResolution>();
 
   constructor(
     @IConfigRegistry private readonly registry: IConfigRegistry,
@@ -378,6 +412,27 @@ export class ConfigService extends Disposable implements IConfigService {
       userValue: this.raw[domain] as T | undefined,
       memoryValue,
     };
+  }
+
+  assertValid(domain: string): void {
+    if (this.readError !== undefined) {
+      throw new Error2(
+        ErrorCodes.CONFIG_INVALID,
+        `Cannot use config section '${domain}' because ${this.bootstrap.configPath} could not be read`,
+        { cause: this.readError },
+      );
+    }
+    const value = this.raw[domain];
+    if (value === undefined) return;
+    try {
+      this.registry.validate(domain, value);
+    } catch (error) {
+      throw new Error2(
+        ErrorCodes.CONFIG_INVALID,
+        `Invalid config section '${domain}': ${describeUnknownError(error)}`,
+        { cause: error },
+      );
+    }
   }
 
   getAll(): ResolvedConfig {
@@ -616,12 +671,12 @@ export class ConfigService extends Disposable implements IConfigService {
   private async load(source: ConfigChangeSource): Promise<void> {
     this.diagnosticsList.length = 0;
     let fileData: ResolvedConfig = {};
-    let failed = false;
     try {
       const data = await this.documentStore.get<ResolvedConfig>(CONFIG_SCOPE, this.configKey);
       fileData = data !== undefined && isPlainObject(data) ? data : {};
+      this.readError = undefined;
     } catch (error) {
-      failed = true;
+      this.readError = error;
       const message =
         error instanceof TomlError
           ? `Failed to parse ${this.bootstrap.configPath}: ${describeTomlSyntaxError(error)}`
@@ -629,12 +684,10 @@ export class ConfigService extends Disposable implements IConfigService {
       this.pushDiagnostic({ severity: 'error', message });
       this.log.warn('config load failed', { error: describeUnknownError(error) });
       if (source !== 'load') {
-        this.tainted = true;
         this.emitDiagnosticsIfChanged();
         return;
       }
     }
-    this.tainted = failed;
     const nextRawSnake = cloneRecord(fileData);
     for (const diagnostic of collectKeyDeprecations(nextRawSnake, this.registry.listSections())) {
       this.pushDiagnostic(diagnostic);
@@ -663,7 +716,7 @@ export class ConfigService extends Disposable implements IConfigService {
     domains?: readonly string[],
   ): void {
     const previous = this.effective;
-    this.validated = this.buildValidated(this.raw);
+    this.validated = this.buildValidated(this.raw, this.validated);
     const next = { ...this.validated };
     this.applySectionEnvBindings(next, true);
     this.applyEnvOverlay(next);
@@ -702,12 +755,15 @@ export class ConfigService extends Disposable implements IConfigService {
     }
   }
 
-  private buildValidated(raw: ResolvedConfig): ResolvedConfig {
+  private buildValidated(raw: ResolvedConfig, previous: ResolvedConfig = {}): ResolvedConfig {
     const validated: ResolvedConfig = {};
     for (const [domain, value] of Object.entries(raw)) {
       try {
         validated[domain] = this.registry.validate(domain, value);
       } catch (error) {
+        if (Object.prototype.hasOwnProperty.call(previous, domain)) {
+          validated[domain] = previous[domain];
+        }
         this.pushDiagnostic({
           domain,
           severity: 'warning',
@@ -723,12 +779,32 @@ export class ConfigService extends Disposable implements IConfigService {
     return validated;
   }
 
+  private sectionEnvNames(section: ConfigSection): readonly string[] {
+    const cached = this.envNamesBySection.get(section);
+    if (cached !== undefined) return cached;
+    const names: string[] = [];
+    if (section.env !== undefined) collectEnvNames(section.env, names);
+    this.envNamesBySection.set(section, names);
+    return names;
+  }
+
   private applySectionEnvBindings(effective: ResolvedConfig, reportErrors: boolean): void {
     const getEnv = (name: string): string | undefined => this.bootstrap.getEnv(name);
     for (const section of this.registry.listSections()) {
       if (section.env === undefined) continue;
+      const base = effective[section.domain];
+      const envValues = this.sectionEnvNames(section).map(getEnv);
+      const resolved = this.envSectionResolutions.get(section);
+      if (
+        !reportErrors &&
+        resolved !== undefined &&
+        resolved.base === base &&
+        sameEnvValues(resolved.envValues, envValues)
+      ) {
+        effective[section.domain] = resolved.value;
+        continue;
+      }
       try {
-        const base = effective[section.domain];
         const onDeprecatedEnv: OnDeprecatedEnv | undefined = reportErrors
           ? (oldName, newName) => {
               this.pushDiagnostic({
@@ -739,8 +815,11 @@ export class ConfigService extends Disposable implements IConfigService {
             }
           : undefined;
         const next = applySectionEnv(base, section.env, getEnv, onDeprecatedEnv);
-        effective[section.domain] = this.registry.validate(section.domain, next);
+        const value = this.registry.validate(section.domain, next);
+        effective[section.domain] = value;
+        this.envSectionResolutions.set(section, { base, envValues, value });
       } catch (error) {
+        this.envSectionResolutions.delete(section);
         if (reportErrors) {
           this.pushDiagnostic({
             domain: section.domain,
@@ -853,7 +932,7 @@ export class ConfigService extends Disposable implements IConfigService {
   }
 
   private assertPersistable(): void {
-    if (!this.tainted) return;
+    if (this.readError === undefined) return;
     throw new Error2(
       ErrorCodes.CONFIG_PERSIST_BLOCKED,
       `Refusing to persist config: ${this.bootstrap.configPath} could not be read; fix the file and reload before writing.`,
@@ -889,7 +968,7 @@ export class ConfigService extends Disposable implements IConfigService {
       this.log.warn('config persist aborted: re-read failed', {
         error: describeUnknownError(error),
       });
-      this.tainted = true;
+      this.readError = error;
       throw new Error2(
         ErrorCodes.CONFIG_PERSIST_BLOCKED,
         `Refusing to persist config: ${this.bootstrap.configPath} could not be read; fix the file and reload before writing.`,

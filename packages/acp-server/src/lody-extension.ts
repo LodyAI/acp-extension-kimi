@@ -78,7 +78,8 @@ export function addTokenUsage(left: TokenUsage | undefined, right: TokenUsage): 
       left.reasoningOutput === undefined && right.reasoningOutput === undefined
         ? undefined
         : (left.reasoningOutput ?? 0) + (right.reasoningOutput ?? 0),
-    inputCacheRead: left.inputCacheRead + right.inputCacheRead,
+    inputCacheRead: left.inputCacheRead === undefined || right.inputCacheRead === undefined
+      ? undefined : left.inputCacheRead + right.inputCacheRead,
     inputCacheCreation: left.inputCacheCreation + right.inputCacheCreation,
   };
 }
@@ -91,7 +92,7 @@ export function tokenUsageDelta(current: TokenUsage, previous: TokenUsage | unde
       current.reasoningOutput === undefined
         ? undefined
         : counterDelta(current.reasoningOutput, previous?.reasoningOutput),
-    inputCacheRead: counterDelta(current.inputCacheRead, previous?.inputCacheRead),
+    inputCacheRead: current.inputCacheRead === undefined ? undefined : counterDelta(current.inputCacheRead, previous?.inputCacheRead),
     inputCacheCreation: counterDelta(current.inputCacheCreation, previous?.inputCacheCreation),
   };
 }
@@ -101,7 +102,7 @@ export function hasTokenUsage(usage: TokenUsage): boolean {
     usage.inputOther > 0 ||
     usage.output > 0 ||
     (usage.reasoningOutput ?? 0) > 0 ||
-    usage.inputCacheRead > 0 ||
+    (usage.inputCacheRead ?? 0) > 0 ||
     usage.inputCacheCreation > 0
   );
 }
@@ -111,7 +112,7 @@ export function toLodyModelUsage(usage: TokenUsage, contextWindow?: number): Mod
     inputTokens: usage.inputOther,
     outputTokens: usage.output - (usage.reasoningOutput ?? 0),
     reasoningOutputTokens: usage.reasoningOutput,
-    cacheReadInputTokens: usage.inputCacheRead,
+    cacheReadInputTokens: usage.inputCacheRead ?? 0,
     cacheCreationInputTokens: usage.inputCacheCreation,
     ...(contextWindow === undefined ? {} : { contextWindow }),
   };

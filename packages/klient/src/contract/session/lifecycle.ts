@@ -18,6 +18,7 @@ export const createSessionOptionsSchema = z.object({
   workDir: z.string(),
   additionalDirs: z.array(z.string()).optional(),
   requestAdditionalDirs: z.array(z.string()).optional(),
+  environmentId: z.string().optional(),
   /**
    * Ephemeral per-session MCP servers (engine `CreateSessionOptions.mcpServers`):
    * connected only for the created session, never persisted.

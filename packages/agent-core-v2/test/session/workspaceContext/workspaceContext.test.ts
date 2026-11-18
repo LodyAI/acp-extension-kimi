@@ -1,3 +1,4 @@
+import type { ISessionWorkdir } from '#/session/workdir/workdir';
 import { describe, expect, it } from 'vitest';
 
 import { Emitter } from '#/_base/event';
@@ -14,6 +15,7 @@ it('replaces request roots independently while following native workspace change
   let native = ['/native'];
   const info: ISessionWorkspaceInfo = {
     _serviceBrand: undefined,
+    primaryByWorkspace: {},
     ready: Promise.resolve(),
     get additionalDirs() {
       return native;
@@ -28,7 +30,7 @@ it('replaces request roots independently while following native workspace change
       sessionDir: `/sessions/${sessionId}`,
       sessionScope: sessionId,
       cwd: '/workspace',
-    }), info);
+    }), info, { environmentId: 'local', cwd: '/workspace' } as ISessionWorkdir);
     return { states, ctx };
   });
   const parent = sessions[0]!;
@@ -78,10 +80,11 @@ describe('session working directory', () => {
       cwd: '/workspace',
     }), {
       _serviceBrand: undefined,
-      ready: Promise.resolve(),
+      primaryByWorkspace: {},
+    ready: Promise.resolve(),
       additionalDirs: [],
       onDidChange: changed.event,
-    });
+    }, { environmentId: 'local', cwd: '/workspace' } as ISessionWorkdir);
     try {
       states.set(workspaceContextRequestAdditionalDirsKey, ['../extra']);
       expect(ctx.additionalDirs).toEqual(['/extra']);

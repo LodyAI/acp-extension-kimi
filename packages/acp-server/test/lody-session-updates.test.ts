@@ -429,7 +429,7 @@ describe('fork positions on the wire', () => {
     (update as { _meta?: { lody?: { turnId?: string } } })._meta?.lody?.turnId;
 
   it('publishes the engine fork position on a user turn and forks back at it', async () => {
-    // Two turns already recorded: the next user turn is fork index 2.
+    // Persistent engine IDs include internal turns and are not visible ordinals.
     const { fake, session, updates } = await startSession([
       { turnIndex: 0, prompt: 'first' },
       { turnIndex: 1, prompt: 'second' },
@@ -445,7 +445,7 @@ describe('fork positions on the wire', () => {
       .map((entry) => entry.update)
       .filter((update) => update.sessionUpdate === 'agent_message_chunk')
       .map(lodyTurnId);
-    expect(stamped).toEqual(['2']);
+    expect(stamped).toEqual(['7']);
   });
 
   it('does not spend a fork position on an engine-opened turn', async () => {
@@ -454,7 +454,7 @@ describe('fork positions on the wire', () => {
     void session.prompt([{ type: 'text', text: 'second' }]);
     await flush();
     // A cron fire and a subagent wake sit between two user turns; neither is a
-    // fork boundary, so neither may consume an index.
+    // visible fork boundary, but both retain their native engine IDs.
     fake.emit('turn.started', { turnId: 1, origin: { kind: 'cron_job' } });
     fake.emit('assistant.delta', { turnId: 1, delta: 'cron' });
     fake.emit('turn.ended', { turnId: 1, reason: 'completed' });
@@ -476,7 +476,7 @@ describe('fork positions on the wire', () => {
     );
     expect(byText.get('cron')).toBeUndefined();
     expect(byText.get('wake')).toBeUndefined();
-    expect(byText.get('user turn')).toBe('1');
+    expect(byText.get('user turn')).toBe('3');
   });
 });
 

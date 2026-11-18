@@ -18,7 +18,7 @@ describe('projectHistoryToSessionUpdates', () => {
 
   it('projects a user text message to a user_message_chunk', () => {
     const messages: ContextMessage[] = [
-      { role: 'user', content: [{ type: 'text', text: 'hi' }], toolCalls: [] },
+      { role: 'user', content: [{ type: 'text', text: 'hi' }] },
     ];
     const updates = projectHistoryToSessionUpdates(SESSION_ID, messages);
     expect(kinds(updates)).toEqual(['user_message_chunk']);
@@ -30,7 +30,7 @@ describe('projectHistoryToSessionUpdates', () => {
 
   it('projects an assistant text + tool call and correlates the tool result', () => {
     const messages: ContextMessage[] = [
-      { role: 'user', content: [{ type: 'text', text: 'read a.ts' }], toolCalls: [] },
+      { role: 'user', content: [{ type: 'text', text: 'read a.ts' }] },
       {
         role: 'assistant',
         content: [{ type: 'text', text: 'reading' }],
@@ -39,7 +39,6 @@ describe('projectHistoryToSessionUpdates', () => {
       {
         role: 'tool',
         content: [{ type: 'text', text: 'file body' }],
-        toolCalls: [],
         toolCallId: 'c1',
       },
     ];
@@ -74,7 +73,6 @@ describe('projectHistoryToSessionUpdates', () => {
       {
         role: 'tool',
         content: [{ type: 'text', text: 'boom' }],
-        toolCalls: [],
         toolCallId: 'c1',
         isError: true,
       },
@@ -100,7 +98,6 @@ describe('projectHistoryToSessionUpdates', () => {
       {
         role: 'tool',
         content: [{ type: 'text', text: 'orphan' }],
-        toolCalls: [],
         toolCallId: 'unknown',
       },
     ];
@@ -134,9 +131,9 @@ describe('fork positions in a replayed history', () => {
 
   it('carries the engine position for each replayed turn', () => {
     const messages: ContextMessage[] = [
-      { role: 'user', id: 'msg_1', content: [{ type: 'text', text: 'first' }], toolCalls: [] },
+      { role: 'user', id: 'msg_1', content: [{ type: 'text', text: 'first' }] },
       { role: 'assistant', content: [{ type: 'text', text: 'one' }], toolCalls: [] },
-      { role: 'user', id: 'msg_2', content: [{ type: 'text', text: 'second' }], toolCalls: [] },
+      { role: 'user', id: 'msg_2', content: [{ type: 'text', text: 'second' }] },
       { role: 'assistant', content: [{ type: 'text', text: 'two' }], toolCalls: [] },
     ];
     const updates = projectHistoryToSessionUpdates(SESSION_ID, messages, [
@@ -149,9 +146,9 @@ describe('fork positions in a replayed history', () => {
   it('keeps positions aligned when compaction dropped a turn from the middle', () => {
     // The records still hold three turns; the replayed context lost the second.
     const messages: ContextMessage[] = [
-      { role: 'user', id: 'msg_1', content: [{ type: 'text', text: 'first' }], toolCalls: [] },
+      { role: 'user', id: 'msg_1', content: [{ type: 'text', text: 'first' }] },
       { role: 'assistant', content: [{ type: 'text', text: 'one' }], toolCalls: [] },
-      { role: 'user', id: 'msg_3', content: [{ type: 'text', text: 'third' }], toolCalls: [] },
+      { role: 'user', id: 'msg_3', content: [{ type: 'text', text: 'third' }] },
       { role: 'assistant', content: [{ type: 'text', text: 'three' }], toolCalls: [] },
     ];
     const updates = projectHistoryToSessionUpdates(SESSION_ID, messages, [
@@ -165,7 +162,7 @@ describe('fork positions in a replayed history', () => {
   it('does not let a repeated prompt resolve to the wrong turn', () => {
     // Same text, different turns: identity decides, never the rendered prose.
     const messages: ContextMessage[] = [
-      { role: 'user', id: 'msg_2', content: [{ type: 'text', text: 'continue' }], toolCalls: [] },
+      { role: 'user', id: 'msg_2', content: [{ type: 'text', text: 'continue' }] },
       { role: 'assistant', content: [{ type: 'text', text: 'answer' }], toolCalls: [] },
     ];
     const updates = projectHistoryToSessionUpdates(SESSION_ID, messages, [
@@ -177,9 +174,9 @@ describe('fork positions in a replayed history', () => {
 
   it('leaves a turn unstamped rather than guessing when it matches nothing', () => {
     const messages: ContextMessage[] = [
-      { role: 'user', content: [{ type: 'text', text: 'no durable id' }], toolCalls: [] },
+      { role: 'user', content: [{ type: 'text', text: 'no durable id' }] },
       { role: 'assistant', content: [{ type: 'text', text: 'answer' }], toolCalls: [] },
-      { role: 'user', id: 'msg_gone', content: [{ type: 'text', text: 'dropped' }], toolCalls: [] },
+      { role: 'user', id: 'msg_gone', content: [{ type: 'text', text: 'dropped' }] },
       { role: 'assistant', content: [{ type: 'text', text: 'answer' }], toolCalls: [] },
     ];
     const updates = projectHistoryToSessionUpdates(SESSION_ID, messages, [

@@ -1,8 +1,9 @@
 import type { ModelCapability } from '#/llm-adapter/contract/capability';
-import type { ToolCall } from '#human/llm/message';
+import type { ToolCall } from '#human/message';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { IAgentProfileService, type ResolvedAgentProfile } from '#/agent/profile/profile';
+import { IAgentLoopService } from '#/agent/loop/loop';
+import type { ResolvedAgentProfile } from '#/agent/profile/profile';
 import { normalizeAgentProfile } from '#/app/agentProfileCatalog/agentProfileCatalog';
 import {
   Error2,
@@ -13,7 +14,7 @@ import {
   toErrorPayload,
 } from '#/errors';
 import { WIRE_PROTOCOL_VERSION } from '#/wire/migration/migration';
-import { createTestAgent, type TestAgentContext } from '../../harness';
+import { appService, createTestAgent, type TestAgentContext } from '../../harness';
 import { DEFAULT_TEST_SYSTEM_PROMPT } from '../../harness/snapshots';
 
 import { SyncDescriptor } from '#/_base/di/descriptors';
@@ -71,7 +72,6 @@ import { type ThinkingConfig } from '#/llm-adapter/model/thinking';
 import {
   BASH_TASK_TIMEOUT_S_ENV,
   KEEP_ALIVE_ON_EXIT_ENV,
-  MAX_RUNNING_TASKS_ENV,
   PRINT_BACKGROUND_MODE_ENV,
   PRINT_MAX_TURNS_ENV,
   PRINT_WAIT_CEILING_S_ENV,
@@ -86,7 +86,9 @@ import {
   resolveSubagentBinding,
   resolveSubagentModelPool,
   resolveSubagentTimeoutMs,
+  SECONDARY_MODEL_FORCE_REMOVED_MESSAGE,
   SECONDARY_MODEL_SECTION,
+  secondaryModelRemovedKeysMessage,
   SUBAGENT_SECTION,
   SUBAGENT_TIMEOUT_ENV,
   type SecondaryModelConfig,
@@ -117,6 +119,7 @@ import {
   type McpSection,
 } from '#/app/mcpConfig/configSection';
 import { ILogService } from '#/_base/log/log';
+import { IHostClock } from '#/os/interface/hostClock';
 import { InMemoryStorageService } from '#/persistence/backends/memory/inMemoryStorageService';
 import { IFileSystemStorageService } from '#/persistence/interface/storage';
 import { IAtomicTomlDocumentStore } from '#/persistence/interface/atomicDocumentStore';
@@ -132,13 +135,19 @@ const TEST_OS_ENV = {
   shellPath: '/bin/bash',
 } as const;
 
+const pinnedHostClock: IHostClock = {
+  _serviceBrand: undefined,
+  now: () => new Date(),
+  timeZone: () => 'Asia/Shanghai',
+};
+
 describe('Agent config', () => {
   let ctx: TestAgentContext;
-  let profile: IAgentProfileService;
+  let profile: IAgentLoopService;
 
   beforeEach(() => {
     ctx = createTestAgent();
-    profile = ctx.get(IAgentProfileService);
+    profile = ctx.get(IAgentLoopService);
   });
 
   afterEach(async () => {
@@ -217,8 +226,8 @@ describe('Agent config', () => {
 
     expect(ctx.newEvents()).toMatchInlineSnapshot(`
       [wire] config.update            { "agentId": "main", "profileName": "test-profile", "systemPrompt": "Profile system prompt.", "environmentDisclosure": { "cwd": "<cwd>" }, "agentsMdPaths": [], "disallowedTools": [], "time": "<time>" }
-      [emit] agent.status.updated     { "time": "<time>", "agentId": "main", "model": "mock-model", "maxContextTokens": 1000000 }
       [wire] tools.set_active_tools   { "agentId": "main", "names": [ "Read" ], "time": "<time>" }
+      [emit] agent.status.updated     { "time": "<time>", "agentId": "main", "model": "mock-model", "maxContextTokens": 1000000 }
     `);
   });
 
@@ -290,10 +299,10 @@ describe('Agent config', () => {
 
   it('keeps turn-start config for later steps and applies updates to the next turn', async () => {
     await ctx.dispose();
-    ctx = createTestAgent({ autoConfigure: false });
+    ctx = createTestAgent({ autoConfigure: false }, appService(IHostClock, pinnedHostClock));
     await ctx.restorePersisted();
     ctx.configure();
-    profile = ctx.get(IAgentProfileService);
+    profile = ctx.get(IAgentLoopService);
     const lookupCall: ToolCall = {
       type: 'function',
       id: 'call_lookup',
@@ -320,33 +329,33 @@ describe('Agent config', () => {
       input: [{ type: 'text', text: 'Look up before config changes' }],
     });
     expect(await ctx.untilApproval(true)).toMatchInlineSnapshot(`
-      [emit] prompt.submitted                { "time": "<time>", "agentId": "main", "promptId": "<msg-1>", "userMessageId": "<msg-1>", "status": "running", "content": [ { "type": "text", "text": "Look up before config changes" } ], "createdAt": "<time>" }
-      [wire] turn.prompt                     { "agentId": "main", "input": [ { "type": "text", "text": "Look up before config changes" } ], "origin": { "kind": "user" }, "promptId": "<msg-1>", "turnId": 0, "time": "<time>" }
+      [emit] prompt.submitted                { "time": "<time>", "agentId": "main", "promptId": "<msg-1>", "userMessageId": "<msg-1>", "status": "running", "content": [ { "type": "text", "text": "Look up before config changes" } ], "origin": { "kind": "user" }, "createdAt": "<time>" }
+      [wire] turn.prompt                     { "agentId": "main", "input": [ { "type": "text", "text": "Look up before config changes" } ], "origin": { "kind": "user" }, "promptId": "<msg-1>", "turnId": 0, "trigger": "normal", "time": "<time>" }
+      [emit] context.spliced                 { "time": "<time>", "agentId": "main", "start": 0, "deleteCount": 0, "messages": [ { "role": "user", "content": [ { "type": "text", "text": "Look up before config changes" } ], "id": "<msg-1>", "origin": { "kind": "user" } } ] }
+      [wire] context.append_message          { "agentId": "main", "message": { "role": "user", "content": [ { "type": "text", "text": "Look up before config changes" } ], "toolCalls": [], "id": "<msg-1>", "origin": { "kind": "user" } }, "time": "<time>" }
+      [emit] turn.prompt                     { "time": "<time>", "agentId": "main", "input": [ { "type": "text", "text": "Look up before config changes" } ], "origin": { "kind": "user" }, "promptId": "<msg-1>", "turnId": 0, "trigger": "normal" }
       [emit] turn.started                    { "time": "<time>", "agentId": "main", "turnId": 0, "promptId": "<msg-1>", "origin": { "kind": "user" }, "prompt": "Look up before config changes" }
-      [emit] context.spliced                 { "time": "<time>", "agentId": "main", "start": 0, "deleteCount": 0, "messages": [ { "role": "user", "content": [ { "type": "text", "text": "Look up before config changes" } ], "id": "<msg-1>", "toolCalls": [], "origin": { "kind": "user" } } ] }
       [emit] prompt.started                  { "time": "<time>", "agentId": "main", "promptId": "<msg-1>" }
-      [wire] context.append_message          { "agentId": "main", "message": { "role": "user", "content": [ { "type": "text", "text": "Look up before config changes" } ], "id": "<msg-1>", "toolCalls": [], "origin": { "kind": "user" } }, "time": "<time>" }
-      [wire] agent.message.appended          { "message": { "message": { "role": "user", "content": [ { "type": "text", "text": "Look up before config changes" } ] }, "meta": { "source": "input", "promptId": "<msg-1>", "origin": { "kind": "user" }, "tracked": true, "createdAt": "<time>", "userMessageId": "<msg-1>" } }, "time": "<time>", "kind": "event" }
-      [wire] agent.turn.started              { "turnId": 0, "queueItemId": "<msg-1>", "time": "<time>", "kind": "event" }
-      [wire] plugin.session_start            { "agentId": "main", "content": null, "time": "<time>" }
       [emit] turn.step.started               { "time": "<time>", "agentId": "main", "turnId": 0, "step": 1, "stepId": "<uuid-1>" }
-      [wire] context.append_loop_event       { "agentId": "main", "event": { "type": "step.begin", "uuid": "<uuid-1>", "turnId": "0", "step": 1 }, "time": "<time>" }
-      [emit] assistant.delta                 { "time": "<time>", "agentId": "main", "turnId": 0, "delta": "I will look it up." }
-      [wire] llm.tools_snapshot              { "agentId": "main", "hash": "3bfeb22e61431247933e79f6ab94e7ca14a127f899bc87e7bbd22594ba9cdb66", "tools": [ { "name": "Lookup", "description": "Look up a short test value.", "parameters": { "type": "object", "properties": { "query": { "type": "string" } }, "required": [ "query" ], "additionalProperties": false } } ], "time": "<time>" }
+      [wire] plugin.session_start            { "agentId": "main", "content": null, "time": "<time>" }
+      [wire] tool_select.initialized         { "agentId": "main", "tools": [ "Agent", "AgentSwarm", "AskUserQuestion", "Bash", "CreateGoal", "CronCreate", "CronDelete", "CronList", "Edit", "ExitPlanMode", "FetchURL", "GetGoal", "Glob", "Grep", "Lookup", "Read", "ReadMediaFile", "select_tools", "SetGoalBudget", "Skill", "TaskList", "TaskOutput", "TaskStop", "TodoList", "UpdateGoal", "WaitFor", "Write" ], "time": "<time>" }
+      [wire] context.append_loop_event       { "agentId": "main", "event": { "type": "step.begin", "uuid": "<uuid-2>", "turnId": "0", "step": 1 }, "time": "<time>" }
+      [emit] assistant.delta                 { "time": "<time>", "agentId": "main", "turnId": 0, "delta": "I will look it up.", "block": 0 }
       [emit] tool.call.delta                 { "time": "<time>", "agentId": "main", "turnId": 0, "toolCallId": "call_lookup", "name": "Lookup", "argumentsPart": "{\\"query\\":\\"original\\"}" }
-      [wire] llm.request                     { "agentId": "main", "kind": "loop", "provider": "openai", "model": "mock-model", "modelAlias": "mock-model", "thinkingEffort": "off", "maxTokens": 1000000, "toolSelect": false, "systemPromptHash": "ec9c34379c88babbc468ef2f3e0e08cd2f422c8c4a910664fb8bb394d703a575", "toolsHash": "3bfeb22e61431247933e79f6ab94e7ca14a127f899bc87e7bbd22594ba9cdb66", "messageCount": 1, "turnStep": "0.1", "time": "<time>" }
+      [wire] llm.tools_snapshot              { "agentId": "main", "hash": "<tools-hash>", "tools": [ "Agent", "AgentSwarm", "AskUserQuestion", "Bash", "CreateGoal", "CronCreate", "CronDelete", "CronList", "Edit", "ExitPlanMode", "FetchURL", "GetGoal", "Glob", "Grep", "Read", "SetGoalBudget", "Skill", "TaskList", "TaskOutput", "TaskStop", "TodoList", "UpdateGoal", "WaitFor", "Write" ], "time": "<time>" }
+      [emit] context.spliced                 { "time": "<time>", "agentId": "main", "start": 1, "deleteCount": 0, "messages": [ { "role": "assistant", "content": [ { "type": "text", "text": "I will look it up." } ], "toolCalls": [ { "type": "function", "id": "call_lookup", "name": "Lookup", "arguments": "{\\"query\\":\\"original\\"}" } ], "providerMessageId": "mock-1", "usage": { "inputOther": 9, "output": 17, "inputCacheRead": 0, "inputCacheCreation": 0 } } ] }
       [emit] agent.status.updated            { "time": "<time>", "agentId": "main", "usage": { "byModel": { "mock-model": { "inputOther": 9, "output": 17, "inputCacheRead": 0, "inputCacheCreation": 0 } }, "total": { "inputOther": 9, "output": 17, "inputCacheRead": 0, "inputCacheCreation": 0 }, "currentTurn": { "inputOther": 9, "output": 17, "inputCacheRead": 0, "inputCacheCreation": 0 } } }
       [emit] agent.status.updated            { "time": "<time>", "agentId": "main", "contextTokens": 26 }
+      [wire] context.append_loop_event       { "agentId": "main", "event": { "type": "content.part", "uuid": "<uuid-3>", "turnId": "0", "step": 1, "stepUuid": "<uuid-2>", "block": 0, "part": { "type": "text", "text": "I will look it up." }, "startedAt": "<time>" }, "time": "<time>" }
       [wire] usage.record                    { "agentId": "main", "model": "mock-model", "usage": { "inputOther": 9, "output": 17, "inputCacheRead": 0, "inputCacheCreation": 0 }, "usageScope": "turn", "time": "<time>" }
       [wire] token_counting.measured         { "agentId": "main", "length": 2, "tokens": 26, "time": "<time>" }
-      [wire] context.append_loop_event       { "agentId": "main", "event": { "type": "content.part", "uuid": "<uuid-2>", "turnId": "0", "step": 1, "stepUuid": "<uuid-1>", "part": { "type": "text", "text": "I will look it up." } }, "time": "<time>" }
       [emit] permission.approval.requested   { "time": "<time>", "id": "<approval-1>", "sessionId": "test-session", "agentId": "main", "turnId": 0, "toolCallId": "call_lookup", "toolName": "Lookup", "action": "Approve Lookup", "display": { "kind": "generic", "summary": "Approve Lookup", "detail": { "query": "original" } }, "toolInput": { "query": "original" } }
       [wire] interaction.request             { "agentId": "main", "id": "<approval-1>", "kind": "approval", "toolCallId": "call_lookup", "request": { "id": "<approval-1>", "sessionId": "test-session", "agentId": "main", "turnId": 0, "toolCallId": "call_lookup", "toolName": "Lookup", "action": "Approve Lookup", "display": { "kind": "generic", "summary": "Approve Lookup", "detail": { "query": "original" } } }, "time": "<time>" }
       [emit] requestApproval                 { "id": "<approval-1>", "turnId": 0, "toolCallId": "call_lookup", "toolName": "Lookup", "action": "Approve Lookup", "display": { "kind": "generic", "summary": "Approve Lookup", "detail": { "query": "original" } } }
     `);
     expect(ctx.lastLlmInput()).toMatchInlineSnapshot(`
       system: <system-prompt>
-      tools: Lookup
+      tools: Agent, AgentSwarm, AskUserQuestion, Bash, CreateGoal, CronCreate, CronDelete, CronList, Edit, ExitPlanMode, FetchURL, GetGoal, Glob, Grep, Read, SetGoalBudget, Skill, TaskList, TaskOutput, TaskStop, TodoList, UpdateGoal, WaitFor, Write
       messages:
         user: text "Look up before config changes"
     `);
@@ -367,36 +376,31 @@ describe('Agent config', () => {
     ctx.mockNextResponse({ type: 'text', text: 'Still using the original turn config.' });
     await toolCallEvents;
     expect(await ctx.untilTurnEnd()).toMatchInlineSnapshot(`
-      [wire] context.append_loop_event   { "agentId": "main", "event": { "type": "tool.call", "uuid": "<uuid-3>", "turnId": "0", "step": 1, "stepUuid": "<uuid-1>", "toolCallId": "call_lookup", "name": "Lookup", "args": { "query": "original" } }, "time": "<time>" }
+      [wire] context.append_loop_event   { "agentId": "main", "event": { "type": "tool.call", "uuid": "<uuid-4>", "turnId": "0", "step": 1, "stepUuid": "<uuid-2>", "toolCallId": "call_lookup", "name": "Lookup", "args": { "query": "original" } }, "time": "<time>" }
       [wire] interaction.request         { "agentId": "main", "id": "<user_tool-2>", "kind": "user_tool", "toolCallId": "call_lookup", "request": { "turnId": 0, "toolCallId": "call_lookup", "name": "Lookup", "args": { "query": "original" } }, "time": "<time>" }
       [wire] interaction.resolved        { "agentId": "main", "id": "<user_tool-2>", "response": { "content": "original-result", "output": "original-result" }, "time": "<time>" }
-      [emit] tool.result                 { "time": "<time>", "agentId": "main", "turnId": 0, "toolCallId": "call_lookup", "output": "original-result" }
-      [wire] context.append_loop_event   { "agentId": "main", "event": { "type": "tool.result", "parentUuid": "<uuid-3>", "toolCallId": "call_lookup", "result": { "output": "original-result" } }, "time": "<time>" }
+      [emit] tool.updated                { "time": "<time>", "agentId": "main", "origin": "loop", "turnId": 0, "toolCallId": "call_lookup", "taskId": "<taskId>", "status": "running", "detached": false, "fields": {} }
+      [emit] tool.updated                { "time": "<time>", "agentId": "main", "origin": "loop", "turnId": 0, "toolCallId": "call_lookup", "taskId": "<taskId>", "status": "success", "detached": false, "fields": {} }
+      [emit] tool.result                 { "time": "<time>", "agentId": "main", "origin": "loop", "turnId": 0, "toolCallId": "call_lookup", "output": "original-result" }
       [emit] turn.step.completed         { "time": "<time>", "agentId": "main", "turnId": 0, "step": 1, "stepId": "<uuid-1>", "usage": { "inputOther": 9, "output": 17, "inputCacheRead": 0, "inputCacheCreation": 0 }, "finishReason": "tool_use", "providerFinishReason": "tool_calls", "rawFinishReason": "tool_calls" }
-      [wire] context.append_loop_event   { "agentId": "main", "event": { "type": "step.end", "uuid": "<uuid-1>", "turnId": "0", "step": 1, "finishReason": "tool_use", "usage": { "inputOther": 9, "output": 17, "inputCacheRead": 0, "inputCacheCreation": 0 }, "messageId": "mock-1", "providerFinishReason": "tool_calls", "rawFinishReason": "tool_calls" }, "time": "<time>" }
-      [emit] context.spliced             { "time": "<time>", "agentId": "main", "start": 3, "deleteCount": 0, "messages": [ { "role": "user", "content": [ { "type": "text", "text": "<date-reminder>" } ], "toolCalls": [], "origin": { "kind": "injection", "variant": "date_change", "disclosure": { "kind": "date", "renderGeneration": 2, "localDate": "<date>", "timeZone": "<time-zone>" } } } ] }
+      [emit] context.spliced             { "time": "<time>", "agentId": "main", "start": 2, "deleteCount": 0, "messages": [ { "role": "tool", "content": [ { "type": "text", "text": "original-result" } ], "toolCallId": "call_lookup" } ] }
+      [wire] context.append_loop_event   { "agentId": "main", "event": { "type": "tool.result", "parentUuid": "<uuid-4>", "toolCallId": "call_lookup", "result": { "output": "original-result" } }, "time": "<time>" }
+      [emit] turn.step.started           { "time": "<time>", "agentId": "main", "turnId": 0, "step": 2, "stepId": "<uuid-5>" }
+      [wire] context.append_loop_event   { "agentId": "main", "event": { "type": "step.end", "uuid": "<uuid-2>", "turnId": "0", "step": 1, "finishReason": "tool_use", "usage": { "inputOther": 9, "output": 17, "inputCacheRead": 0, "inputCacheCreation": 0 }, "messageId": "mock-1", "providerFinishReason": "tool_calls", "rawFinishReason": "tool_calls" }, "time": "<time>" }
+      [emit] context.spliced             { "time": "<time>", "agentId": "main", "start": 3, "deleteCount": 0, "messages": [ { "role": "user", "content": [ { "type": "text", "text": "<date-reminder>" } ], "origin": { "kind": "injection", "variant": "date_change", "disclosure": { "kind": "date", "renderGeneration": 2, "localDate": "<date>", "timeZone": "<time-zone>" } } } ] }
       [wire] context.append_message      { "agentId": "main", "message": { "role": "user", "content": [ { "type": "text", "text": "<date-reminder>" } ], "toolCalls": [], "origin": { "kind": "injection", "variant": "date_change", "disclosure": { "kind": "date", "renderGeneration": 2, "localDate": "<date>", "timeZone": "<time-zone>" } } }, "time": "<time>" }
-      [emit] turn.step.started           { "time": "<time>", "agentId": "main", "turnId": 0, "step": 2, "stepId": "<uuid-4>" }
-      [wire] context.append_loop_event   { "agentId": "main", "event": { "type": "step.begin", "uuid": "<uuid-4>", "turnId": "0", "step": 2 }, "time": "<time>" }
-      [emit] assistant.delta             { "time": "<time>", "agentId": "main", "turnId": 0, "delta": "Still using the original turn config." }
-      [wire] llm.tools_snapshot          { "agentId": "main", "hash": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945", "tools": [], "time": "<time>" }
-      [wire] llm.request                 { "agentId": "main", "kind": "loop", "provider": "openai", "model": "mock-model", "modelAlias": "mock-model", "thinkingEffort": "off", "maxTokens": 1000000, "toolSelect": false, "systemPromptHash": "ec9c34379c88babbc468ef2f3e0e08cd2f422c8c4a910664fb8bb394d703a575", "systemPrompt": "You are a deterministic test agent.", "toolsHash": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945", "messageCount": 4, "turnStep": "0.2", "time": "<time>" }
-      [emit] agent.status.updated        { "time": "<time>", "agentId": "main", "usage": { "byModel": { "mock-model": { "inputOther": 98, "output": 30, "inputCacheRead": 0, "inputCacheCreation": 0 } }, "total": { "inputOther": 98, "output": 30, "inputCacheRead": 0, "inputCacheCreation": 0 }, "currentTurn": { "inputOther": 98, "output": 30, "inputCacheRead": 0, "inputCacheCreation": 0 } } }
-      [emit] agent.status.updated        { "time": "<time>", "agentId": "main", "contextTokens": 102 }
-      [wire] usage.record                { "agentId": "main", "model": "mock-model", "usage": { "inputOther": 89, "output": 13, "inputCacheRead": 0, "inputCacheCreation": 0 }, "usageScope": "turn", "time": "<time>" }
-      [emit] turn.step.completed         { "time": "<time>", "agentId": "main", "turnId": 0, "step": 2, "stepId": "<uuid-4>", "usage": { "inputOther": 89, "output": 13, "inputCacheRead": 0, "inputCacheCreation": 0 }, "finishReason": "end_turn", "providerFinishReason": "completed", "rawFinishReason": "stop" }
-      [wire] token_counting.measured     { "agentId": "main", "length": 5, "tokens": 102, "time": "<time>" }
-      [wire] context.append_loop_event   { "agentId": "main", "event": { "type": "content.part", "uuid": "<uuid-5>", "turnId": "0", "step": 2, "stepUuid": "<uuid-4>", "part": { "type": "text", "text": "Still using the original turn config." } }, "time": "<time>" }
-      [wire] context.append_loop_event   { "agentId": "main", "event": { "type": "step.end", "uuid": "<uuid-4>", "turnId": "0", "step": 2, "finishReason": "end_turn", "usage": { "inputOther": 89, "output": 13, "inputCacheRead": 0, "inputCacheCreation": 0 }, "messageId": "mock-2", "providerFinishReason": "completed", "rawFinishReason": "stop" }, "time": "<time>" }
-      [wire] agent.message.appended      { "message": { "message": { "role": "assistant", "content": [ { "type": "text", "text": "I will look it up." } ], "toolCalls": [ { "type": "function", "id": "call_lookup", "name": "Lookup", "arguments": "{\\"query\\":\\"original\\"}" } ] }, "meta": { "model": { "provider": "agent-loop", "model": "agent-loop" }, "source": "llm", "usage": { "inputOther": 9, "output": 17, "inputCacheRead": 0, "inputCacheCreation": 0 }, "finish": { "finishReason": "tool_calls", "rawFinishReason": "tool_calls" }, "messageId": "mock-1" } }, "time": "<time>", "kind": "event" }
-      [wire] agent.message.appended      { "message": { "message": { "role": "tool", "content": [ { "type": "text", "text": "original-result" } ], "toolCallId": "call_lookup" }, "meta": { "source": "tool" } }, "time": "<time>", "kind": "event" }
-      [wire] agent.message.appended      { "message": { "message": { "role": "assistant", "content": [ { "type": "text", "text": "Still using the original turn config." } ], "toolCalls": [] }, "meta": { "model": { "provider": "agent-loop", "model": "agent-loop" }, "source": "llm", "usage": { "inputOther": 89, "output": 13, "inputCacheRead": 0, "inputCacheCreation": 0 }, "finish": { "finishReason": "completed", "rawFinishReason": "stop" }, "messageId": "mock-2" } }, "time": "<time>", "kind": "event" }
-      [wire] agent.turn.ended            { "turnId": 0, "outcome": "done", "time": "<time>", "kind": "event" }
-      [wire] turn.ended                  { "agentId": "main", "turnId": 0, "reason": "completed", "time": "<time>" }
+      [wire] context.append_loop_event   { "agentId": "main", "event": { "type": "step.begin", "uuid": "<uuid-6>", "turnId": "0", "step": 2 }, "time": "<time>" }
+      [emit] assistant.delta             { "time": "<time>", "agentId": "main", "turnId": 0, "delta": "Still using the original turn config.", "block": 0 }
+      [emit] context.spliced             { "time": "<time>", "agentId": "main", "start": 4, "deleteCount": 0, "messages": [ { "role": "assistant", "content": [ { "type": "text", "text": "Still using the original turn config." } ], "toolCalls": [], "providerMessageId": "mock-2", "usage": { "inputOther": 103, "output": 13, "inputCacheRead": 0, "inputCacheCreation": 0 } } ] }
+      [emit] turn.step.completed         { "time": "<time>", "agentId": "main", "turnId": 0, "step": 2, "stepId": "<uuid-5>", "usage": { "inputOther": 103, "output": 13, "inputCacheRead": 0, "inputCacheCreation": 0 }, "finishReason": "end_turn", "providerFinishReason": "completed", "rawFinishReason": "stop" }
+      [emit] agent.status.updated        { "time": "<time>", "agentId": "main", "usage": { "byModel": { "mock-model": { "inputOther": 112, "output": 30, "inputCacheRead": 0, "inputCacheCreation": 0 } }, "total": { "inputOther": 112, "output": 30, "inputCacheRead": 0, "inputCacheCreation": 0 }, "currentTurn": { "inputOther": 112, "output": 30, "inputCacheRead": 0, "inputCacheCreation": 0 } } }
+      [emit] agent.status.updated        { "time": "<time>", "agentId": "main", "contextTokens": 116 }
+      [wire] context.append_loop_event   { "agentId": "main", "event": { "type": "content.part", "uuid": "<uuid-7>", "turnId": "0", "step": 2, "stepUuid": "<uuid-6>", "block": 0, "part": { "type": "text", "text": "Still using the original turn config." }, "startedAt": "<time>" }, "time": "<time>" }
+      [wire] usage.record                { "agentId": "main", "model": "mock-model", "usage": { "inputOther": 103, "output": 13, "inputCacheRead": 0, "inputCacheCreation": 0 }, "usageScope": "turn", "time": "<time>" }
+      [wire] token_counting.measured     { "agentId": "main", "length": 5, "tokens": 116, "time": "<time>" }
       [emit] turn.ended                  { "time": "<time>", "agentId": "main", "turnId": 0, "reason": "completed" }
     `);
     expect(ctx.lastLlmInput()).toMatchInlineSnapshot(`
-      tools: []
       messages:
         <last>
         assistant: text "I will look it up."  calls call_lookup:Lookup { "query": "original" }
@@ -408,32 +412,29 @@ describe('Agent config', () => {
     await ctx.rpc.prompt({ input: [{ type: 'text', text: 'Start a fresh turn' }] });
 
     expect(await ctx.untilTurnEnd()).toMatchInlineSnapshot(`
-      [wire] token_counting.turn_recorded   { "agentId": "main", "turnId": 0, "length": 5, "tokens": 102, "time": "<time>" }
-      [emit] agent.status.updated           { "time": "<time>", "agentId": "main", "contextTokens": 102 }
-      [wire] prompt.completed               { "agentId": "main", "promptId": "<msg-1>", "finishedAt": "<time>", "reason": "completed", "time": "<time>" }
+      [emit] agent.status.updated           { "time": "<time>", "agentId": "main", "contextTokens": 116 }
       [emit] prompt.completed               { "time": "<time>", "agentId": "main", "promptId": "<msg-1>", "finishedAt": "<time>", "reason": "completed" }
-      [emit] prompt.submitted               { "time": "<time>", "agentId": "main", "promptId": "<msg-2>", "userMessageId": "<msg-2>", "status": "running", "content": [ { "type": "text", "text": "Start a fresh turn" } ], "createdAt": "<time>" }
-      [wire] turn.prompt                    { "agentId": "main", "input": [ { "type": "text", "text": "Start a fresh turn" } ], "origin": { "kind": "user" }, "promptId": "<msg-2>", "turnId": 1, "time": "<time>" }
+      [wire] context.append_loop_event      { "agentId": "main", "event": { "type": "step.end", "uuid": "<uuid-6>", "turnId": "0", "step": 2, "finishReason": "end_turn", "usage": { "inputOther": 103, "output": 13, "inputCacheRead": 0, "inputCacheCreation": 0 }, "messageId": "mock-2", "providerFinishReason": "completed", "rawFinishReason": "stop" }, "time": "<time>" }
+      [wire] turn.ended                     { "agentId": "main", "turnId": 0, "reason": "completed", "time": "<time>" }
+      [wire] token_counting.turn_recorded   { "agentId": "main", "turnId": 0, "length": 5, "tokens": 116, "time": "<time>" }
+      [wire] prompt.completed               { "agentId": "main", "promptId": "<msg-1>", "finishedAt": "<time>", "reason": "completed", "time": "<time>" }
+      [emit] prompt.submitted               { "time": "<time>", "agentId": "main", "promptId": "<msg-2>", "userMessageId": "<msg-2>", "status": "running", "content": [ { "type": "text", "text": "Start a fresh turn" } ], "origin": { "kind": "user" }, "createdAt": "<time>" }
+      [wire] turn.prompt                    { "agentId": "main", "input": [ { "type": "text", "text": "Start a fresh turn" } ], "origin": { "kind": "user" }, "promptId": "<msg-2>", "turnId": 1, "trigger": "normal", "time": "<time>" }
+      [emit] context.spliced                { "time": "<time>", "agentId": "main", "start": 5, "deleteCount": 0, "messages": [ { "role": "user", "content": [ { "type": "text", "text": "Start a fresh turn" } ], "id": "<msg-2>", "origin": { "kind": "user" } } ] }
+      [wire] context.append_message         { "agentId": "main", "message": { "role": "user", "content": [ { "type": "text", "text": "Start a fresh turn" } ], "toolCalls": [], "id": "<msg-2>", "origin": { "kind": "user" } }, "time": "<time>" }
+      [emit] turn.prompt                    { "time": "<time>", "agentId": "main", "input": [ { "type": "text", "text": "Start a fresh turn" } ], "origin": { "kind": "user" }, "promptId": "<msg-2>", "turnId": 1, "trigger": "normal" }
       [emit] turn.started                   { "time": "<time>", "agentId": "main", "turnId": 1, "promptId": "<msg-2>", "origin": { "kind": "user" }, "prompt": "Start a fresh turn" }
-      [emit] context.spliced                { "time": "<time>", "agentId": "main", "start": 5, "deleteCount": 0, "messages": [ { "role": "user", "content": [ { "type": "text", "text": "Start a fresh turn" } ], "id": "<msg-2>", "toolCalls": [], "origin": { "kind": "user" } } ] }
       [emit] prompt.started                 { "time": "<time>", "agentId": "main", "promptId": "<msg-2>" }
-      [wire] context.append_message         { "agentId": "main", "message": { "role": "user", "content": [ { "type": "text", "text": "Start a fresh turn" } ], "id": "<msg-2>", "toolCalls": [], "origin": { "kind": "user" } }, "time": "<time>" }
-      [wire] agent.message.appended         { "message": { "message": { "role": "user", "content": [ { "type": "text", "text": "Start a fresh turn" } ] }, "meta": { "source": "input", "promptId": "<msg-2>", "origin": { "kind": "user" }, "tracked": true, "createdAt": "<time>", "userMessageId": "<msg-2>" } }, "time": "<time>", "kind": "event" }
-      [wire] agent.turn.started             { "turnId": 1, "queueItemId": "<msg-2>", "time": "<time>", "kind": "event" }
-      [emit] turn.step.started              { "time": "<time>", "agentId": "main", "turnId": 1, "step": 1, "stepId": "<uuid-6>" }
-      [wire] context.append_loop_event      { "agentId": "main", "event": { "type": "step.begin", "uuid": "<uuid-6>", "turnId": "1", "step": 1 }, "time": "<time>" }
-      [emit] assistant.delta                { "time": "<time>", "agentId": "main", "turnId": 1, "delta": "Now the changed config is active." }
-      [wire] llm.request                    { "agentId": "main", "kind": "loop", "provider": "openai", "model": "changed-model", "modelAlias": "changed-model", "thinkingEffort": "off", "maxTokens": 1000000, "toolSelect": false, "systemPromptHash": "7617cb8b42659214c397a1d7505fce204b673b078a10de8bcccc697d88dcda56", "toolsHash": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945", "messageCount": 6, "turnStep": "1.1", "time": "<time>" }
-      [wire] usage.record                   { "agentId": "main", "model": "changed-model", "usage": { "inputOther": 108, "output": 12, "inputCacheRead": 0, "inputCacheCreation": 0 }, "usageScope": "turn", "time": "<time>" }
-      [emit] agent.status.updated           { "time": "<time>", "agentId": "main", "usage": { "byModel": { "mock-model": { "inputOther": 98, "output": 30, "inputCacheRead": 0, "inputCacheCreation": 0 }, "changed-model": { "inputOther": 108, "output": 12, "inputCacheRead": 0, "inputCacheCreation": 0 } }, "total": { "inputOther": 206, "output": 42, "inputCacheRead": 0, "inputCacheCreation": 0 }, "currentTurn": { "inputOther": 108, "output": 12, "inputCacheRead": 0, "inputCacheCreation": 0 } } }
-      [wire] token_counting.measured        { "agentId": "main", "length": 7, "tokens": 120, "time": "<time>" }
-      [emit] agent.status.updated           { "time": "<time>", "agentId": "main", "contextTokens": 120 }
-      [emit] turn.step.completed            { "time": "<time>", "agentId": "main", "turnId": 1, "step": 1, "stepId": "<uuid-6>", "usage": { "inputOther": 108, "output": 12, "inputCacheRead": 0, "inputCacheCreation": 0 }, "finishReason": "end_turn", "providerFinishReason": "completed", "rawFinishReason": "stop" }
-      [wire] context.append_loop_event      { "agentId": "main", "event": { "type": "content.part", "uuid": "<uuid-7>", "turnId": "1", "step": 1, "stepUuid": "<uuid-6>", "part": { "type": "text", "text": "Now the changed config is active." } }, "time": "<time>" }
-      [wire] context.append_loop_event      { "agentId": "main", "event": { "type": "step.end", "uuid": "<uuid-6>", "turnId": "1", "step": 1, "finishReason": "end_turn", "usage": { "inputOther": 108, "output": 12, "inputCacheRead": 0, "inputCacheCreation": 0 }, "messageId": "mock-3", "providerFinishReason": "completed", "rawFinishReason": "stop" }, "time": "<time>" }
-      [wire] agent.message.appended         { "message": { "message": { "role": "assistant", "content": [ { "type": "text", "text": "Now the changed config is active." } ], "toolCalls": [] }, "meta": { "model": { "provider": "agent-loop", "model": "agent-loop" }, "source": "llm", "usage": { "inputOther": 108, "output": 12, "inputCacheRead": 0, "inputCacheCreation": 0 }, "finish": { "finishReason": "completed", "rawFinishReason": "stop" }, "messageId": "mock-3" } }, "time": "<time>", "kind": "event" }
-      [wire] agent.turn.ended               { "turnId": 1, "outcome": "done", "time": "<time>", "kind": "event" }
-      [wire] turn.ended                     { "agentId": "main", "turnId": 1, "reason": "completed", "time": "<time>" }
+      [emit] turn.step.started              { "time": "<time>", "agentId": "main", "turnId": 1, "step": 1, "stepId": "<uuid-8>" }
+      [wire] context.append_loop_event      { "agentId": "main", "event": { "type": "step.begin", "uuid": "<uuid-9>", "turnId": "1", "step": 1 }, "time": "<time>" }
+      [emit] assistant.delta                { "time": "<time>", "agentId": "main", "turnId": 1, "delta": "Now the changed config is active.", "block": 0 }
+      [emit] context.spliced                { "time": "<time>", "agentId": "main", "start": 6, "deleteCount": 0, "messages": [ { "role": "assistant", "content": [ { "type": "text", "text": "Now the changed config is active." } ], "toolCalls": [], "providerMessageId": "mock-3", "usage": { "inputOther": 122, "output": 12, "inputCacheRead": 0, "inputCacheCreation": 0 } } ] }
+      [emit] turn.step.completed            { "time": "<time>", "agentId": "main", "turnId": 1, "step": 1, "stepId": "<uuid-8>", "usage": { "inputOther": 122, "output": 12, "inputCacheRead": 0, "inputCacheCreation": 0 }, "finishReason": "end_turn", "providerFinishReason": "completed", "rawFinishReason": "stop" }
+      [emit] agent.status.updated           { "time": "<time>", "agentId": "main", "usage": { "byModel": { "mock-model": { "inputOther": 112, "output": 30, "inputCacheRead": 0, "inputCacheCreation": 0 }, "changed-model": { "inputOther": 122, "output": 12, "inputCacheRead": 0, "inputCacheCreation": 0 } }, "total": { "inputOther": 234, "output": 42, "inputCacheRead": 0, "inputCacheCreation": 0 }, "currentTurn": { "inputOther": 122, "output": 12, "inputCacheRead": 0, "inputCacheCreation": 0 } } }
+      [emit] agent.status.updated           { "time": "<time>", "agentId": "main", "contextTokens": 134 }
+      [wire] context.append_loop_event      { "agentId": "main", "event": { "type": "content.part", "uuid": "<uuid-10>", "turnId": "1", "step": 1, "stepUuid": "<uuid-9>", "block": 0, "part": { "type": "text", "text": "Now the changed config is active." }, "startedAt": "<time>" }, "time": "<time>" }
+      [wire] usage.record                   { "agentId": "main", "model": "changed-model", "usage": { "inputOther": 122, "output": 12, "inputCacheRead": 0, "inputCacheCreation": 0 }, "usageScope": "turn", "time": "<time>" }
+      [wire] token_counting.measured        { "agentId": "main", "length": 7, "tokens": 134, "time": "<time>" }
       [emit] turn.ended                     { "time": "<time>", "agentId": "main", "turnId": 1, "reason": "completed" }
     `);
     expect(ctx.lastLlmInput()).toMatchInlineSnapshot(`
@@ -465,6 +466,73 @@ describe('ConfigService env overlay (live)', () => {
     expect(config.get<CronConfig>('cron').disabled).toBe(true);
     env['KIMI_DISABLE_CRON'] = '0';
     expect(config.get<CronConfig>('cron').disabled).toBe(false);
+
+    disposables.dispose();
+  });
+
+  it('re-validates an env-bound section only when its env values change', async () => {
+    const env: Record<string, string> = {};
+    const disposables = new DisposableStore();
+    const ix = disposables.add(new TestInstantiationService());
+    ix.stub(ILogService, stubLog());
+    ix.stub(IBootstrapService, stubBootstrap('/tmp/kimi-cfg', env));
+    ix.stub(IFileSystemStorageService, new InMemoryStorageService());
+    ix.set(IAtomicTomlDocumentStore, new SyncDescriptor(TomlAtomicDocumentStore));
+    ix.set(IConfigRegistry, new SyncDescriptor(ConfigRegistry));
+    ix.set(IConfigService, new SyncDescriptor(ConfigService));
+    const config = ix.get(IConfigService);
+    await config.ready;
+
+    const parse = vi.fn((value: unknown) => value as { value?: string });
+    ix.get(IConfigRegistry).registerSection('memoDemo', { parse }, {
+      env: { value: 'MEMO_DEMO_ENV' },
+    });
+    parse.mockClear();
+
+    expect(config.get<{ value?: string }>('memoDemo')).toEqual({});
+    expect(config.get<{ value?: string }>('memoDemo')).toEqual({});
+    expect(parse).toHaveBeenCalledTimes(1);
+
+    env['MEMO_DEMO_ENV'] = 'from-env';
+    expect(config.get<{ value?: string }>('memoDemo')).toEqual({ value: 'from-env' });
+    expect(config.get<{ value?: string }>('memoDemo')).toEqual({ value: 'from-env' });
+    expect(parse).toHaveBeenCalledTimes(2);
+
+    delete env['MEMO_DEMO_ENV'];
+    expect(config.get<{ value?: string }>('memoDemo')).toEqual({});
+    expect(parse).toHaveBeenCalledTimes(3);
+
+    disposables.dispose();
+  });
+
+  it('drops a memoized env-bound value when its domain is re-registered by another section', async () => {
+    const env: Record<string, string> = { REBOUND_DEMO_ENV: 'x' };
+    const disposables = new DisposableStore();
+    const ix = disposables.add(new TestInstantiationService());
+    ix.stub(ILogService, stubLog());
+    ix.stub(IBootstrapService, stubBootstrap('/tmp/kimi-cfg', env));
+    ix.stub(IFileSystemStorageService, new InMemoryStorageService());
+    ix.set(IAtomicTomlDocumentStore, new SyncDescriptor(TomlAtomicDocumentStore));
+    ix.set(IConfigRegistry, new SyncDescriptor(ConfigRegistry));
+    ix.set(IConfigService, new SyncDescriptor(ConfigService));
+    const config = ix.get(IConfigService);
+    await config.ready;
+    const registry = ix.get(IConfigRegistry);
+
+    registry.registerSection(
+      'reboundDemo',
+      { parse: (value: unknown) => `first:${String(value)}` },
+      { env: 'REBOUND_DEMO_ENV' },
+    );
+    expect(config.get('reboundDemo')).toBe('first:x');
+
+    registry.unregisterSection('reboundDemo');
+    registry.registerSection(
+      'reboundDemo',
+      { parse: (value: unknown) => `second:${String(value)}` },
+      { env: 'REBOUND_DEMO_ENV' },
+    );
+    expect(config.get('reboundDemo')).toBe('second:x');
 
     disposables.dispose();
   });
@@ -1511,7 +1579,7 @@ describe('task config section', () => {
       '',
       'config.toml',
       new TextEncoder().encode(
-        '[background]\nmax_running_tasks = 3\nkill_grace_period_ms = 25\n',
+        '[background]\nbash_task_timeout_s = 3\nkill_grace_period_ms = 25\n',
       ),
     );
     ix.stub(ILogService, stubLog());
@@ -1524,7 +1592,7 @@ describe('task config section', () => {
     await config.ready;
 
     expect(resolveAgentTaskConfig(config)).toEqual({
-      maxRunningTasks: 3,
+      bashTaskTimeoutS: 3,
       killGracePeriodMs: 25,
       keepAliveOnExit: true,
     });
@@ -1532,35 +1600,35 @@ describe('task config section', () => {
     disposables.dispose();
   });
 
-  it('re-applies the maxRunningTasks env binding on every get() and ignores invalid env', async () => {
+  it('re-applies the bashTaskTimeoutS env binding on every get() and ignores invalid env', async () => {
     const env: Record<string, string> = {};
     const { config, disposables } = await createTaskConfig(env);
 
-    expect(config.get<AgentTaskConfig>('task')?.maxRunningTasks).toBeUndefined();
+    expect(config.get<AgentTaskConfig>('task')?.bashTaskTimeoutS).toBeUndefined();
 
-    env[MAX_RUNNING_TASKS_ENV] = 'abc';
-    expect(config.get<AgentTaskConfig>('task')?.maxRunningTasks).toBeUndefined();
-    env[MAX_RUNNING_TASKS_ENV] = '0';
-    expect(config.get<AgentTaskConfig>('task')?.maxRunningTasks).toBeUndefined();
+    env[BASH_TASK_TIMEOUT_S_ENV] = 'abc';
+    expect(config.get<AgentTaskConfig>('task')?.bashTaskTimeoutS).toBeUndefined();
+    env[BASH_TASK_TIMEOUT_S_ENV] = '0';
+    expect(config.get<AgentTaskConfig>('task')?.bashTaskTimeoutS).toBe(0);
 
-    env[MAX_RUNNING_TASKS_ENV] = '4';
-    expect(config.get<AgentTaskConfig>('task')?.maxRunningTasks).toBe(4);
-    expect(config.get<AgentTaskConfig>('background')?.maxRunningTasks).toBe(4);
+    env[BASH_TASK_TIMEOUT_S_ENV] = '4';
+    expect(config.get<AgentTaskConfig>('task')?.bashTaskTimeoutS).toBe(4);
+    expect(config.get<AgentTaskConfig>('background')?.bashTaskTimeoutS).toBe(4);
 
-    env[MAX_RUNNING_TASKS_ENV] = '2';
-    expect(config.get<AgentTaskConfig>('task')?.maxRunningTasks).toBe(2);
+    env[BASH_TASK_TIMEOUT_S_ENV] = '2';
+    expect(config.get<AgentTaskConfig>('task')?.bashTaskTimeoutS).toBe(2);
 
     disposables.dispose();
   });
 
-  it('lets the maxRunningTasks env binding override the config value', async () => {
-    const env: Record<string, string> = { [MAX_RUNNING_TASKS_ENV]: '8' };
+  it('lets the bashTaskTimeoutS env binding override the config value', async () => {
+    const env: Record<string, string> = { [BASH_TASK_TIMEOUT_S_ENV]: '8' };
     const { config, disposables } = await createTaskConfig(
       env,
-      '[background]\nmax_running_tasks = 3\n',
+      '[background]\nbash_task_timeout_s = 3\n',
     );
 
-    expect(resolveAgentTaskConfig(config)?.maxRunningTasks).toBe(8);
+    expect(resolveAgentTaskConfig(config)?.bashTaskTimeoutS).toBe(8);
 
     disposables.dispose();
   });
@@ -1568,26 +1636,26 @@ describe('task config section', () => {
   it('restores env-owned fields to the raw value on set() while the env var is set', async () => {
     const env: Record<string, string> = {
       [KEEP_ALIVE_ON_EXIT_ENV]: 'true',
-      [MAX_RUNNING_TASKS_ENV]: '8',
+      [BASH_TASK_TIMEOUT_S_ENV]: '8',
     };
     const { config, disposables } = await createTaskConfig(
       env,
-      '[background]\nmax_running_tasks = 3\n',
+      '[background]\nbash_task_timeout_s = 3\n',
     );
 
     await config.set('background', {
       keepAliveOnExit: true,
-      maxRunningTasks: 8,
+      bashTaskTimeoutS: 8,
       killGracePeriodMs: 25,
     });
 
     expect(config.get<AgentTaskConfig>('background')).toEqual({
       keepAliveOnExit: true,
-      maxRunningTasks: 8,
+      bashTaskTimeoutS: 8,
       killGracePeriodMs: 25,
     });
     expect(config.inspect<AgentTaskConfig>('background').userValue).toEqual({
-      maxRunningTasks: 3,
+      bashTaskTimeoutS: 3,
       killGracePeriodMs: 25,
     });
 
@@ -1983,7 +2051,7 @@ describe('subagent config section', () => {
     ix.set(IConfigService, new SyncDescriptor(ConfigService));
     const config = ix.get(IConfigService);
     await config.ready;
-    return { config, disposables };
+    return { config, disposables, storage };
   }
 
   it('defaults to two hours and honours the env override', async () => {
@@ -2057,7 +2125,7 @@ describe('subagent config section', () => {
     disposables.dispose();
   });
 
-  it('resolves the spawn binding: pool default, explicit alias, primary opt-in, inherit without pool', async () => {
+  it('resolves the spawn binding: pool default, explicit alias, inherit without pool', async () => {
     const own = { modelAlias: 'provider/main', thinkingLevel: 'medium' };
 
     const noPool = await createConfig({});
@@ -2066,11 +2134,9 @@ describe('subagent config section', () => {
       thinking: 'medium',
       modelSource: 'inherited',
     });
-    expect(resolveSubagentBinding(noPool.config, own, 'primary')).toEqual({
-      model: 'provider/main',
-      thinking: 'medium',
-      modelSource: 'primary_override',
-    });
+    expect(() => resolveSubagentBinding(noPool.config, own, 'primary')).toThrow(
+      /Invalid model "primary": no \[secondary_model\] pool is configured/,
+    );
     noPool.disposables.dispose();
 
     const pool = await createConfig(
@@ -2087,11 +2153,9 @@ describe('subagent config section', () => {
       thinking: undefined,
       modelSource: 'secondary_pool',
     });
-    expect(resolveSubagentBinding(pool.config, own, 'primary')).toEqual({
-      model: 'provider/main',
-      thinking: 'medium',
-      modelSource: 'primary_override',
-    });
+    expect(() => resolveSubagentBinding(pool.config, own, 'primary')).toThrow(
+      'Invalid model "primary". Available models: provider/fast, provider/smart.',
+    );
     pool.disposables.dispose();
   });
 
@@ -2107,13 +2171,11 @@ describe('subagent config section', () => {
       thinking: undefined,
       modelSource: 'secondary_pool',
     });
-    expect(resolveSubagentBinding(config, own, 'primary')).toEqual({
-      model: 'provider/main',
-      thinking: 'medium',
-      modelSource: 'primary_override',
-    });
+    expect(() => resolveSubagentBinding(config, own, 'primary')).toThrow(
+      'Invalid model "primary". Available models: provider/fast.',
+    );
     expect(() => resolveSubagentBinding(config, own, 'provider/smart')).toThrow(
-      /Invalid model "provider\/smart"\. Available models: provider\/fast, primary\./,
+      'Invalid model "provider/smart". Available models: provider/fast.',
     );
 
     disposables.dispose();
@@ -2140,7 +2202,7 @@ describe('subagent config section', () => {
       modelSource: 'secondary_pool',
     });
     expect(() => resolveSubagentBinding(config, own, 'provider/smart')).toThrow(
-      /Invalid model "provider\/smart"\. Available models: provider\/fast, primary\./,
+      'Invalid model "provider/smart". Available models: provider/fast.',
     );
 
     disposables.dispose();
@@ -2176,45 +2238,26 @@ describe('subagent config section', () => {
     disposables.dispose();
   });
 
-  it('lets force pin the legacy model fallback when no default_model is set', async () => {
-    const own = { modelAlias: 'provider/main', thinkingLevel: 'medium' };
-    const { config, disposables } = await createConfig(
+  it('ignores legacy recipe patch fields with a warning and keeps them on disk', async () => {
+    const { config, disposables, storage } = await createConfig(
       {},
-      '[secondary_model]\nmodel = "provider/fast"\nforce = true\n',
-    );
-
-    expect(resolveSubagentBinding(config, own)).toEqual({
-      model: 'provider/fast',
-      thinking: undefined,
-      modelSource: 'forced',
-    });
-    expect(() => resolveSubagentBinding(config, own, 'primary')).toThrow(
-      /Invalid model "primary": \[secondary_model\]\.force is set/,
-    );
-
-    disposables.dispose();
-  });
-
-  it('round-trips legacy recipe patch fields the pool resolution ignores', async () => {
-    const { config, disposables } = await createConfig(
-      {},
-      '[secondary_model]\nmodel = "provider/fast"\ndefault_effort = "low"\nmax_output_size = 8192\n',
+      '[secondary_model]\nmodel = "provider/fast"\ndefault_effort = "low"\nmax_output_size = 8192\ncapabilities = ["image_in"]\n',
     );
 
     expect(config.get<SecondaryModelConfig>(SECONDARY_MODEL_SECTION)).toEqual({
       model: 'provider/fast',
       defaultEffort: 'low',
-      maxOutputSize: 8192,
     });
-    expect(resolveSubagentModelPool(config)).toEqual({
-      defaultModel: 'provider/fast',
-      models: { 'provider/fast': '' },
+    expect(config.diagnostics()).toContainEqual({
+      domain: SECONDARY_MODEL_SECTION,
+      severity: 'warning',
+      message: secondaryModelRemovedKeysMessage(['max_output_size', 'capabilities']),
     });
 
     await config.set(SECONDARY_MODEL_SECTION, { defaultModel: 'provider/fast' });
-    const after = config.get<SecondaryModelConfig>(SECONDARY_MODEL_SECTION);
-    expect(after?.defaultEffort).toBe('low');
-    expect(after?.maxOutputSize).toBe(8192);
+    expect(config.get<SecondaryModelConfig>(SECONDARY_MODEL_SECTION)?.defaultEffort).toBe('low');
+    const onDisk = new TextDecoder().decode(await storage.read('', 'config.toml'));
+    expect(onDisk).toContain('max_output_size = 8192');
 
     disposables.dispose();
   });
@@ -2231,50 +2274,39 @@ describe('subagent config section', () => {
       thinking: 'max',
       modelSource: 'secondary_pool',
     });
-    expect(resolveSubagentBinding(config, own, 'primary')).toEqual({
-      model: 'provider/main',
-      thinking: 'medium',
-      modelSource: 'primary_override',
-    });
 
     disposables.dispose();
   });
 
-  it('binds every spawn to the forced default_model, rejecting even "primary"', async () => {
+  it('ignores the removed force key with a warning, keeping the pool semantics', async () => {
     const own = { modelAlias: 'provider/main', thinkingLevel: 'medium' };
-    const { config, disposables } = await createConfig(
-      {},
-      '[secondary_model]\ndefault_model = "provider/fast"\nforce = true\n',
-    );
+    const lone = await createConfig({}, '[secondary_model]\ndefault_model = "provider/fast"\nforce = true\n');
 
-    expect(config.get<SecondaryModelConfig>(SECONDARY_MODEL_SECTION)).toEqual({
+    expect(lone.config.get<SecondaryModelConfig>(SECONDARY_MODEL_SECTION)).toEqual({
       defaultModel: 'provider/fast',
-      force: true,
     });
-    expect(resolveSubagentBinding(config, own)).toEqual({
+    expect(lone.config.diagnostics()).toContainEqual({
+      domain: SECONDARY_MODEL_SECTION,
+      severity: 'warning',
+      message: SECONDARY_MODEL_FORCE_REMOVED_MESSAGE,
+    });
+    expect(resolveSubagentBinding(lone.config, own)).toEqual({
       model: 'provider/fast',
       thinking: undefined,
-      modelSource: 'forced',
+      modelSource: 'secondary_pool',
     });
-    expect(() => resolveSubagentBinding(config, own, 'primary')).toThrow(
-      /Invalid model "primary": \[secondary_model\]\.force is set/,
-    );
+    lone.disposables.dispose();
 
-    disposables.dispose();
-  });
-
-  it('rejects force combined with a models table at spawn resolution, matching startup validation', async () => {
-    const own = { modelAlias: 'provider/main', thinkingLevel: 'medium' };
-    const { config, disposables } = await createConfig(
+    const table = await createConfig(
       {},
-      '[secondary_model]\ndefault_model = "provider/fast"\nforce = true\n\n[secondary_model.models]\n"provider/fast" = "fast and cheap"\n',
+      '[secondary_model]\ndefault_model = "provider/fast"\nforce = true\n\n[secondary_model.models]\n"provider/fast" = "fast and cheap"\n"provider/smart" = ""\n',
     );
-
-    expect(() => resolveSubagentBinding(config, own)).toThrow(
-      /\[secondary_model\]\.force cannot be combined with \[secondary_model\.models\]/,
-    );
-
-    disposables.dispose();
+    expect(resolveSubagentBinding(table.config, own, 'provider/smart')).toEqual({
+      model: 'provider/smart',
+      thinking: undefined,
+      modelSource: 'secondary_pool',
+    });
+    table.disposables.dispose();
   });
 
   it('rejects an alias outside the pool, listing the available models', async () => {
@@ -2293,7 +2325,7 @@ describe('subagent config section', () => {
     expect(isError2(caught)).toBe(true);
     expect((caught as Error2).code).toBe(ErrorCodes.CONFIG_INVALID);
     expect((caught as Error2).message).toBe(
-      'Invalid model "provider/typo". Available models: provider/fast, provider/smart, primary.',
+      'Invalid model "provider/typo". Available models: provider/fast, provider/smart.',
     );
 
     disposables.dispose();
@@ -2304,7 +2336,7 @@ describe('subagent config section', () => {
     const { config, disposables } = await createConfig({});
 
     expect(() => resolveSubagentBinding(config, own, 'provider/fast')).toThrow(
-      /Invalid model "provider\/fast": no \[secondary_model\.models\] pool is configured/,
+      /Invalid model "provider\/fast": no \[secondary_model\] pool is configured/,
     );
 
     disposables.dispose();
@@ -2780,6 +2812,76 @@ describe('ConfigService replaceSections', () => {
     disposables.dispose();
   });
 
+  it('round-trips model upgrade metadata using snake_case TOML fields', async () => {
+    const { config, disposables, storage } = await createSectionsConfig();
+    await config.replaceSections({
+      [MODELS_SECTION]: {
+        'acme/m1': {
+          provider: 'acme',
+          model: 'm1',
+          maxContextSize: 1000,
+          upgrade: {
+            model: 'm2',
+            migrationMarkdown: 'Use {model_to}',
+            retirementAt: '2030-01-01T00:00:00Z',
+          },
+        },
+      },
+    });
+
+    const onDisk = new TextDecoder().decode(await storage.read('', 'config.toml'));
+    expect(onDisk).toContain('migration_markdown = "Use {model_to}"');
+    expect(onDisk).toContain('retirement_at = "2030-01-01T00:00:00Z"');
+    expect(onDisk).not.toContain('migrationMarkdown');
+    expect(onDisk).not.toContain('retirementAt');
+
+    await config.reload();
+    const models = config.get<Record<string, { upgrade?: unknown }>>(MODELS_SECTION);
+    expect(models['acme/m1']?.upgrade).toEqual({
+      model: 'm2',
+      migrationMarkdown: 'Use {model_to}',
+      retirementAt: '2030-01-01T00:00:00Z',
+    });
+    disposables.dispose();
+  });
+
+  it('removes withdrawn upgrade metadata instead of merging it', async () => {
+    const { config, disposables, storage } = await createSectionsConfig();
+    const model = {
+      provider: 'acme',
+      model: 'm1',
+      maxContextSize: 1000,
+    };
+    await config.replaceSections({
+      [MODELS_SECTION]: {
+        'acme/m1': {
+          ...model,
+          upgrade: {
+            model: 'm2',
+            migrationMarkdown: 'Use {model_to}',
+            retirementAt: '2030-01-01T00:00:00Z',
+          },
+        },
+      },
+    });
+    await config.replaceSections({
+      [MODELS_SECTION]: {
+        'acme/m1': {
+          ...model,
+          upgrade: { model: 'm2', migrationMarkdown: 'Use {model_to}' },
+        },
+      },
+    });
+
+    const withoutRetirement = new TextDecoder().decode(await storage.read('', 'config.toml'));
+    expect(withoutRetirement).not.toContain('retirement_at');
+
+    await config.replaceSections({ [MODELS_SECTION]: { 'acme/m1': model } });
+    const withoutUpgrade = new TextDecoder().decode(await storage.read('', 'config.toml'));
+    expect(withoutUpgrade).not.toContain('[models."acme/m1".upgrade]');
+    disposables.dispose();
+  });
+
   it('can replace selected domains exactly without touching other domains', async () => {
     const toml = [
       '[providers.acme]',
@@ -3049,6 +3151,22 @@ describe('ConfigService persistence guards', () => {
     });
     await config.set(THINKING_SECTION, { enabled: true });
     expect(config.get<ThinkingConfig>(THINKING_SECTION)).toEqual({ enabled: true });
+
+    await overwrite(storage, '[providers.beta]\ntype = "openai"\napi_key = 42\n');
+    await config.reload();
+    expect(config.get<Record<string, unknown>>(PROVIDERS_SECTION)).toEqual({
+      beta: { type: 'openai', apiKey: 'sk-beta' },
+    });
+    expect(config.diagnostics()).toContainEqual(expect.objectContaining({
+      domain: PROVIDERS_SECTION,
+      severity: 'warning',
+    }));
+
+    await overwrite(storage, '[providers.gamma]\ntype = "openai"\napi_key = "sk-gamma"\n');
+    await config.reload();
+    expect(config.get<Record<string, unknown>>(PROVIDERS_SECTION)).toEqual({
+      gamma: { type: 'openai', apiKey: 'sk-gamma' },
+    });
 
     disposables.dispose();
   });

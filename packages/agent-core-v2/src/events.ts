@@ -3,8 +3,9 @@ import type { TurnStartedEvent, TurnStepCompletedEvent, TurnStepInterruptedEvent
 import type { TurnEndedEvent } from '#/agent/loop/turnOps';
 import type { PluginCommandActivatedEvent } from '#/agent/pluginCommand/pluginCommand';
 import type { PromptAbortedEvent, PromptCompletedEvent, PromptSteeredEvent, PromptSubmittedEvent } from '#/agent/prompt/promptEvents';
+import type { EnvironmentStatusChangedEvent } from '#/agent/environmentBinding/environmentEvents';
 import type { BackgroundTaskStartedEvent, BackgroundTaskTerminatedEvent, TaskStartedEvent, TaskTerminatedEvent } from '#/agent/task/types';
-import type { McpServerStatusEvent, ShellCompletedEvent, ShellOutputEvent, ShellStartedEvent, ToolCallDeltaEvent, ToolCallStartedEvent, ToolListUpdatedEvent, ToolProgressEvent } from '#/agent/toolExecutor/toolExecutorEvents';
+import type { McpServerStatusEvent, ShellCompletedEvent, ShellOutputEvent, ShellStartedEvent, ToolCallDeltaEvent, ToolCallStartedEvent, ToolListUpdatedEvent, ToolUpdatedEvent } from '#/agent/toolExecutor/toolExecutorEvents';
 import type { ToolResultEventPayload } from '#/agent/toolExecutor/toolExecutorEvents';
 import type { AgentStatusUpdatedEvent } from '#/agent/usage/usageEvents';
 import type { CapabilityChangedEvent } from '#/app/capability/capabilityEvents';
@@ -46,6 +47,7 @@ export type AgentEvent =
   | GoalUpdatedEvent
   | SkillActivatedEvent
   | PluginCommandActivatedEvent
+  | EnvironmentStatusChangedEvent
   | TurnStartedEvent
   | TurnEndedEvent
   | TurnStepStartedEvent
@@ -57,7 +59,7 @@ export type AgentEvent =
   | ThinkingDeltaEvent
   | ToolCallDeltaEvent
   | ToolCallStartedEvent
-  | ToolProgressEvent
+  | ToolUpdatedEvent
   | ShellOutputEvent
   | ShellStartedEvent
   | ShellCompletedEvent

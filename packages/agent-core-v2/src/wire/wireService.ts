@@ -4,16 +4,32 @@ import { ILogService } from '#/_base/log/log';
 import { IAgentBlobService } from '#/agent/blob/agentBlobService';
 import { IAgentScopeContext } from '#/agent/scopeContext/scopeContext';
 import { ITelemetryService } from '#/app/telemetry/telemetry';
-import type { ContentPart } from '#human/llm/message';
+import type { ContentPart, Message } from '#human/llm/message';
+import {
+  fromCoreMessage,
+  fromCorePart,
+  historyRecordFromPersistent,
+  historyRecordToPersistent,
+  toCoreMessage,
+  toCorePart,
+  type ContentPart as LegacyContentPart,
+} from '#human/message';
+import {
+  fromLlmMessage,
+  toLlmMessage,
+  type Message as LegacyContractMessage,
+} from '#/llm-adapter/contract/message';
 import {
   type AppendLogTruncation,
   IAppendLogStore,
 } from '#/persistence/interface/appendLogStore';
 import { IFileSystemStorageService, StorageError, StorageErrors } from '#/persistence/interface/storage';
+import { ISessionLockService } from '#/persistence/interface/sessionLock';
+import { ISessionContext } from '#/session/sessionContext/sessionContext';
 
 import { IWireService, type WireRestoreChains } from './wire';
 import { WireError, WireErrors } from './errors';
-import { isHumanRecordType } from './human';
+import { HUMAN_AGENT_DOMAIN, humanEventType, isHumanRecordType, normalizeLegacyTurnSteerRecords } from './human';
 import {
   type AgentJournalRef,
   type IAgentJournal,
@@ -35,7 +51,9 @@ import {
   type WireTree,
 } from './tree';
 import {
+  WIRE_MIN_READER_VERSION,
   WIRE_PROTOCOL_VERSION,
+  assertWireReaderVersion,
   isNewerWireVersion,
   migrateV1_4ToV1_5,
   migrateWireRecord,
@@ -63,11 +81,14 @@ export class WireService extends Service implements IWireService, IAgentJournal 
   private pendingRepair:
     | { readonly records: WireRecord[]; readonly truncation: AppendLogTruncation }
     | undefined;
+  private pendingRewrite: WireRecord[] | undefined;
   private persistError: Error | undefined;
   private treeSnapshot: WireTree | undefined;
   private writeGeneration = 0;
   private lastReadLineCount = 0;
   private modeTwoEntries: WireLine[] = [];
+  private modeTwoProfileEntries: WireLine[] = [];
+  private readonly reportedDiagnostics = new Set<string>();
 
   constructor(
     @IAgentScopeContext scopeContext: IAgentScopeContext,
@@ -76,11 +97,18 @@ export class WireService extends Service implements IWireService, IAgentJournal 
     @IFileSystemStorageService private readonly storage: IFileSystemStorageService,
     @ILogService private readonly logger: ILogService,
     @ITelemetryService private readonly telemetry: ITelemetryService,
+    @ISessionLockService private readonly sessionLocks: ISessionLockService,
+    @ISessionContext private readonly sessionContext: ISessionContext,
   ) {
     super();
     this.wireScope = scopeContext.scope();
     this.agentId = scopeContext.agentId;
     this._register(this.log.acquire(this.wireScope, AGENT_WIRE_RECORD_KEY));
+    this._register(
+      this.log.bindWriteGuard(this.wireScope, AGENT_WIRE_RECORD_KEY, () =>
+        this.sessionLocks.tryHold(this.sessionContext.sessionId),
+      ),
+    );
   }
 
   async seal(): Promise<void> {
@@ -95,12 +123,14 @@ export class WireService extends Service implements IWireService, IAgentJournal 
   appendRecord(record: WireRecord, dehydrate?: RecordDehydrator): void {
     if (
       this.pendingRepair === undefined &&
+      this.pendingRewrite === undefined &&
       dehydrate === undefined &&
       this.persistQueue === undefined
     ) {
       try {
         this.appendRecordLow(record);
       } catch (error) {
+        this.logger.error('wire append failed', { agentId: this.agentId, error });
         onUnexpectedError(error);
       }
       return;
@@ -114,10 +144,16 @@ export class WireService extends Service implements IWireService, IAgentJournal 
         if (this.pendingRepair !== undefined) {
           await this.repairPendingJournal();
         }
+        if (this.pendingRewrite !== undefined) {
+          await this.rewritePendingJournal();
+        }
         const output = dehydrate === undefined ? record : await dehydrate(record, transform);
         this.appendRecordLow(output);
       })
-      .catch((error: unknown) => onUnexpectedError(error));
+      .catch((error: unknown) => {
+        this.logger.error('wire append failed', { agentId: this.agentId, error });
+        onUnexpectedError(error);
+      });
     this.persistQueue = queued;
     void queued.then(() => {
       if (this.persistQueue === queued) this.persistQueue = undefined;
@@ -125,7 +161,7 @@ export class WireService extends Service implements IWireService, IAgentJournal 
   }
 
   async *readJournal(): AsyncIterable<WireRecord> {
-    for await (const { record } of this.readEntries()) {
+    for await (const { record } of this.readEntries(false)) {
       yield record;
     }
   }
@@ -143,9 +179,8 @@ export class WireService extends Service implements IWireService, IAgentJournal 
     const tree = parseTree(entries, entries.at(-1)?.line ?? 0);
     this.treeSnapshot = tree;
     this.reportTreeDiagnostics(tree);
-    for (const { record } of activeChain(entries, tree)) {
-      yield record;
-    }
+    const records = activeChain(entries, tree).map(({ record }) => record);
+    for (const record of normalizeLegacyTurnSteerRecords(records)) yield record;
   }
 
   readRaw(): AsyncIterable<WireRecord> {
@@ -154,7 +189,18 @@ export class WireService extends Service implements IWireService, IAgentJournal 
 
   readHumanChain(): readonly WireLine[] {
     const tree = parseTree(this.modeTwoEntries, this.lines);
-    return activeChain(this.modeTwoEntries, tree);
+    return restorableChain(this.modeTwoEntries, tree);
+  }
+
+  readLoopChain(): readonly WireLine[] {
+    const entries = [...this.modeTwoEntries, ...this.modeTwoProfileEntries]
+      .toSorted((a, b) => a.line - b.line);
+    const tree = parseTree(entries, this.lines);
+    return restorableChain(entries, tree);
+  }
+
+  readHumanJournal(): readonly WireLine[] {
+    return this.modeTwoEntries;
   }
 
   async *readRestorable(): AsyncIterable<WireRecord> {
@@ -162,9 +208,8 @@ export class WireService extends Service implements IWireService, IAgentJournal 
     const tree = parseTree(entries, entries.at(-1)?.line ?? 0);
     this.treeSnapshot = tree;
     this.reportTreeDiagnostics(tree);
-    for (const { record } of restorableChain(entries, tree)) {
-      yield record;
-    }
+    const records = restorableChain(entries, tree).map(({ record }) => record);
+    for (const record of normalizeLegacyTurnSteerRecords(records)) yield record;
   }
 
   async readRestoreChains(): Promise<WireRestoreChains> {
@@ -173,7 +218,7 @@ export class WireService extends Service implements IWireService, IAgentJournal 
     this.treeSnapshot = tree;
     this.reportTreeDiagnostics(tree);
     return {
-      restorable: restorableChain(entries, tree).map(({ record }) => record),
+      restorable: normalizeLegacyTurnSteerRecords(restorableChain(entries, tree).map(({ record }) => record)),
       journal: entries.map(({ record }) => record),
     };
   }
@@ -274,6 +319,9 @@ export class WireService extends Service implements IWireService, IAgentJournal 
 
   private reportTreeDiagnostics(tree: WireTree): void {
     for (const line of tree.diagnostics.malformedSwitchLines) {
+      const key = `line:${String(line)}`;
+      if (this.reportedDiagnostics.has(key)) continue;
+      this.reportedDiagnostics.add(key);
       onUnexpectedError(
         new WireError(
           WireErrors.codes.WIRE_UNKNOWN_RECORD,
@@ -283,6 +331,9 @@ export class WireService extends Service implements IWireService, IAgentJournal 
       );
     }
     for (const branch of tree.diagnostics.duplicateBranches) {
+      const key = `branch:${branch}`;
+      if (this.reportedDiagnostics.has(key)) continue;
+      this.reportedDiagnostics.add(key);
       onUnexpectedError(
         new WireError(
           WireErrors.codes.WIRE_UNKNOWN_RECORD,
@@ -307,7 +358,7 @@ export class WireService extends Service implements IWireService, IAgentJournal 
     return this.drainPersisted();
   }
 
-  private async *readEntries(): AsyncIterable<WireLine> {
+  private async *readEntries(decodePersistent = true): AsyncIterable<WireLine> {
     let truncation: AppendLogTruncation | undefined;
     const source = this.log.read<WireRecord>(this.wireScope, AGENT_WIRE_RECORD_KEY, {
       onTruncate: (info) => {
@@ -322,7 +373,9 @@ export class WireService extends Service implements IWireService, IAgentJournal 
     let hasRecords = false;
     let legacyPlanRevisionMigrated = false;
     const modeTwoEntries: WireLine[] = [];
+    const modeTwoProfileEntries: WireLine[] = [];
     const modeTwoLengthAtStart = this.modeTwoEntries.length;
+    const modeTwoProfileLengthAtStart = this.modeTwoProfileEntries.length;
 
     for await (const candidate of source) {
       lineCount++;
@@ -345,12 +398,15 @@ export class WireService extends Service implements IWireService, IAgentJournal 
             'Agent wire metadata is malformed',
             { details: { scope: this.wireScope, key: AGENT_WIRE_RECORD_KEY } },
           );
-        } else if (isNewerWireVersion(sourceRecord.protocol_version)) {
-          newerWireVersion = true;
         } else {
-          migrations = resolveWireMigrations(sourceRecord.protocol_version);
-          if (sourceRecord.protocol_version !== WIRE_PROTOCOL_VERSION) {
-            rewrittenRecords = [];
+          assertWireReaderVersion(sourceRecord.min_protocol_version);
+          if (isNewerWireVersion(sourceRecord.protocol_version)) {
+            newerWireVersion = true;
+          } else {
+            migrations = resolveWireMigrations(sourceRecord.protocol_version);
+            if (sourceRecord.protocol_version !== WIRE_PROTOCOL_VERSION) {
+              rewrittenRecords = [];
+            }
           }
         }
       }
@@ -376,12 +432,19 @@ export class WireService extends Service implements IWireService, IAgentJournal 
         if (record.type === 'plan.revision') recordIndex++;
         continue;
       }
-      rewrittenRecords?.push(normalized);
-      if (isHumanRecordType(normalized.type)) {
-        modeTwoEntries.push({ record: normalized, line: lineCount });
+      const outputRecord =
+        rewrittenRecords !== undefined && normalized.type === 'metadata'
+          ? { ...normalized, min_protocol_version: WIRE_MIN_READER_VERSION }
+          : normalized;
+      rewrittenRecords?.push(outputRecord);
+      const runtimeRecord = fromPersistentWireRecord(outputRecord);
+      if (isHumanRecordType(runtimeRecord.type)) {
+        modeTwoEntries.push({ record: runtimeRecord, line: lineCount });
+      } else if (isLoopProfileRecordType(runtimeRecord.type)) {
+        modeTwoProfileEntries.push({ record: runtimeRecord, line: lineCount });
       }
-      yield { record: normalized, line: lineCount };
-      if (normalized.type !== 'metadata') {
+      yield { record: decodePersistent ? runtimeRecord : outputRecord, line: lineCount };
+      if (outputRecord.type !== 'metadata') {
         recordIndex++;
       }
     }
@@ -393,18 +456,25 @@ export class WireService extends Service implements IWireService, IAgentJournal 
       rewrittenRecords = [createWireMetadataRecord()];
     }
     if (truncation !== undefined) {
+      this.pendingRewrite = undefined;
       await this.repairJournal(truncation, rewrittenRecords);
     } else if (rewrittenRecords !== undefined) {
-      await this.log.rewrite(this.wireScope, AGENT_WIRE_RECORD_KEY, rewrittenRecords);
-      this.writeGeneration += 1;
-      this.lines = rewrittenRecords.length;
-      this.lastClearLine = lastContextClearLineOf(rewrittenRecords);
+      if (!(await this.rewriteMigratedJournal(rewrittenRecords))) {
+        this.pendingRewrite = rewrittenRecords;
+      }
     }
-    this.mergeModeTwoEntries(modeTwoEntries, this.modeTwoEntries.slice(modeTwoLengthAtStart), lineCount);
+    this.mergeModeTwoEntries('modeTwoEntries', modeTwoEntries, this.modeTwoEntries.slice(modeTwoLengthAtStart), lineCount);
+    this.mergeModeTwoEntries(
+      'modeTwoProfileEntries',
+      modeTwoProfileEntries,
+      this.modeTwoProfileEntries.slice(modeTwoProfileLengthAtStart),
+      lineCount,
+    );
     this.lastReadLineCount = lineCount;
   }
 
   private mergeModeTwoEntries(
+    target: 'modeTwoEntries' | 'modeTwoProfileEntries',
     fresh: WireLine[],
     appended: readonly WireLine[],
     lineCount: number,
@@ -416,7 +486,7 @@ export class WireService extends Service implements IWireService, IAgentJournal 
       line += 1;
       merged.push({ record: entry.record, line });
     }
-    this.modeTwoEntries = merged;
+    this[target] = merged;
   }
 
   lineCount(): number {
@@ -429,6 +499,37 @@ export class WireService extends Service implements IWireService, IAgentJournal 
 
   journalPath(): string | undefined {
     return this.storage.pathFor(this.wireScope, AGENT_WIRE_RECORD_KEY);
+  }
+
+  externallyModified(): boolean {
+    return this.log.externallyModified(this.wireScope, AGENT_WIRE_RECORD_KEY);
+  }
+
+  private async rewriteMigratedJournal(records: WireRecord[]): Promise<boolean> {
+    if (
+      !this.sessionLocks.tryHold(this.sessionContext.sessionId) ||
+      this.externallyModified()
+    ) {
+      return false;
+    }
+    await this.log.rewrite(this.wireScope, AGENT_WIRE_RECORD_KEY, records);
+    this.pendingRewrite = undefined;
+    this.writeGeneration += 1;
+    this.lines = records.length;
+    this.lastClearLine = lastContextClearLineOf(records);
+    return true;
+  }
+
+  private async rewritePendingJournal(): Promise<void> {
+    const pending = this.pendingRewrite;
+    if (pending === undefined || (await this.rewriteMigratedJournal(pending))) return;
+    const error = new WireError(
+      WireErrors.codes.RECORDS_WRITE_FAILED,
+      'Wire journal migration did not complete; record was not appended',
+      { details: { scope: this.wireScope, key: AGENT_WIRE_RECORD_KEY } },
+    );
+    this.persistError = error;
+    throw error;
   }
 
   private async repairJournal(
@@ -445,6 +546,13 @@ export class WireService extends Service implements IWireService, IAgentJournal 
       )) {
         records.push(record);
       }
+    }
+    if (
+      !this.sessionLocks.tryHold(this.sessionContext.sessionId) ||
+      this.externallyModified()
+    ) {
+      this.pendingRepair = { records, truncation };
+      return;
     }
     const outcome = await repairWireJournal(
       {
@@ -514,7 +622,11 @@ export class WireService extends Service implements IWireService, IAgentJournal 
       const migratedRecord = migrateWireRecord(candidate, migrations);
       const record =
         !newerWireVersion && migratedRecord.type === 'metadata'
-          ? { ...migratedRecord, protocol_version: WIRE_PROTOCOL_VERSION }
+          ? {
+              ...migratedRecord,
+              protocol_version: WIRE_PROTOCOL_VERSION,
+              min_protocol_version: WIRE_MIN_READER_VERSION,
+            }
           : migratedRecord;
       const normalized = newerWireVersion
         ? record
@@ -572,15 +684,163 @@ export class WireService extends Service implements IWireService, IAgentJournal 
   }
 
   private appendRecordLow(record: WireRecord): void {
-    this.log.append(this.wireScope, AGENT_WIRE_RECORD_KEY, record, {
+    this.log.append(this.wireScope, AGENT_WIRE_RECORD_KEY, toPersistentWireRecord(record), {
       onError: onUnexpectedError,
     });
     this.lines += 1;
     if (isHumanRecordType(record.type)) {
       this.modeTwoEntries.push({ record, line: this.lines });
+    } else if (isLoopProfileRecordType(record.type)) {
+      this.modeTwoProfileEntries.push({ record, line: this.lines });
     }
     if (record.type === 'context.clear') this.lastClearLine = this.lines;
   }
+}
+
+function isLoopProfileRecordType(type: string): boolean {
+  return type === 'profile.bind' ||
+    type === 'config.update' ||
+    type === 'tools.set_active_tools' ||
+    type === 'tools.reset_active_tools';
+}
+
+type UnknownRecord = Record<string, unknown>;
+
+const CONTEXT_MESSAGE_FIELDS = [
+  'id',
+  'providerMessageId',
+  'name',
+  'origin',
+  'isError',
+  'partial',
+  'toolCallDisplays',
+  'note',
+  'usage',
+  'llmTiming',
+  'durationMs',
+] as const;
+
+function isUnknownRecord(value: unknown): value is UnknownRecord {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function fromPersistentPart(part: unknown): ContentPart {
+  return toCorePart(part as LegacyContentPart);
+}
+
+function toPersistentContextMessage(message: Message): UnknownRecord {
+  const legacy = fromLlmMessage(fromCoreMessage(message));
+  const output: UnknownRecord = { ...legacy };
+  const source = message as unknown as UnknownRecord;
+  for (const key of CONTEXT_MESSAGE_FIELDS) {
+    if (source[key] !== undefined) output[key] = source[key];
+  }
+  return output;
+}
+
+function fromPersistentContextMessage(message: unknown): UnknownRecord {
+  const source = message as LegacyContractMessage & UnknownRecord;
+  const output: UnknownRecord = { ...toCoreMessage(toLlmMessage(source)) };
+  for (const key of CONTEXT_MESSAGE_FIELDS) {
+    if (source[key] !== undefined) output[key] = source[key];
+  }
+  return output;
+}
+
+function toPersistentLoopEvent(event: unknown): unknown {
+  if (!isUnknownRecord(event)) return event;
+  if (event['type'] === 'content.part') {
+    return { ...event, part: fromCorePart(event['part'] as ContentPart) };
+  }
+  if (event['type'] === 'tool.result' && isUnknownRecord(event['result'])) {
+    const result = event['result'];
+    const output = result['output'];
+    if (Array.isArray(output)) {
+      return {
+        ...event,
+        result: { ...result, output: output.map((part) => fromCorePart(part as ContentPart)) },
+      };
+    }
+  }
+  return event;
+}
+
+function fromPersistentLoopEvent(event: unknown): unknown {
+  if (!isUnknownRecord(event)) return event;
+  if (event['type'] === 'content.part') {
+    return { ...event, part: fromPersistentPart(event['part']) };
+  }
+  if (event['type'] === 'tool.result' && isUnknownRecord(event['result'])) {
+    const result = event['result'];
+    const output = result['output'];
+    if (Array.isArray(output)) {
+      return { ...event, result: { ...result, output: output.map(fromPersistentPart) } };
+    }
+  }
+  return event;
+}
+
+function toPersistentHistoryMessage(message: Message): UnknownRecord {
+  const output = toPersistentContextMessage(message);
+  if (!Array.isArray(output['content'])) return output;
+  output['content'] = message.content.map((part, index) => {
+    const converted = (output['content'] as unknown[])[index];
+    return part.type === 'text' && part.contentType !== undefined && isUnknownRecord(converted)
+      ? { ...converted, contentType: part.contentType }
+      : converted;
+  });
+  return output;
+}
+
+function fromPersistentHistoryMessage(message: unknown): UnknownRecord {
+  const output = fromPersistentContextMessage(message);
+  if (!isUnknownRecord(message) || !Array.isArray(message['content']) || !Array.isArray(output['content'])) {
+    return output;
+  }
+  output['content'] = (output['content'] as unknown[]).map((part, index) => {
+    const source = (message['content'] as unknown[])[index];
+    return isUnknownRecord(source) && typeof source['contentType'] === 'string' && isUnknownRecord(part)
+      ? { ...part, contentType: source['contentType'] }
+      : part;
+  });
+  return output;
+}
+
+export function toPersistentWireRecord(record: WireRecord): WireRecord {
+  const humanType = humanEventType(record.type, HUMAN_AGENT_DOMAIN);
+  if (humanType !== undefined) {
+    return historyRecordToPersistent(humanType, record) as WireRecord;
+  }
+  if (record.type === 'context.append_message') {
+    return {
+      ...record,
+      message: toPersistentHistoryMessage(record['message'] as Message),
+    };
+  }
+  if (record.type === 'context.append_loop_event') {
+    return { ...record, event: toPersistentLoopEvent(record['event']) };
+  }
+  if (record.type === 'context.apply_compaction' && isUnknownRecord(record['summary'])) {
+    return { ...record, summary: toPersistentContextMessage(record['summary'] as unknown as Message) };
+  }
+  return record;
+}
+
+export function fromPersistentWireRecord(record: WireRecord): WireRecord {
+  const humanType = humanEventType(record.type, HUMAN_AGENT_DOMAIN);
+  if (humanType !== undefined) {
+    return historyRecordFromPersistent(humanType, record) as WireRecord;
+  }
+  if (record.type === 'context.append_message') {
+    return { ...record, message: fromPersistentHistoryMessage(record['message']) };
+  }
+  if (record.type === 'context.append_loop_event') {
+    return { ...record, event: fromPersistentLoopEvent(record['event']) };
+  }
+  if (record.type === 'context.apply_compaction' && isUnknownRecord(record['summary'])) {
+    return { ...record, summary: fromPersistentContextMessage(record['summary']) };
+  }
+  return record;
 }
 
 function recordsMatch(a: WireRecord, b: WireRecord): boolean {

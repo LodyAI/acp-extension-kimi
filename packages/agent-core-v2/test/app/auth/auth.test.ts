@@ -30,6 +30,8 @@ import { ConfigRegistry } from '#/app/config/configService';
 import { IEventService } from '#/app/event/event';
 import type { Event2 } from '#/app/event/event2';
 import { ILogService } from '#/_base/log/log';
+import { IRegionService } from '#/app/region/region';
+import { RegionService } from '#/app/region/regionService';
 import { IAgentIdentity } from '#/app/agentIdentity/agentIdentity';
 import { IBootstrapService } from '#/app/bootstrap/bootstrap';
 import { IModelService, type ModelRecord } from '#/llm-adapter/model/model';
@@ -169,6 +171,7 @@ describe('OAuthService', () => {
       base: [registerBootstrapServices, registerTelemetryServices],
       additionalServices: (reg) => {
         reg.definePartialInstance(IProviderService, {
+          ready: Promise.resolve(),
           get: ((name: string) => providers[name]) as IProviderService['get'],
           list: (() => providers) as IProviderService['list'],
           set: providerSet as unknown as IProviderService['set'],
@@ -200,6 +203,7 @@ describe('OAuthService', () => {
         });
         reg.defineInstance(IOAuthToolkit, toolkit as unknown as IOAuthToolkit);
         reg.definePartialInstance(ITelemetryService, { track2: vi.fn() });
+        reg.define(IRegionService, RegionService);
         reg.define(IOAuthService, OAuthService);
       },
     });
@@ -225,8 +229,8 @@ describe('OAuthService', () => {
         data: [
           {
             id: 'kimi-k2',
-            context_length: 131072,
-            supports_reasoning: true,
+            limit: { context: 131072 },
+            reasoning: { type: 'both' },
             display_name: 'Kimi K2',
           },
         ],
@@ -268,20 +272,20 @@ describe('OAuthService', () => {
           data: [
             {
               id: 'kimi-k2',
-              context_length: 131072,
-              supports_reasoning: true,
+              limit: { context: 131072 },
+              reasoning: { type: 'both' },
               display_name: 'Kimi K2',
             },
             {
               id: 'kimi-k2.5',
-              context_length: 262144,
-              supports_reasoning: true,
+              limit: { context: 262144 },
+              reasoning: { type: 'both' },
               display_name: 'Kimi K2.5',
             },
             {
               id: 'kimi-k3',
-              context_length: 1048576,
-              supports_reasoning: true,
+              limit: { context: 1048576 },
+              reasoning: { type: 'both' },
               display_name: 'Kimi K3',
             },
           ],
@@ -423,32 +427,40 @@ describe('OAuthService', () => {
     );
   });
 
-  it('startLogin with region global resolves the global login environment', async () => {
+  it('startLogin without a region resolves the hydrated login environment', async () => {
     stubManagedModelsFetch();
     toolkit.login.mockImplementation((_provider, options) => {
       options.onDeviceCode(deviceAuth);
       return Promise.resolve({ providerName: OAUTH_PROVIDER, ok: true });
     });
-    const svc = createService();
-    await svc.startLogin(OAUTH_PROVIDER, { region: 'global' });
+    const home = ix.get(IBootstrapService).homeDir;
+    providers[OAUTH_PROVIDER] = { type: 'kimi' };
+    try {
+      await mkdir(home, { recursive: true });
+      await writeFile(join(home, 'region'), 'global\n', 'utf-8');
+      const svc = createService();
+      await svc.startLogin(OAUTH_PROVIDER);
 
-    expect(toolkit.login).toHaveBeenCalledWith(
-      OAUTH_PROVIDER,
-      expect.objectContaining({
-        oauthRef: OVERSEAS_SCOPED_REF,
-        baseUrl: 'https://api.kimi.ai/coding/v1',
-        oauthHost: 'https://auth.kimi.ai',
-      }),
-    );
-    await flush();
-    expect(providerSet).toHaveBeenCalledWith(
-      OAUTH_PROVIDER,
-      expect.objectContaining({
-        type: 'kimi',
-        baseUrl: 'https://api.kimi.ai/coding/v1',
-        oauth: OVERSEAS_SCOPED_REF,
-      }),
-    );
+      expect(toolkit.login).toHaveBeenCalledWith(
+        OAUTH_PROVIDER,
+        expect.objectContaining({
+          oauthRef: OVERSEAS_SCOPED_REF,
+          baseUrl: 'https://api.kimi.ai/coding/v1',
+          oauthHost: 'https://auth.kimi.ai',
+        }),
+      );
+      await flush();
+      expect(providerSet).toHaveBeenCalledWith(
+        OAUTH_PROVIDER,
+        expect.objectContaining({
+          type: 'kimi',
+          baseUrl: 'https://api.kimi.ai/coding/v1',
+          oauth: OVERSEAS_SCOPED_REF,
+        }),
+      );
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
   });
 
   it('startLogin with a region still honors env endpoint overrides', async () => {
@@ -470,16 +482,16 @@ describe('OAuthService', () => {
     );
   });
 
-  it('getRegion resolves cn by default and global from the persisted login host', () => {
+  it('getRegion resolves cn by default and global from the persisted login host', async () => {
     vi.stubEnv('KIMI_CODE_REGION_MARKER', 'off');
     const svc = createService();
-    expect(svc.getRegion()).toBe('mainland-cn');
+    expect(await svc.getRegionAsync()).toBe('mainland-cn');
 
     providers[OAUTH_PROVIDER] = {
       type: 'kimi',
       oauth: { storage: 'file', key: OVERSEAS_SCOPED_REF.key, oauthHost: 'https://auth.kimi.ai' },
     };
-    expect(svc.getRegion()).toBe('global');
+    expect(await svc.getRegionAsync()).toBe('global');
   });
 
   it('getRegion reads the install marker from the bootstrapped home unless KIMI_CODE_REGION_MARKER=off', async () => {
@@ -489,10 +501,15 @@ describe('OAuthService', () => {
       await writeFile(join(home, 'region'), 'global\n', 'utf-8');
       vi.stubEnv('KIMI_CODE_OAUTH_HOST', '');
       providers[OAUTH_PROVIDER] = { type: 'kimi' };
-      expect(createService().getRegion()).toBe('global');
+      expect(await createService().getRegionAsync()).toBe('global');
 
       vi.stubEnv('KIMI_CODE_REGION_MARKER', 'off');
-      expect(createService().getRegion()).toBe('mainland-cn');
+      const offRegions = new RegionService(ix.get(IProviderService), ix.get(IBootstrapService));
+      try {
+        expect(await offRegions.getRegionAsync()).toBe('mainland-cn');
+      } finally {
+        offRegions.dispose();
+      }
     } finally {
       await rm(home, { recursive: true, force: true });
     }
@@ -507,7 +524,7 @@ describe('OAuthService', () => {
       vi.stubEnv('KIMI_CODE_HOME', envHome);
       vi.stubEnv('KIMI_CODE_OAUTH_HOST', '');
       providers[OAUTH_PROVIDER] = { type: 'kimi' };
-      expect(createService().getRegion()).toBe('global');
+      expect(await createService().getRegionAsync()).toBe('global');
     } finally {
       await rm(bootstrapHome, { recursive: true, force: true });
       await rm(envHome, { recursive: true, force: true });
@@ -524,7 +541,7 @@ describe('OAuthService', () => {
         type: 'kimi',
         oauth: { storage: 'file', key: 'oauth/kimi-code' },
       };
-      expect(createService().getRegion()).toBe('mainland-cn');
+      expect(await createService().getRegionAsync()).toBe('mainland-cn');
     } finally {
       await rm(home, { recursive: true, force: true });
     }
@@ -957,8 +974,8 @@ describe('OAuthService', () => {
         data: [
           {
             id: 'kimi-k2',
-            context_length: 131072,
-            supports_reasoning: true,
+            limit: { context: 131072 },
+            reasoning: { type: 'both' },
             display_name: 'Kimi K2',
           },
         ],
@@ -1012,8 +1029,8 @@ describe('OAuthService', () => {
           data: [
             {
               id: 'kimi-k2',
-              context_length: 131072,
-              supports_reasoning: true,
+              limit: { context: 131072 },
+              reasoning: { type: 'both' },
               display_name: 'Kimi K2',
             },
           ],
@@ -1047,8 +1064,8 @@ describe('OAuthService', () => {
         data: [
           {
             id: 'kimi-k2',
-            context_length: 131072,
-            supports_reasoning: true,
+            limit: { context: 131072 },
+            reasoning: { type: 'both' },
             display_name: 'Kimi K2',
           },
         ],
@@ -1199,12 +1216,18 @@ describe('WebSearchProviderService', () => {
   let disposables: DisposableStore;
   let ix: TestInstantiationService;
   let providers: Record<string, ProviderConfig>;
+  let defaultProvider: string | undefined;
+  let models: Record<string, ModelRecord>;
+  let defaultModel: string | undefined;
   let servicesConfig: ServicesConfig | undefined;
   let resolveTokenProvider: ReturnType<typeof vi.fn>;
 
   beforeEach(() => {
     disposables = new DisposableStore();
     providers = {};
+    defaultProvider = undefined;
+    models = {};
+    defaultModel = undefined;
     servicesConfig = undefined;
     resolveTokenProvider = vi
       .fn()
@@ -1213,6 +1236,11 @@ describe('WebSearchProviderService', () => {
       additionalServices: (reg) => {
         reg.definePartialInstance(IProviderService, {
           get: ((name: string) => providers[name]) as IProviderService['get'],
+          getDefaultProvider: (() => defaultProvider) as IProviderService['getDefaultProvider'],
+        });
+        reg.definePartialInstance(IModelService, {
+          get: ((id: string) => models[id]) as IModelService['get'],
+          getDefaultModel: (() => defaultModel) as IModelService['getDefaultModel'],
         });
         reg.definePartialInstance(IOAuthService, {
           resolveTokenProvider:
@@ -1317,7 +1345,10 @@ describe('WebSearchProviderService', () => {
     expect(headers['User-Agent']).toBe('kimi-code-cli/test');
     expect(headers['X-Msh-Device-Id']).toBe('device-test');
     expect(headers['X-Custom']).toBe('yes');
-    expect(JSON.parse(init.body as string)).toEqual({ text_query: 'hello' });
+    expect(JSON.parse(init.body as string)).toEqual({
+      text_query: 'hello',
+      search_mode: 'links',
+    });
   });
 
   it('builds a search provider from the services.moonshot_search api_key config', async () => {
@@ -1435,6 +1466,10 @@ describe('WebSearchProviderService', () => {
           domain === SERVICES_SECTION ? servicesConfig : undefined) as IConfigService['get'],
       } as IConfigService,
       notFrozen,
+      {
+        get: ((id: string) => models[id]) as IModelService['get'],
+        getDefaultModel: (() => defaultModel) as IModelService['getDefaultModel'],
+      } as IModelService,
     );
 
     expect(svc.hasWebSearchProvider()).toBe(true);
@@ -1452,6 +1487,114 @@ describe('WebSearchProviderService', () => {
       },
     };
     expect(svc.hasWebSearchProvider()).toBe(true);
+  });
+
+  it('prefers active model provider searchUrl over OAuth moonshot_search while honoring explicit non-OAuth overrides', async () => {
+    providers = {
+      'registry-kimi': {
+        type: 'kimi',
+        baseUrl: 'https://registry.example.test/v1',
+        apiKey: 'YOUR_API_KEY',
+        searchUrl: 'https://registry.example.test/v1/search',
+        customHeaders: { 'X-Registry': '1' },
+      },
+      'registry-plain': {
+        type: 'openai_responses',
+        baseUrl: 'https://registry.example.test/v1',
+        apiKey: 'YOUR_API_KEY',
+      },
+      [OAUTH_PROVIDER]: {
+        type: 'kimi',
+        baseUrl: 'https://managed.example.test/v1',
+        oauth: { storage: 'file', key: 'oauth/kimi-code' },
+      },
+    };
+    models = {
+      'registry-kimi/k3': { provider: 'registry-kimi', model: 'k3', maxContextSize: 131072 },
+      'registry-plain/gpt': { provider: 'registry-plain', model: 'gpt', maxContextSize: 131072 },
+    };
+    servicesConfig = {
+      moonshotSearch: {
+        baseUrl: 'https://managed.example.test/v1/search',
+        apiKey: '',
+        oauth: { storage: 'file', key: 'oauth/kimi-code' },
+      },
+    };
+
+    const fetchMock = vi.fn().mockResolvedValue({
+      status: 200,
+      json: async () => ({ search_results: [] }),
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const svc = createService();
+    expect(svc.hasWebSearchProvider('registry-kimi/k3')).toBe(true);
+    await svc.getWebSearchProvider('registry-kimi/k3')!.search('q1');
+    expect(fetchMock.mock.calls[0]?.[0]).toBe('https://registry.example.test/v1/search');
+    expect(
+      ((fetchMock.mock.calls[0]?.[1] as RequestInit).headers as Record<string, string>)[
+        'Authorization'
+      ],
+    ).toBe('Bearer YOUR_API_KEY');
+    expect(
+      ((fetchMock.mock.calls[0]?.[1] as RequestInit).headers as Record<string, string>)[
+        'X-Registry'
+      ],
+    ).toBe('1');
+
+    await svc.getWebSearchProvider('registry-plain/gpt')!.search('q2');
+    expect(fetchMock.mock.calls[1]?.[0]).toBe('https://managed.example.test/v1/search');
+
+    servicesConfig = {
+      moonshotSearch: {
+        baseUrl: 'https://override.example.test/search',
+        apiKey: 'override-key',
+      },
+    };
+    await svc.getWebSearchProvider('registry-kimi/k3')!.search('q3');
+    expect(fetchMock.mock.calls[2]?.[0]).toBe('https://override.example.test/search');
+  });
+
+  it('honors defaultProvider fallback and providerId precedence over provider', async () => {
+    defaultModel = 'default-k3';
+    defaultProvider = 'fallback-provider';
+    providers = {
+      'fallback-provider': {
+        type: 'kimi',
+        baseUrl: 'https://fallback.example.test/v1',
+        apiKey: 'YOUR_API_KEY',
+        searchUrl: 'https://fallback.example.test/v1/search',
+      },
+      'primary-provider': {
+        type: 'kimi',
+        baseUrl: 'https://primary.example.test/v1',
+        apiKey: 'YOUR_API_KEY',
+        searchUrl: 'https://primary.example.test/v1/search',
+      },
+    };
+    models = {
+      'default-k3': { model: 'k3', maxContextSize: 131072 },
+      'dual-k3': {
+        providerId: 'primary-provider',
+        provider: 'fallback-provider',
+        model: 'k3',
+        maxContextSize: 131072,
+      },
+    };
+
+    const fetchMock = vi.fn().mockResolvedValue({
+      status: 200,
+      json: async () => ({ search_results: [] }),
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const svc = createService();
+    expect(svc.hasWebSearchProvider()).toBe(true);
+    await svc.getWebSearchProvider()!.search('q1');
+    expect(fetchMock.mock.calls[0]?.[0]).toBe('https://fallback.example.test/v1/search');
+
+    await svc.getWebSearchProvider('dual-k3')!.search('q2');
+    expect(fetchMock.mock.calls[1]?.[0]).toBe('https://primary.example.test/v1/search');
   });
 });
 

@@ -19,6 +19,7 @@ describe('tool result session updates', () => {
   function update(output: unknown, isError = false) {
     const event: ToolResultEvent = {
       type: 'tool.result',
+      origin: 'loop',
       turnId: 1,
       toolCallId: 'media',
       output,
@@ -112,7 +113,7 @@ describe('acpMcpServersToConfigRecord', () => {
         command: '/usr/local/bin/mcp-fs',
         args: ['--root', '/tmp'],
         env: { API_KEY: 'secret', DEBUG: '1' },
-        runtime_id: 'local',
+        environment_id: 'local',
       },
     });
   });

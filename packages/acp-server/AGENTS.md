@@ -36,15 +36,12 @@ Package-local rules for `packages/acp-server`.
 - The ACP-backed process service forwards every executable/argument pair through
   `terminal/*`; Glob and Grep need non-shell `rg` processes. Only a recognized Bash
   tool invocation emits the terminal-created event used to attach a terminal tool card.
-- Fork positions are engine positions. The engine addresses `fork({ turnIndex })` by
-  counting user-visible turns in the durable records, so the `_meta.lody.turnId` this
-  server publishes IS that index, anchored per activation from `session.forkTurns()` and
-  advanced only by turns `isUserVisibleTurnOrigin` accepts — a wake or cron turn must
-  never consume one. Resolve a replayed turn to its position through the prompt's durable
-  id, never through rendered text: compaction drops messages from context while the
-  records defining these positions stay, and a repeated or truncated prompt would match
-  the wrong turn. A turn with no resolvable position is published without one; forking
-  the wrong turn is worse than not offering the branch.
+- Fork positions are persistent engine turn IDs. Publish the native ID on visible
+  user turns, preserving gaps for background turns and cancelled reservations.
+  Replayed prompts resolve IDs through durable prompt IDs and the same engine
+  records used by `fork({ turnIndex })`; steered messages share their owning turn.
+  Legacy context-only records retain their old positions only when unambiguous.
+  Omit a position when it cannot be resolved safely.
 
 - Declare Core `sessionTitle` only for a configured native OAuth title provider.
   Accepted prompt launches trigger native generation without blocking the turn;
