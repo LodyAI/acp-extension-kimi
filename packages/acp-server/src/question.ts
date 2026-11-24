@@ -13,7 +13,6 @@ function questionPropertyKey(questionIndex: number): string {
   return `q${questionIndex}`;
 }
 
-/** Titled enum options shared by the single- (`oneOf`) and multi- (`anyOf`) select arms. */
 function titledEnumOptions(question: QuestionItem): EnumOption[] {
   return question.options.map((opt) => ({
     const: opt.label,
@@ -71,15 +70,6 @@ export function questionRequestToElicitationParams(
   };
 }
 
-/**
- * Reverse-map an `elicitation/create` response into a tool-side
- * {@link QuestionAnswers} payload. `decline` / `cancel` (and an `accept`
- * without content) resolve to `null` — the tool's canonical "user dismissed"
- * branch. Multi-select values join with `', '` in DECLARED option order,
- * matching the TUI's `QuestionDialog` encoding. Values outside the declared
- * options are dropped defensively; an accept that answers nothing resolves
- * to `null` as well.
- */
 export function elicitationResponseToQuestionAnswers(
   questions: readonly QuestionItem[],
   response: CreateElicitationResponse,

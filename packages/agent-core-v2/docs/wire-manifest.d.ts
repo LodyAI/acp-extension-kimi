@@ -422,7 +422,7 @@ interface InterruptionReminderRequestedPayload {
 interface LlmRequestPayload {
   _name: 'llm.request';
   agentId: string;
-  kind: 'loop' | 'compaction';
+  kind: 'loop' | 'compaction' | 'prediction';
   provider: string;
   model: string;
   modelAlias?: string;
@@ -948,6 +948,18 @@ interface TurnEndedPayload {
   durationMs?: number;
   stopReason?: string;
   requestId?: string;
+  replyModel?: {
+    provider: string;
+    model: string;
+  };
+  modelSteps?: {
+    step: number;
+    role: 'step' | 'subagent';
+    model: string;
+    provider: string;
+    isKfc: boolean;
+    requestId?: string;
+  }[];
 }
 
 /**
@@ -990,7 +1002,7 @@ interface UsageRecordPayload {
   model: string;
   usage: TokenUsage;
   /** UsageRecordScope */
-  usageScope?: 'session' | 'turn';
+  usageScope?: 'session' | 'turn' | 'prediction';
 }
 
 /** Record type → payload sketch. */

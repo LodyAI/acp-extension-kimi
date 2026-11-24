@@ -1,37 +1,28 @@
-/**
- * acp-server bootstrap — wires `@moonshot-ai/agent-core-v2` (the DI × Scope
- * engine) into an ACP (Agent Client Protocol) stdio server.
- *
- * Composition root: `bootstrap()` builds the App `Scope`; a `@moonshot-ai/
- * klient` facade over the in-memory transport is created on top of it, and
- * every ACP method handler drives the engine through that facade. The
- * ACP-backed `IHostFileSystem` (./acp-fs) is imported for its Session-scope
- * registration side effect (see the import below) — being registered on the
- * same scope the memory transport dispatches against, it keeps working
- * unchanged.
- */
-
 import { Readable, Writable } from 'node:stream';
 
-import { RequestError, ndJsonStream, type AgentConnection, type Stream } from '@agentclientprotocol/sdk';
+import {
+  RequestError,
+  ndJsonStream,
+  type AgentConnection,
+  type Stream,
+} from '@agentclientprotocol/sdk';
 import {
   bootstrap,
   drainLogCloses,
   drainQueryStoreDisposals,
   drainSessionIndexMirror,
   drainSessionMetadataWrites,
-  ensureMainAgent,
   getLiveSessionById,
   IAgentLifecycleService,
   IAgentProfileService,
   ISessionAgentProfileCatalog,
   IAgentLoopService,
-  IAgentEnvironmentBindingService,
+  IAgentEnvironmentOverlay,
   IAppendLogStore,
-  IHostEnvironment,
+  ensureMainAgent,
   ISessionContext,
+  ISessionManager,
   ISessionIndexMirror,
-  IEnvironmentService,
   logSeed,
   resolveConfigPath,
   resolveKimiHome,
@@ -45,12 +36,9 @@ import type { Klient } from '@moonshot-ai/klient';
 import { createKlient } from '@moonshot-ai/klient/memory';
 
 import { acpClientFromContext } from './acp-client';
-// Importing the `acp-fs` barrel also registers the ACP-backed Session-scope
-// `IHostFileSystem` and the App-scope `IAcpConnection` holder via the barrel's
-// module side effects. `IAcpConnection` is used below to bind the ACP client
-// connection.
 import { IAcpConnection } from './acp-fs';
-import { AcpEnvironmentProviderFactory } from './acp-terminal';
+import { AcpEnvironmentOverlay } from './acp-terminal';
+import { currentAcpActivation } from './activation';
 import { AcpServer, type AcpServerOptions, createAcpAgentApp } from './server';
 
 export interface RunAcpServerOptions extends Omit<AcpServerOptions, 'setStoredArchive'> {
@@ -58,12 +46,6 @@ export interface RunAcpServerOptions extends Omit<AcpServerOptions, 'setStoredAr
   readonly configPath?: string;
   readonly input?: NodeJS.ReadableStream;
   readonly output?: NodeJS.WritableStream;
-  /**
-   * Extra App-scope service seeds forwarded to `bootstrap()`. Intended for
-   * tests — e.g. seeding a scripted `IProtocolAdapterRegistry` to drive a
-   * deterministic turn without a real LLM. Seeds shadow any registered
-   * binding with the same service identifier.
-   */
   readonly extraSeeds?: ScopeSeed;
 }
 
@@ -74,10 +56,6 @@ export interface RunningAcpServer {
   close(): Promise<void>;
 }
 
-/**
- * Redirect `console.*` to stderr. Stdout is the ACP JSON-RPC channel; any stray
- * write from a dependency would corrupt the protocol stream.
- */
 function redirectConsoleToStderr(): void {
   const sink = (...args: unknown[]): void => {
     process.stderr.write(`${args.map(String).join(' ')}\n`);
@@ -88,30 +66,13 @@ function redirectConsoleToStderr(): void {
   globalThis.console.debug = sink;
 }
 
-/**
- * Drive an {@link AcpServer} over an arbitrary ACP {@link Stream}.
- *
- * Boots `agent-core-v2`, creates the in-memory `Klient` facade over the app
- * scope, binds the ACP client connection into {@link IAcpConnection} (so the
- * `acp` `IHostFileSystem` can reverse-RPC file IO), and resolves when the
- * connection closes.
- */
 export async function runAcpServerWithStream(
   stream: Stream,
   opts: RunAcpServerOptions = {},
 ): Promise<RunningAcpServer> {
   const homeDir = resolveKimiHome(opts.homeDir);
   const configPath = resolveConfigPath({ homeDir, configPath: opts.configPath });
-  // `ILogOptions` (logSeed) is required by the Session-scoped log writer; any
-  // session creation would otherwise fail to instantiate the Session scope.
   const logging = resolveLoggingConfig({ homeDir, env: process.env });
-  // `bootstrap()` seeds `IFileSystemStorageService` with a `FileStorageService`
-  // rooted at `homeDir`, so session metadata, wire records, blobs, and the
-  // session index all persist to disk. `clientIdentity` is required by the
-  // engine: reuse the advertised ACP `agentInfo` (the embedding CLI's
-  // name/version) with the CLI platform — the literal matches
-  // `KIMI_CODE_PLATFORM` from `@moonshot-ai/kimi-code-oauth`, which this
-  // package does not depend on.
   const { app: core } = bootstrap(
     {
       homeDir,
@@ -125,38 +86,48 @@ export async function runAcpServerWithStream(
     [...logSeed(logging), ...(opts.extraSeeds ?? [])],
   );
 
-  // The klient dispatches against the same app scope — calls and events stay
-  // in-process but observe wire-shaped (JSON-cloned) data. The klient does
-  // NOT own the scope: lifecycle stays with this composition root.
+  const lifecycle = core.accessor.get(ISessionManager);
+  const onWillCreateSession = lifecycle.onWillCreateSession;
+  if (onWillCreateSession === undefined)
+    throw new Error('Session creation lifecycle is unavailable');
+  const activationSubscription = onWillCreateSession((event) => {
+    const activation = currentAcpActivation();
+    if (activation === undefined) return;
+    activation.close.push(() => lifecycle.close(event.sessionId));
+    activation.subscriptions.push(
+      event.onDidCreateScope((handle) => {
+        const overlay = handle.accessor.get(IAgentEnvironmentOverlay);
+        if (!(overlay instanceof AcpEnvironmentOverlay))
+          throw new Error('ACP environment overlay is unavailable');
+        overlay.attach();
+        activation.subscriptions.push(
+          handle.accessor
+            .get(IAgentLifecycleService)
+            .onDidCreateScope(({ context, handle: agent }) => {
+              if (!activation.active || context.agentId !== 'main') return;
+              const hold = agent.accessor.get(IAgentLoopService).tryAcquireQuiescence();
+              if (hold === undefined)
+                throw new Error('ACP activation could not pause restored work');
+              activation.holds.push(hold);
+            }),
+        );
+      }),
+    );
+  });
+
   const klient = createKlient({ scope: core });
   const acpConnection = core.accessor.get(IAcpConnection);
 
-  // Route every inbound ACP method to the `AcpServer`. The app must be
-  // connected before the outbound client surface (`conn.client`) — and thus
-  // the server — exists. Handlers wait for `serverReady` so requests received
-  // while the environment provider is attaching run only after construction.
   let resolveServer!: (server: AcpServer) => void;
-  let rejectServer!: (error: unknown) => void;
-  const serverReady = new Promise<AcpServer>((resolve, reject) => {
+
+  const serverReady = new Promise<AcpServer>((resolve) => {
     resolveServer = resolve;
-    rejectServer = reject;
   });
   void serverReady.catch(() => {});
   const app = createAcpAgentApp(() => serverReady);
   const conn = app.connect(stream);
   const client = acpClientFromContext(conn.client);
-  // Bind the process-wide ACP client connection before any session performs
-  // file IO. The `acp` `IHostFileSystem` reads it lazily via
-  // `IAcpConnection.get()`.
   acpConnection.bind(client);
-  const acpEnvironmentProvider = new AcpEnvironmentProviderFactory(acpConnection, core.accessor.get(IHostEnvironment));
-  const acpProviderRegistration = await core.accessor
-    .get(IEnvironmentService)
-    .addProvider(acpEnvironmentProvider)
-    .catch((error: unknown) => {
-      rejectServer(error);
-      throw error;
-    });
   const server = new AcpServer(client, klient, acpConnection, {
     setStoredArchive: async (sessionId, archived) => {
       const result = await setSessionArchived(core.accessor, sessionId, archived);
@@ -171,14 +142,11 @@ export async function runAcpServerWithStream(
     bindSessionEnvironment: async (sessionId, systemPrompt) => {
       const handle = getLiveSessionById(core.accessor, sessionId);
       if (handle === undefined) throw new Error(`session ${sessionId} is not live`);
-      const context = handle.accessor.get(ISessionContext);
-      const environmentId = acpEnvironmentProvider.bindSession(sessionId, context.cwd);
-      const agentContext = await ensureMainAgent(handle, { environmentId, environmentCwd: context.cwd });
-      handle.accessor
-        .get(IAgentLifecycleService)
-        .handleOf(agentContext.agentId)!
-        .accessor.get(IAgentEnvironmentBindingService)
-        .bind(environmentId, context.cwd);
+      const overlay = handle.accessor.get(IAgentEnvironmentOverlay);
+      if (!(overlay instanceof AcpEnvironmentOverlay))
+        throw new Error('ACP environment overlay is unavailable');
+      overlay.attach();
+      const agentContext = await ensureMainAgent(handle);
       const agent = handle.accessor.get(IAgentLifecycleService).handleOf(agentContext.agentId)!;
       const profile = agent.accessor.get(IAgentProfileService);
       const loop = agent.accessor.get(IAgentLoopService);
@@ -191,11 +159,12 @@ export async function runAcpServerWithStream(
         const rendered = base.renderSystemPrompt(context);
         return {
           ...rendered,
-          text: systemPrompt === undefined
-            ? rendered.text
-            : systemPrompt.mode === 'override'
-              ? systemPrompt.text
-              : `${rendered.text}\n\n${systemPrompt.text}`,
+          text:
+            systemPrompt === undefined
+              ? rendered.text
+              : systemPrompt.mode === 'override'
+                ? systemPrompt.text
+                : `${rendered.text}\n\n${systemPrompt.text}`,
         };
       };
       const changed = await profile.applyProfile({
@@ -208,9 +177,6 @@ export async function runAcpServerWithStream(
         environmentDisclosure: changed.environmentDisclosure,
         agentsMdPaths: changed.agentsMdPaths,
       });
-    },
-    unbindSessionEnvironment: async (sessionId) => {
-      await acpEnvironmentProvider.unbindSession(sessionId);
     },
     // Prompt-image compression persists originals into the session's own
     // media-originals dir (same resolution as kap-server's prompt route):
@@ -229,30 +195,15 @@ export async function runAcpServerWithStream(
   const close = async (): Promise<void> => {
     if (closePromise !== undefined) return closePromise;
     closePromise = (async () => {
-      // Detach the klient's event subscriptions first so disposal below cannot
-      // deliver into a torn-down scope.
+      activationSubscription.dispose();
       await klient.close();
-      // Flush the append-log write-behind before disposing, so a clean shutdown
-      // never races a pending drain against teardown (and doesn't drop the last
-      // persisted ops). Best-effort: a flush failure must not block disposal.
       const appendLogStore = core.accessor.get(IAppendLogStore);
       try {
         await appendLogStore.flush();
-      } catch {
-        // ignore — disposal proceeds regardless
-      }
-      // Same shutdown order as kap-server: settle queued session-metadata
-      // writes, then drain the session-index mirror while the query store is
-      // still open, so a queued summary lands in the read model.
+      } catch {}
       await drainSessionMetadataWrites();
       await core.accessor.get(ISessionIndexMirror).drain();
-      await acpProviderRegistration.dispose();
       core.dispose();
-      // `core.dispose()` runs the mirror's and the query store's synchronous
-      // `dispose()`, whose drains/closes are asynchronous — await them so an
-      // embedding host that removes homeDir right after close() never races
-      // an in-flight shard close (ENOTEMPTY on teardown). The same window
-      // exists for the append-log retirement flushes released by disposal.
       await appendLogStore.drainRetirements();
       await drainSessionIndexMirror();
       await drainQueryStoreDisposals();
@@ -269,12 +220,6 @@ export async function runAcpServerWithStream(
   return { core, klient, conn, close };
 }
 
-/**
- * Drive an {@link AcpServer} over Node stdio (or the supplied streams).
- *
- * The ACP SDK speaks Web `ReadableStream` / `WritableStream`, so Node stdio is
- * bridged through `Readable.toWeb` / `Writable.toWeb`.
- */
 export async function runAcpServer(opts: RunAcpServerOptions = {}): Promise<void> {
   redirectConsoleToStderr();
   const input = (opts.input ?? process.stdin) as Readable;

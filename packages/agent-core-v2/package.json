@@ -1,6 +1,6 @@
 {
   "name": "@moonshot-ai/agent-core-v2",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "private": true,
   "description": "The unified agent engine for Kimi (v2 — DI Scope architecture)",
   "license": "MIT",
@@ -69,6 +69,7 @@
     "@google/genai": "^1.49.0",
     "@jsquash/webp": "^1.5.0",
     "@modelcontextprotocol/sdk": "^1.29.0",
+    "@moonshot-ai/core": "workspace:^",
     "@moonshot-ai/kimi-code-oauth": "workspace:^",
     "@moonshot-ai/minidb": "workspace:^",
     "@moonshot-ai/tree-sitter-bash": "workspace:^",

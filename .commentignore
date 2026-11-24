@@ -1,0 +1,44 @@
+# Paths exempt from scripts/check-comments.mjs. Same syntax as .gitignore.
+
+# Vendored upstream code that carries license headers.
+packages/pi-tui/
+
+packages/minidb/
+
+# Doc comments define the public SDK API.
+packages/node-sdk/src/
+
+# Kept for now.
+packages/agent-core-v2/
+apps/kimi-code/src/tui/kimi-tui.ts
+apps/vis/server/src/lib/context-projector.ts
+packages/acp-server/src/replay.ts
+packages/acp-server/src/session.ts
+packages/klient/src/contract/agent/schemas.ts
+packages/klient/test/facade.test.ts
+
+# Core tool tests document their issue/PR provenance at the user's request.
+packages/core/test/tool/*.test.ts
+
+apps/kimi-code/scripts/build-vis-asset.mjs
+apps/kimi-code/src/constant/app.ts
+packages/acp-server/src/acp-client.ts
+packages/acp-server/src/acp-fs/acpFsService.ts
+packages/acp-server/src/config-options.ts
+packages/acp-server/src/convert.ts
+packages/acp-server/src/events-map.ts
+packages/acp-server/src/interaction-bridge.ts
+packages/acp-server/src/lody-extension.ts
+packages/acp-server/src/question.ts
+packages/acp-server/src/server.ts
+packages/acp-server/src/start.ts
+packages/acp-server/src/subagent-events.ts
+packages/acp-server/test/e2e-turn.test.ts
+packages/acp-server/test/lody-extension.test.ts
+packages/acp-server/test/lody-session-updates.test.ts
+packages/acp-server/test/replay.test.ts
+packages/klient/src/contract/agent/events.ts
+packages/klient/src/contract/global/auth.ts
+packages/klient/src/contract/session/lifecycle.ts
+packages/klient/src/core/facade/global.ts
+packages/klient/src/core/facade/session.ts

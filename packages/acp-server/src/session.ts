@@ -32,9 +32,20 @@ import type {
   ToolCallLocation,
 } from '@agentclientprotocol/sdk';
 import { RequestError } from '@agentclientprotocol/sdk';
-import { type ContextMessage, type ForkTurnSummary, isUserVisibleTurnOrigin } from '@moonshot-ai/agent-core-v2';
+import {
+  type ContextMessage,
+  type ForkTurnSummary,
+  isUserVisibleTurnOrigin,
+} from '@moonshot-ai/agent-core-v2';
+import type {
+  ToolCallDeltaEvent,
+  ToolCallStartedEvent,
+  ToolUpdatedEvent,
+} from '@moonshot-ai/agent-core-v2/agent/toolExecutor/toolExecutorEvents';
+import type { ToolResultEvent } from '@moonshot-ai/agent-core-v2/events';
 import { toCoreMessage } from '@moonshot-ai/agent-core-v2/human/message';
 import { toLlmMessage } from '@moonshot-ai/agent-core-v2/llm-adapter/contract/message';
+import type { ToolInputDisplay } from '@moonshot-ai/agent-core-v2/tool/toolInputDisplay';
 import type {
   AgentEventPayloads,
   AgentHandle,
@@ -49,13 +60,6 @@ import type {
   UsageStatus,
 } from '@moonshot-ai/klient';
 import { LODY_EXTENSION_METHODS, type LodyActivityMeta } from 'acp-extension-core';
-import type { ToolResultEvent } from '@moonshot-ai/agent-core-v2/events';
-import type {
-  ToolCallDeltaEvent,
-  ToolCallStartedEvent,
-  ToolUpdatedEvent,
-} from '@moonshot-ai/agent-core-v2/agent/toolExecutor/toolExecutorEvents';
-import type { ToolInputDisplay } from '@moonshot-ai/agent-core-v2/tool/toolInputDisplay';
 
 import type { AcpClient } from './acp-client';
 import type { AcpTerminalCreatedEvent, IAcpConnection } from './acp-fs';
@@ -107,39 +111,16 @@ import { projectHistoryToSessionUpdates } from './replay';
 import { buildAcpSkillSlashCommands, detectSlashIntent } from './slash';
 import { KimiSubagentEvents } from './subagent-events';
 
-/** Leading text of the first text block, if any (used for slash detection). */
 function leadingText(blocks: readonly ContentBlock[]): string | undefined {
   const first = blocks[0];
   if (first !== undefined && first.type === 'text') return first.text;
   return undefined;
 }
 
-/**
- * The engine's wire code for "another turn is active". A plain
- * `agent.prompt` while busy is QUEUED by the engine (the RPC returns
- * `undefined`, indistinguishable from a hook-blocked launch), so this code
- * only reaches us from `agent.activateSkill`, which rejects instead.
- */
 const TURN_AGENT_BUSY_CODE = 'turn.agent_busy';
 const SESSION_OCCUPIED_CODE = 'session.occupied';
 const SESSION_STALE_CODE = 'session.stale';
 
-/**
- * Map a prompt-launch rejection (from `agent.prompt` / `agent.activateSkill`)
- * to the JSON-RPC error the client sees.
- *
- *  - Auth-coded failures surface as `auth_required` so the client drives its
- *    re-auth flow (same mapping as the `turn.ended` auth path).
- *  - `turn.agent_busy` maps to `invalidRequest` (-32600), matching the legacy
- *    adapter's busy-prompt semantics.
- *  - `session.occupied` / `session.stale` map to `invalidRequest` too:
- *    occupied passes the engine message through (it is user-facing already),
- *    stale swaps in a client-action message because the engine's names the
- *    internal session id.
- *  - Everything else becomes a fixed-message `internalError` (-32603): the
- *    raw engine message and stack are logged server-side but NEVER cross the
- *    wire, so internal details cannot leak into the JSON-RPC channel.
- */
 export function mapPromptLaunchError(error: unknown, sessionId: string): RequestError {
   const code = (error as { readonly code?: unknown } | null | undefined)?.code;
   const message = error instanceof Error ? error.message : String(error);
@@ -172,7 +153,6 @@ export function mapPromptLaunchError(error: unknown, sessionId: string): Request
   return RequestError.internalError(undefined, 'session prompt failed');
 }
 
-/** Per-turn settlement state for one in-flight `session/prompt`. */
 interface HostSlashCommandsSnapshot {
   readonly commands: ReadonlyArray<AvailableCommand>;
   readonly skillCommandMap?: ReadonlyMap<string, string>;
@@ -186,27 +166,9 @@ interface ResolvedCommands {
 interface TurnDriver {
   resolve(response: PromptResponse): void;
   reject(error: unknown): void;
-  /**
-   * Learned once the launch call (`agent.prompt` / `agent.activateSkill`)
-   * resolves. Events carry a `turnId`, but until this is set no turn-scoped
-   * event can be attributed to this prompt — and the turn may START (with a
-   * fast model even END) before the launch round-trip delivers the id. Such
-   * events are buffered in {@link early} instead of being dropped.
-   */
   turnId?: number;
   settled: boolean;
-  /**
-   * Set when `cancel()` arrives while {@link turnId} is still unknown: the
-   * launch handler re-issues a precisely-addressed cancel once the id lands,
-   * and a no-launch outcome settles `cancelled` instead of `end_turn`.
-   */
   cancelRequested?: boolean;
-  /**
-   * Turn-scoped events that arrived while `turnId` was still unknown. Once
-   * the launch resolves, the entries matching the driver's turn are replayed
-   * in arrival order; the rest (a still-draining prior turn) are dropped —
-   * the same verdict the live path would have given.
-   */
   early: Array<{ readonly turnId: number; readonly dispatch: () => void }>;
   /**
    * The stop reason this prompt will answer with, withheld while background
@@ -239,16 +201,12 @@ function expectsWakeTurn(task: AgentTaskInfo): boolean {
 }
 
 export class AcpSession {
-  /** The klient facade this session was created from. */
   private readonly klient: Klient;
   private readonly session: SessionHandle;
   private readonly agent: AgentHandle;
 
-  /** Currently-selected model id (bare, no suffix). Empty when unbound. */
   private currentModelId: string = '';
-  /** The engine's current thinking level verbatim (`'off'`, `'on'`, or an effort). */
   private currentThinkingLevel: string = 'off';
-  /** Current ACP mode. */
   private currentModeId: AcpModeId = DEFAULT_MODE_ID;
   private planMode = false;
   /**
@@ -257,7 +215,6 @@ export class AcpSession {
    * the klient `skills.changed` event.
    */
   private skills: readonly SkillSummary[] = [];
-  /** The in-flight prompt's driver, if any. */
   private driver: TurnDriver | undefined;
   /**
    * Turns currently running on this session's main agent. Includes turns the
@@ -295,40 +252,11 @@ export class AcpSession {
    * a turn the client already asked to stop.
    */
   private readonly pendingPromptAborts = new Set<{ aborted: boolean }>();
-  /** Session-level agent-event subscriptions, torn down by `dispose()`. */
   private readonly subscriptions: IDisposable[] = [];
-  /**
-   * Streaming-args accumulators for in-flight tool calls, keyed by the ACP
-   * wire toolCallId. An entry's existence doubles as "the wire `tool_call`
-   * CREATE was sent" — either lazy-created from the first `tool.call.delta`
-   * (the engine streams args deltas BEFORE `tool.call.started`) or created by
-   * `tool.call.started` itself. Seeded/reseeded with the full stringified
-   * args at started so any post-started delta emits cumulative REPLACE
-   * content that includes the initial args. Cleaned at `tool.result`.
-   */
   private readonly toolCallStreamArgs = new Map<string, { args: string }>();
   private readonly toolStatuses = new Map<string, string>();
-  /**
-   * Locations derived at `tool.call.started`, keyed by the ACP wire
-   * toolCallId, re-attached to the terminal `tool_call_update`
-   * (`tool.result` carries no args/display of its own).
-   */
   private readonly toolLocations = new Map<string, ToolCallLocation[]>();
-  /**
-   * In-flight Bash tool calls awaiting terminal correlation, keyed by the ACP
-   * wire toolCallId; the value is the model's `args.command`. Filled at
-   * `tool.call.started`, consumed by {@link onTerminalCreated} (or dropped at
-   * `tool.result`).
-   */
   private readonly bashCallsAwaitingTerminal = new Map<string, string>();
-  /**
-   * Tool calls whose execution runs in a client terminal: ACP wire toolCallId
-   * → terminalId. Their terminal `tool_call_update` carries a
-   * `{type: 'terminal'}` content entry instead of the textual output (the
-   * client already renders the bytes in the terminal pane — showing them in
-   * the card too would duplicate them). The model still receives the full
-   * captured output; only the client-facing card content is de-duplicated.
-   */
   private readonly terminalBackedCalls = new Map<string, string>();
   /** Cumulative engine counters captured when this ACP activation began. */
   private readonly lodyUsageBaselines = new Map<string, TokenUsage>();
@@ -349,17 +277,7 @@ export class AcpSession {
     klient: Klient,
     readonly sessionId: string,
     private readonly acpConnection: IAcpConnection,
-    /**
-     * Whether the client advertised `elicitation.form` at `initialize` —
-     * forwarded to the interaction bridge's ask-user routing.
-     */
     elicitationForm: boolean,
-    /**
-     * Resolve the session's media-originals dir for prompt-image compression
-     * (`sessionMediaOriginalsDir(sessionDir)` when the live session scope is
-     * reachable). Undefined / returning undefined → `persistOriginalImage`'s
-     * shared temp-dir fallback applies.
-     */
     private readonly resolveOriginalsDir?: (sessionId: string) => string | undefined,
     private readonly hostCommands: ReadonlyArray<AvailableCommand> | HostSlashCommandsSnapshot = [],
     private readonly supportsPlan = false,
@@ -490,22 +408,16 @@ export class AcpSession {
         this.onCompactionCancelled();
       }),
     );
-    // Session-scope stream: title changes surface as `session_info_update`.
     this.subscriptions.push(
       this.session.events.on('metadata.changed', (event) => {
         this.onMetadataChanged(event);
       }),
     );
-    // Skill catalog changes refresh the cache and re-push the available
-    // commands so the client's slash menu tracks the live catalog.
     this.subscriptions.push(
       this.session.events.on('skills.changed', () => {
         void this.refreshSkills().then(() => this.emitAvailableCommandsUpdate());
       }),
     );
-    // Terminal correlation: the ACP-backed process runner (same process,
-    // App-scope holder) announces every terminal it creates so this session
-    // can attach it to the matching in-flight Bash tool call.
     const unsubscribeTerminal = this.acpConnection.onTerminalCreated((event) => {
       this.onTerminalCreated(event);
     });
@@ -514,7 +426,6 @@ export class AcpSession {
       this.currentModelId = await this.agent.getModel();
       this.currentThinkingLevel = await this.agent.getThinking();
     } catch (error) {
-      // Keep the unbound defaults — configOptions stays honest.
       log.warn('acp: could not seed model/thinking state', {
         sessionId: this.sessionId,
         error: error instanceof Error ? error.message : String(error),
@@ -537,7 +448,6 @@ export class AcpSession {
     void this.emitManagedUsage();
   }
 
-  /** Refresh the skill cache from the session catalog (best-effort). */
   private async refreshSkills(): Promise<void> {
     try {
       this.skills = await this.session.skills.list();
@@ -549,18 +459,12 @@ export class AcpSession {
     }
   }
 
-  /**
-   * Tear down per-session resources. Settles an in-flight prompt as
-   * cancelled, stops forwarding approval / ask-user requests to the client,
-   * and detaches the event subscriptions. Idempotent.
-   */
   dispose(): void {
     this.subagentEvents?.dispose();
     this.clearWakeTurnGrace();
     this.cancel();
     const driver = this.driver;
     if (driver !== undefined) {
-      // Never leave the JSON-RPC `session/prompt` hanging after teardown.
       this.settleDriver(driver, () => {
         driver.resolve({ stopReason: 'cancelled' });
       });
@@ -571,12 +475,6 @@ export class AcpSession {
     }
   }
 
-  /**
-   * Replay the main agent's persisted context history as an ordered batch of
-   * `session/update` notifications. Used by `session/load` so the client
-   * re-renders prior turns before the response settles. Awaits every push for
-   * ordering — replay is a one-shot batch, not a live stream.
-   */
   async replayHistory(): Promise<void> {
     let messages: readonly ContextMessage[];
     try {
@@ -617,8 +515,6 @@ export class AcpSession {
       try {
         await this.conn.sessionUpdate(update);
       } catch (error) {
-        // A single transient push failure must not truncate the whole replay;
-        // log and continue so the rest of the history still lands.
         log.warn('acp: replayHistory failed to push a session/update; continuing', {
           sessionId: this.sessionId,
           error: error instanceof Error ? error.message : String(error),
@@ -627,12 +523,6 @@ export class AcpSession {
     }
   }
 
-  /**
-   * Resolve the current command catalog. Builtins always win, followed by
-   * engine skills and then host-provided commands; duplicate names are dropped.
-   * Host aliases only participate in skill activation when that alias is also
-   * present in the advertised command list.
-   */
   private resolveCommands(): ResolvedCommands {
     const skillSnapshot = buildAcpSkillSlashCommands(this.skills);
     const hostSnapshot = Array.isArray(this.hostCommands)
@@ -658,12 +548,10 @@ export class AcpSession {
     return { commands, skillCommandMap: commandMap };
   }
 
-  /** Return the same merged command palette that is advertised to the client. */
   availableCommands(): AvailableCommand[] {
     return this.resolveCommands().commands;
   }
 
-  /** Push the current `available_commands_update` to the client. */
   async emitAvailableCommandsUpdate(): Promise<void> {
     try {
       const { commands } = this.resolveCommands();
@@ -677,11 +565,6 @@ export class AcpSession {
   }
 
   async prompt(blocks: readonly ContentBlock[]): Promise<PromptResponse> {
-    // Slash-intent detection: builtin commands execute locally without an LLM
-    // turn; skills activate through the engine (rendered skill prompt driven
-    // as a normal turn); unknown slash commands are answered locally with an
-    // "unknown command" notice (never sent to the model); non-slash input
-    // goes to the model as-is.
     const text = leadingText(blocks);
     if (text !== undefined) {
       const commands = this.resolveCommands();
@@ -699,21 +582,11 @@ export class AcpSession {
 
     const content = await this.preparePromptContent(blocks);
     if (content === undefined) {
-      // Cancelled while compressing (see `cancel()`): settle without
-      // launching a turn.
       return { stopReason: 'cancelled' };
     }
     return this.driveTurn(content);
   }
 
-  /**
-   * Convert the ACP blocks to engine content parts and run the input-stage
-   * image compression (see `compressPromptImageParts`). Compression happens
-   * before any turn exists, so honor a `session/cancel` that arrives during
-   * it: `cancel()` flips the marker and this returns `undefined` rather than
-   * launching a turn the client already asked to stop. Returns the compressed
-   * parts otherwise.
-   */
   private async preparePromptContent(
     blocks: readonly ContentBlock[],
   ): Promise<readonly ContentPart[] | undefined> {
@@ -730,11 +603,6 @@ export class AcpSession {
     return pending.aborted ? undefined : content;
   }
 
-  /**
-   * Answer an unknown slash command locally (no LLM turn): push the notice as
-   * one `agent_message_chunk`, then settle the prompt with `end_turn`. The
-   * wording mirrors the legacy adapter's `runUnknownSlashCommand`.
-   */
   private async driveUnknownCommand(name: string): Promise<PromptResponse> {
     await this.conn.sessionUpdate({
       sessionId: this.sessionId,
@@ -749,13 +617,6 @@ export class AcpSession {
     return { stopReason: 'end_turn' };
   }
 
-  /**
-   * Activate a skill through the engine (the agent's `IAgentSkillService`
-   * behind the klient facade): the engine renders the skill prompt (content + args)
-   * and drives it as a normal turn, so the turn events stream and settle
-   * exactly like a plain prompt. Empty args go over as `undefined`, matching
-   * the other consumers.
-   */
   private driveSkillActivation(skillName: string, args: string): Promise<PromptResponse> {
     this.assertNoActiveTurn();
     return this.driveLaunch(
@@ -763,12 +624,6 @@ export class AcpSession {
     );
   }
 
-  /**
-   * Execute an ACP builtin slash command locally: render its text from live
-   * klient/engine state (no LLM turn), push it as one `agent_message_chunk`,
-   * then settle the prompt with `end_turn`. The chunk push is awaited so it
-   * lands before the prompt response.
-   */
   private async driveBuiltinCommand(
     name: AcpBuiltinSlashCommandName,
     args: string,
@@ -808,24 +663,10 @@ export class AcpSession {
     return { stopReason: 'end_turn' };
   }
 
-  /**
-   * The skill command lookup, projected from the cached skill summaries
-   * (command name → skill name, including the `skill:`-prefixed entries).
-   */
   private skillCommandMap(): ReadonlyMap<string, string> {
     return buildAcpSkillSlashCommands(this.skills).commandMap;
   }
 
-  /**
-   * Reject a second model-bound prompt while a turn is in flight. The engine
-   * QUEUES a plain `agent.prompt` submitted during an active turn (the launch
-   * resolves `undefined`, indistinguishable from a hook-blocked launch), and
-   * tracking that queued turn would overwrite the only in-flight driver — the
-   * first prompt would never settle and both turns' events would go
-   * unattributed. The legacy adapter rejected this case (`turn.agent_busy` →
-   * -32600); reject locally instead, synchronously with driver assignment so
-   * two concurrent prompts cannot race past the check.
-   */
   private assertNoActiveTurn(): void {
     if (this.driver !== undefined && !this.driver.settled) {
       throw RequestError.invalidRequest(
@@ -835,25 +676,11 @@ export class AcpSession {
     }
   }
 
-  /**
-   * Submit the prompt and drive the turn to completion: `agent.prompt()`
-   * returns the launched turn id, which the session-level event handlers use
-   * to attribute events to this driver. Settles on `turn.ended`; a no-launch
-   * result (hook-blocked / not runnable) settles with `end_turn`.
-   */
   private driveTurn(input: readonly ContentPart[]): Promise<PromptResponse> {
     this.assertNoActiveTurn();
     return this.driveLaunch(this.agent.prompt({ input }));
   }
 
-  /**
-   * Shared turn settlement for every launch path (`agent.prompt`,
-   * `agent.activateSkill`): the returned turn id attributes subsequent events
-   * to this driver; `undefined` means no turn launched (hook-blocked / not
-   * runnable — the busy case never gets this far, see
-   * {@link assertNoActiveTurn}), so the prompt settles gracefully with
-   * `end_turn`.
-   */
   private driveLaunch(launch: Promise<PromptLaunchResult>): Promise<PromptResponse> {
     return new Promise<PromptResponse>((resolve, reject) => {
       const driver: TurnDriver = { resolve, reject, settled: false, early: [] };
@@ -870,10 +697,6 @@ export class AcpSession {
           }
           if (driver.settled) return;
           if (launched === undefined) {
-            // No turn will emit `turn.ended`, so settle gracefully. The engine
-            // publishes a `prompt.completed` with reason 'blocked' for the
-            // hook-blocked case; the wire carries no blocking message to
-            // surface, matching the old `PromptHandle`-based behavior.
             this.settleDriver(driver, () => {
               resolve({ stopReason: driver.cancelRequested === true ? 'cancelled' : 'end_turn' });
             });
@@ -881,9 +704,6 @@ export class AcpSession {
           }
           driver.turnId = launched.turn_id;
           if (driver.cancelRequested === true) {
-            // A cancel arrived before the id was known (see `cancel()`): the
-            // unaddressed cancel may have predated the turn's activation, so
-            // re-issue it now precisely addressed. Idempotent.
             void this.agent.cancel({ turnId: launched.turn_id }).catch((error) => {
               log.warn('acp: deferred cancel failed', {
                 sessionId: this.sessionId,
@@ -891,9 +711,6 @@ export class AcpSession {
               });
             });
           }
-          // Replay the events the turn emitted before its id arrived (a fast
-          // turn can outrun the launch round-trip — `activateSkill` returns
-          // only after the prompt-metadata update).
           for (const early of driver.early.splice(0)) {
             if (early.turnId === driver.turnId) early.dispatch();
           }
@@ -907,10 +724,6 @@ export class AcpSession {
     });
   }
 
-  /**
-   * Route a turn-scoped event: buffer it while the in-flight prompt's turn id
-   * is still unknown (see {@link TurnDriver.early}), otherwise dispatch live.
-   */
   private dispatchTurnEvent(turnId: number, dispatch: () => void): void {
     const driver = this.driver;
     if (driver !== undefined && !driver.settled && driver.turnId === undefined) {
@@ -920,10 +733,6 @@ export class AcpSession {
     dispatch();
   }
 
-  /**
-   * Settle the driver exactly once and detach it from the session so later
-   * events of its turn are ignored.
-   */
   private settleDriver(driver: TurnDriver, action: () => void): void {
     if (driver.settled) return;
     driver.settled = true;
@@ -931,7 +740,6 @@ export class AcpSession {
     action();
   }
 
-  /** The active driver, but only for events of ITS turn. */
   private driverFor(turnId: number): TurnDriver | undefined {
     const driver = this.driver;
     if (driver === undefined || driver.turnId === undefined || driver.turnId !== turnId) {
@@ -973,17 +781,6 @@ export class AcpSession {
         this.bashCallsAwaitingTerminal.set(key, command);
       }
     }
-    // Branch on whether a streaming delta already lazy-created the wire
-    // `tool_call` for this id:
-    //  - YES → a second CREATE is illegal; emit the "upgrade"
-    //    `tool_call_update` so title/kind/rawInput/locations (and any
-    //    `display`-derived diff) land on the existing card and `status`
-    //    flips to `'in_progress'`.
-    //  - NO  → no prior deltas (provider doesn't stream args); emit the
-    //    `tool_call` CREATE.
-    // Either way the accumulator is (re)seeded with the full stringified
-    // args: `tool_call_update` content is REPLACE-semantics, so a post-start
-    // delta must emit the cumulative args string, not just its fragment.
     const streamArgs = { args: stringifyArgs(mapped.args) };
     const lazyCreated = this.toolCallStreamArgs.has(key);
     this.toolCallStreamArgs.set(key, streamArgs);
@@ -1013,12 +810,6 @@ export class AcpSession {
     const key = acpToolCallId(event.turnId, event.toolCallId);
     const acc = this.toolCallStreamArgs.get(key);
     if (acc === undefined) {
-      // The engine emits args-stream deltas BEFORE `tool.call.started`
-      // (deltas come from the provider's streaming phase; started is
-      // dispatched when the call runs). Lazy-create the wire `tool_call`
-      // from this first delta so subsequent updates have a legitimate parent
-      // — clients otherwise surface "Tool call not found" until the start
-      // eventually lands.
       this.toolCallStreamArgs.set(key, { args: event.argumentsPart ?? '' });
       this.emitForTurn(event.turnId, toolCallLazyCreateToSessionUpdate(this.sessionId, mapped));
       return;
@@ -1031,12 +822,16 @@ export class AcpSession {
   private onToolUpdated(event: AgentEventPayloads['tool.updated']): void {
     const key = acpToolCallId(event.turnId, event.toolCallId);
     const status = event.fields['status'];
-    if (typeof status !== 'string' || status.length === 0 || this.toolStatuses.get(key) === status) return;
+    if (typeof status !== 'string' || status.length === 0 || this.toolStatuses.get(key) === status)
+      return;
     this.toolStatuses.set(key, status);
     // The klient payload mirrors `ToolUpdatedEvent` field-for-field; the
     // helper forwards only `status` updates with text (as a title refresh)
     // and returns null for everything else, which `emit` drops.
-    this.emitForTurn(event.turnId, toolUpdatedToSessionUpdate(this.sessionId, event as unknown as ToolUpdatedEvent));
+    this.emitForTurn(
+      event.turnId,
+      toolUpdatedToSessionUpdate(this.sessionId, event as unknown as ToolUpdatedEvent),
+    );
   }
 
   private onToolResult(event: AgentEventPayloads['tool.result']): void {
@@ -1071,14 +866,6 @@ export class AcpSession {
     );
   }
 
-  /**
-   * Correlate a freshly-created client terminal with the in-flight Bash tool
-   * call whose command it runs, then attach a `{type: 'terminal'}` content
-   * entry to that call's card. Match key: the runner reports the full shell
-   * invocation (`cd <cwd> && <command>`), which ends with the model's
-   * `args.command`. Terminals with no matching call (e.g. a subagent's —
-   * this session only follows the main agent's events) stay unattached.
-   */
   private onTerminalCreated(event: AcpTerminalCreatedEvent): void {
     if (event.sessionId !== this.sessionId) return;
     for (const [key, command] of this.bashCallsAwaitingTerminal) {
@@ -1379,13 +1166,6 @@ export class AcpSession {
     }
   }
 
-  /**
-   * Push a one-shot `usage_update` after a turn settles: `used` = the agent's
-   * current context token count, `size` = the bound model's max context size
-   * from the catalog. Skipped while no catalog model matches the bound id —
-   * there is nothing honest to report. `cost` stays omitted (the engine has
-   * no cost data).
-   */
   private async emitUsageUpdate(): Promise<void> {
     try {
       const size = (await this.klient.global.kosong.listModels()).find(
@@ -1407,7 +1187,6 @@ export class AcpSession {
     void this.emitSessionInfoUpdate();
   }
 
-  /** Push a `session_info_update` with the current title (best-effort). */
   private async emitSessionInfoUpdate(): Promise<void> {
     try {
       const meta = await this.session.get();
@@ -1420,7 +1199,6 @@ export class AcpSession {
     }
   }
 
-  /** Push a `session/update` notification (best-effort, never throws). */
   private emit(notification: SessionNotification | null): void {
     if (notification === null) return;
     void this.conn.sessionUpdate(notification).catch((error) => {
@@ -1431,11 +1209,6 @@ export class AcpSession {
     });
   }
 
-  /**
-   * Cancel the in-flight turn, if any, and abort every prompt still in its
-   * pre-turn compression phase (those settle as cancelled without launching —
-   * see {@link preparePromptContent}). Idempotent.
-   */
   cancel(): void {
     for (const pending of this.pendingPromptAborts) {
       pending.aborted = true;
@@ -1458,13 +1231,6 @@ export class AcpSession {
     }
     const turnId = driver.turnId;
     if (turnId === undefined) {
-      // The launch round-trip has not returned the turn id yet. The engine's
-      // cancel payload makes turnId optional — an empty call cancels whatever
-      // turn is active (the same contract kap-server's cancel route relies
-      // on) — and concurrent prompts are rejected, so the active turn can only
-      // be this driver's. Flag the driver too: when the id lands, the launch
-      // handler re-issues a precisely-addressed cancel, and a no-launch
-      // outcome settles `cancelled` instead of `end_turn`.
       driver.cancelRequested = true;
       this.cancelAgentTurn('unaddressed');
       return;
@@ -1487,11 +1253,6 @@ export class AcpSession {
     });
   }
 
-  /**
-   * Build the current `configOptions` snapshot (model + thinking + mode).
-   * The thinking toggle only appears when the bound model's catalog row is
-   * thinking-capable (see `buildSessionConfigOptions`).
-   */
   async configOptions(): Promise<SessionConfigOption[]> {
     const models = projectModelCatalog(await this.klient.global.kosong.listModels());
     const permission = await this.agent.getPermission();
@@ -1518,25 +1279,11 @@ export class AcpSession {
     };
   }
 
-  /**
-   * Switch the active model.
-   *
-   * Legacy clients may merge the thinking flag into the model id as
-   * `"<id>,thinking"` (mirrors the Python ref's `_ModelIDConv.from_acp_model_id`
-   * and the legacy adapter): the merged form splits into `setModel(<bare id>)`
-   * plus `setThinking(<the NEW model's default effort>)`. The asymmetry is
-   * load-bearing — a bare id does NOT turn thinking off (model and thinking
-   * stay orthogonal; disabling thinking requires the `thinking` config option
-   * with value `'off'`). Both entry points (`session/set_model` and the
-   * `model` arm of `session/set_config_option`) funnel here.
-   */
   async setModel(id: string): Promise<void> {
     const suffix = ',thinking';
     const hasSuffix = id.endsWith(suffix);
     const baseId = hasSuffix ? id.slice(0, -suffix.length) : id;
     await this.agent.setModel(baseId);
-    // Update BEFORE resolving the on-effort so a merged `,thinking` switch
-    // picks the NEW model's default level, not the old one's.
     this.currentModelId = baseId;
     if (hasSuffix) {
       const models = projectModelCatalog(await this.klient.global.kosong.listModels());
@@ -1547,16 +1294,6 @@ export class AcpSession {
     await this.emitConfigOptionUpdate();
   }
 
-  /**
-   * Switch the thinking level. The value is validated against the current
-   * model's declared capability: with `supportEfforts` the allowed set is
-   * `'off'` plus every declared effort (an `always_thinking` model drops
-   * `'off'`); without them it stays the boolean `'off'` / `'on'` pair. Legacy
-   * boolean clients sending `'on'` to an effort-granular model map to the
-   * model's default effort (`AcpModelEntry.defaultThinkingEffort`). Returns
-   * `false` for a value the model cannot take — the caller maps that to ACP
-   * `invalid_params`.
-   */
   async setThinking(value: string): Promise<boolean> {
     const models = projectModelCatalog(await this.klient.global.kosong.listModels());
     const entry = models.find((model) => model.id === this.currentModelId);

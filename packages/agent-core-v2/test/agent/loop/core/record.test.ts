@@ -1,9 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { createUserEntry } from '#human/agent/turn';
-import { createAssistantMessage, createUserMessage, extractText, type ToolCall } from '#human/llm/message';
-import type { LlmRequest } from '#human/llm/request';
-import type { LlmOutcome } from '#human/llm/response';
+import { createUserMessage, extractText, type ToolCall } from '@moonshot-ai/core/llm/message';
 import {
   loopProjection,
   toLoopRecord,
@@ -11,24 +8,18 @@ import {
   type LoopEmitted,
   type LoopLlmRequester,
   type LoopRecord,
-} from '#/agent/loop/core/index';
+} from '@moonshot-ai/core/loop/index';
+import { createMockProviderRequester, type MockProviderResponse } from '../../../harness/scripted-generate';
 import { createTestLoop as createLoop } from './factory';
-import type { ToolExecuteInput, ToolResult } from '#human/tool/executor';
+import { textToolContent, type ToolReturn } from '#/tool/executor';
 import { executorFrom, successfulExecutor } from './executor';
 
-function requester(outcomes: (() => LlmOutcome)[]): LoopLlmRequester {
-  const self: LoopLlmRequester = {
-    with: () => self,
-    request: (part) => part as unknown as LlmRequest,
-    generate: async (_rest, control) => {
-      const next = outcomes.shift();
-      if (next === undefined) throw new Error('boom');
-      const outcome = next();
-      control.onEvent?.({ type: 'llm.streaming.part', part: { type: 'text', text: 'hi' } });
-      return outcome;
-    },
-  };
-  return self;
+function requester(responses: MockProviderResponse[]): LoopLlmRequester {
+  return createMockProviderRequester(() => {
+    const next = responses.shift();
+    if (next === undefined) throw new Error('boom');
+    return next;
+  });
 }
 
 function record(loop: Loop): LoopRecord[] {
@@ -58,10 +49,9 @@ function once(loop: Loop, match: (event: LoopEmitted) => boolean): Promise<void>
   });
 }
 
-const prompt = (text: string) => createUserEntry(createUserMessage(text));
-const done = (text: string, toolCalls: ToolCall[] = []): (() => LlmOutcome) => () => ({
-  type: 'done',
-  message: createAssistantMessage([{ type: 'text', text }], toolCalls),
+const prompt = (text: string) => createUserMessage(text);
+const done = (text: string, toolCalls: ToolCall[] = []): MockProviderResponse => ({
+  parts: [{ type: 'text', text }, ...toolCalls],
 });
 const call = (id: string, name: string): ToolCall => ({ type: 'function', id, name, arguments: '{}' });
 
@@ -69,7 +59,7 @@ describe('loop record', () => {
   it('folds durable loop events back into the loop history and recovers interrupted turns', async () => {
     const scripted = requester([done('hi')]);
     const loop = createLoop({
-      createTurnExecution: ({ profile }) => ({ profile, requester: scripted }),
+      requester: scripted,
       executor: successfulExecutor(['lookup', 'bg', 'slow'], ''),
     });
     const records = record(loop);
@@ -89,29 +79,30 @@ describe('loop record', () => {
       [1, 'failed'],
     ]);
     const restored = createLoop({
-      createTurnExecution: ({ profile }) => ({ profile, requester: requester([]) }),
+      requester: requester([]),
       executor: successfulExecutor(['lookup', 'bg', 'slow'], ''),
       input: { messages: state.messages, nextTurnId: state.nextTurnId },
     });
     expect(restored.state.messages).toEqual(loop.state.messages);
 
-    let settleBackground: ((result: ToolResult) => void) | undefined;
-    let settleSlow: ((result: ToolResult) => void) | undefined;
-    const executor = executorFrom(['bg', 'slow'], ({ toolCall, detach }: ToolExecuteInput) => {
-        if (toolCall.name === 'bg') {
-          detach?.('bg ack');
-          return new Promise<ToolResult>((resolve) => {
+    let settleBackground: ((result: ToolReturn) => void) | undefined;
+    let settleSlow: ((result: ToolReturn) => void) | undefined;
+    const executor = executorFrom(['bg', 'slow'], (context) => {
+        if (context.call.name === 'bg') {
+          context.onDetach(() => ({ content: textToolContent('bg ack') }));
+          context.detach('bg ack');
+          return new Promise<ToolReturn>((resolve) => {
             settleBackground = resolve;
           });
         }
-        return new Promise<ToolResult>((resolve) => {
+        return new Promise<ToolReturn>((resolve) => {
           settleSlow = resolve;
         });
       },
     );
     const acting = requester([done('', [call('call-slow', 'slow'), call('call-bg', 'bg')])]);
     const working = createLoop({
-      createTurnExecution: ({ profile }) => ({ profile, requester: acting }),
+      requester: acting,
       executor,
       input: { messages: state.messages, nextTurnId: state.nextTurnId },
     });
@@ -124,10 +115,16 @@ describe('loop record', () => {
     expect(crashed.unfinished).toEqual({ turnId: 2, trigger: 'normal', step: 1, stepUnfinished: true, appended: true });
     expect(crashed.nextTurnId).toBe(3);
 
+    const lifecycleEvents: LoopEmitted['type'][] = [];
+    working.subscribe((event) => {
+      if (event.type === 'loop.drained' || event.type === 'loop.idle') lifecycleEvents.push(event.type);
+    });
+    let closingIdle: Promise<void> | undefined;
     let closes: { first: Promise<void>; second: Promise<void> } | undefined;
     const stop = working.subscribe((event) => {
       if (event.type !== 'prompt.reminded') return;
       stop();
+      closingIdle = working.waitForIdle();
       closes = { first: working.close(), second: working.close() };
     });
     working.remind(prompt('reentrant close'));
@@ -136,12 +133,14 @@ describe('loop record', () => {
     settleSlow?.({ content: [{ type: 'text', text: 'slow stopped' }] });
     settleBackground?.({ content: [{ type: 'text', text: 'background stopped' }] });
     await first;
+    await closingIdle;
+    expect(lifecycleEvents).toEqual([]);
     const closed = fold([...records, ...live]);
     expect(closed.unfinished).toBeUndefined();
     expect(closed.turns.at(-1)).toMatchObject({ turnId: 2, outcome: { type: 'aborted', reason: { reason: 'closed' } } });
-    expect(closed.messages.slice(-3).map((entry) => entry.message.role)).toEqual(['tool', 'tool', 'user']);
-    expect(extractText(closed.messages.at(-1)!.message)).toBe('reentrant close');
-    expect(closed.notify.map((entry) => extractText(entry.message))).toEqual([
+    expect(closed.messages.slice(-3).map((entry) => entry.role)).toEqual(['tool', 'tool', 'user']);
+    expect(extractText(closed.messages.at(-1)!)).toBe('reentrant close');
+    expect(closed.notify.map((entry) => extractText(entry))).toEqual([
       '[async tool aborted] bg (tool_call_id=call-bg)',
     ]);
     const recordsAtClose = live.length;
@@ -151,7 +150,7 @@ describe('loop record', () => {
 
     const answering = requester([done('next')]);
     const recovered = createLoop({
-      createTurnExecution: ({ profile }) => ({ profile, requester: answering }),
+      requester: answering,
       executor,
       input: { messages: crashed.messages, nextTurnId: crashed.nextTurnId, unfinished: crashed.unfinished },
     });

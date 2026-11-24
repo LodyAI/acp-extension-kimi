@@ -7,6 +7,7 @@ import {
   IAgentSwarmService,
   IAgentTodoService,
   IAgentTowerService,
+  MAIN_AGENT_ID,
   planKey,
   type IAgentScopeHandle,
   type ServiceIdentifier,
@@ -14,15 +15,25 @@ import {
 
 import type {
   AgentState,
+  ContextState,
   GoalState,
   TodoItemState,
-  UsageState,
 } from '../../../protocol/ws-agent';
-import { readLegacyStatus } from '../../../services/legacyStatus/legacyStatus';
+import { missingConfiguredModelAlias, readLegacyStatus } from '../../../services/legacyStatus/legacyStatus';
 
-export function readAgentState(handle: IAgentScopeHandle, running: boolean): AgentState {
+export function readAgentState(handle: IAgentScopeHandle | undefined, running: boolean): AgentState {
+  if (handle === undefined) {
+    return {
+      status: running ? 'running' : 'idle',
+      compacting: false,
+      plan_mode: false,
+      swarm_mode: false,
+      tower_mode: false,
+    };
+  }
   const profile = optionalService(handle, IAgentLoopService);
-  const model = profile?.getModel() ?? '';
+  let model = profile?.getModel() ?? '';
+  if (handle.id === MAIN_AGENT_ID && model !== '' && missingConfiguredModelAlias(handle) !== undefined) model = '';
   return {
     status: running ? 'running' : 'idle',
     compacting: (optionalService(handle, IAgentFullCompactionService)?.compacting ?? null) !== null,
@@ -35,7 +46,7 @@ export function readAgentState(handle: IAgentScopeHandle, running: boolean): Age
   };
 }
 
-export function readUsageState(handle: IAgentScopeHandle): UsageState | undefined {
+export function readContextState(handle: IAgentScopeHandle): ContextState | undefined {
   const status = readLegacyStatus(handle);
   if (status === undefined) return undefined;
   return {
