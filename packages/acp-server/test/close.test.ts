@@ -28,6 +28,22 @@ describe('acp-server session/close', () => {
     return client;
   }
 
+  it('archives and restores the same cold session in native history', async () => {
+    const c = await boot();
+    const init = await c.send('initialize', { protocolVersion: 1, clientCapabilities: {} });
+    expect(init).toMatchObject({ agentCapabilities: { _meta: { lody: { sessionArchive: { version: 1, mode: 'native' } } } } });
+    const { sessionId } = await c.send('session/new', { cwd: homeDir, mcpServers: [] }) as { sessionId: string };
+    const archive = () => c.send('_lody/session/archive', { sessionId });
+    await expect(archive()).rejects.toThrow();
+    await c.send('session/close', { sessionId });
+    for (const archived of [true, true, false, false]) {
+      await c.send(archived ? '_lody/session/archive' : '_lody/session/unarchive', { sessionId });
+      const { sessions } = await c.send('session/list', {}) as { sessions: { sessionId: string }[] };
+      expect(sessions.some((row) => row.sessionId === sessionId)).toBe(!archived);
+    }
+    await expect(c.send('_lody/session/archive', { sessionId: 'missing' })).rejects.toThrow();
+  });
+
   it(
     'advertises the close capability and closes a live session',
     async () => {

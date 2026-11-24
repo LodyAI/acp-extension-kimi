@@ -16,6 +16,7 @@ export const LODY_EXTENSION_CAPABILITIES = {
   usage: { version: 1 },
   rateLimits: { version: 1, query: true },
   forkAtTurn: { version: 1 },
+  sessionArchive: { version: 1, mode: 'native' },
   tasks: { version: 1, background: true },
   subagents: { version: 1, lifecycle: true, list: true, cancel: true, output: true },
   compaction: { version: 1 },
