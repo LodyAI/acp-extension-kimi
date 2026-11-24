@@ -9,7 +9,7 @@
 | 人群 | 说明 | 契约位置 |
 |---|---|---|
 | TUI 交互用户 | `kimi` 默认入口 | `apps/kimi-code/src/tui/` |
-| print 模式用户 | `kimi -p`，含解析 `--output-format stream-json` 输出的脚本。脚本解析者算二等人群，但输出格式变化必须写进 changeset（#3146） | `apps/kimi-code/src/cli/options.ts` |
+| print 模式用户 | `kimi -p`，含解析 `--output-format stream-json` 输出的脚本。脚本解析者算二等人群，但输出格式变化必须写进 PR 描述（#3146） | `apps/kimi-code/src/cli/options.ts` |
 | desktop 与 web 用户 | 源码在 code-app 仓库，只消费 kap-server 的 `/api/v1` REST 与 `/api/v1/ws`。本仓 diff 看不到它们的用法，改契约时必须点名让作者去对方仓库核对 | `packages/kap-server/src/routes/`、`packages/kap-server/src/transport/ws/`、`docs/en/reference/server-api.md` |
 | VS Code 扩展用户 | 走 SDK 事件适配层，webview 有自己的渲染契约（#3250：v2 不再发 `display` 字段导致卡片空白） | `apps/vscode/` |
 | ACP 客户端用户 | Zed 等，`kimi acp`。stdio MCP 是 ACP 的默认传输，客户端会无条件发（#3167）；能力矩阵是公开承诺（#3081） | `packages/acp-server/`、`docs/en/reference/kimi-acp.md` |
@@ -102,7 +102,7 @@ prompt 文本改动影响全体用户，且没有测试能证明"无影响"。�
 | `packages/node-sdk/src/index.ts`、`packages/node-sdk/package.json` | SDK 导出面 | 删除或改签名即破坏性变更 |
 | `packages/klient/src/` | SDK 与 ACP 下面的客户端门面契约 | 只改 klient 的 PR 碰不到 node-sdk 导出面，按 SDK 调用方与 ACP 客户端两个人群核行为变化 |
 | `packages/transcript/src/contract/` | kap-server 发给 desktop、web、VS Code 的 transcript 载荷契约 | 消费方在 code-app，点名让作者去核；上一版客户端能否解析新载荷 |
-| `.github/workflows/release.yml`、`_native-build.yml`、`manual-native-bundle.yml`、`vscode-publish.yml`，`apps/kimi-code/scripts/native/`、`apps/kimi-code/scripts/check-web-assets.mjs` | 发布产物 | 按安装方式与平台核：npm 包内容、各平台 native 二进制、VS Code 市场包、内置 web 产物是否仍齐全 |
+| `apps/kimi-code/scripts/native/`、`apps/kimi-code/scripts/check-web-assets.mjs` | 发布产物 | 按安装方式与平台核：npm 包内容、各平台 native 二进制、VS Code 市场包、内置 web 产物是否仍齐全 |
 | `packages/acp-server/` | ACP 客户端 | 对照 `docs/en/reference/kimi-acp.md` 的能力矩阵逐项核对 |
 | `apps/kimi-code/src/cli/` | 命令行参数、子命令、`--output-format` | 对照 `docs/en/reference/kimi-command.md` |
 | `packages/agent-core-v2/src/features/externalHooks/` | hook 事件与载荷 | 对照 `docs/en/customization/hooks.md` 的事件参考 |

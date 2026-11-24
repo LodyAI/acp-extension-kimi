@@ -25,7 +25,7 @@ description: 在 kimi-code 仓库里创建或更新 PR 时使用：如何写出�
    - PR 已存在时，用 `gh pr view` 拿元数据和改动文件列表。
    - 改动让用户看到的界面或输出变了的，准备视觉证据，见"UI/UX 变化的视觉证据"。
 
-4. 按模板各节写描述。描述用用户当前使用的语言，行为变化表也一样；只有三样固定：PR 标题保持英文 Conventional Commit，changeset 保持英文（见 `gen-changesets` skill），节标题沿用模板原文。
+4. 按模板各节写描述。描述用用户当前使用的语言，行为变化表也一样；有两项固定：PR 标题保持英文 Conventional Commit，节标题沿用模板原文。
    - **Requirement or Bug**：两三句话讲清谁遇到了什么问题、这个 PR 之后能做到什么；有 issue 的写 `Resolve #<number>`，再补一句背景。解决办法留给 Code Changes。
    - **Bug Reproduction Steps**：只有 bug 类 PR 需要；feature 写 `N/A`。步骤已在 issue 里的写 `See linked issue`。
    - **Root Cause**：只有 bug 类 PR 需要；feature 写 `N/A`。说明根因，以及这是根本修复还是绕过。机制要靠时序或状态才说得清的，用图，见"代码变更的可视化大纲"。
@@ -61,7 +61,7 @@ description: 在 kimi-code 仓库里创建或更新 PR 时使用：如何写出�
 
 5. 确实没有可观测变化的，写 `None`，并说明证据：哪些分支、默认值、契约文件没动。
 
-6. 表后面列受影响模块与每一行对应的测试覆盖。默认翻转或删除行为的，必须有一条测试把未被改动的人群的旧行为钉住，并且 changeset 要写明用户失去了什么，见 `gen-changesets` skill；没有退路的，在 PR 里请维护者显式拍板。
+6. 表后面列受影响模块与每一行对应的测试覆盖。默认翻转或删除行为的，必须有一条测试把未被改动的人群的旧行为钉住；没有退路的，在 PR 里请维护者显式拍板。
 
 ## 讲清楚改动
 

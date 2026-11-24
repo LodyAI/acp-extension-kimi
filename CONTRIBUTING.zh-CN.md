@@ -71,16 +71,7 @@ pnpm install
 | perf     | 性能优化                                 | perf(session): batch event flushes     |
 | style    | 仅格式化（无逻辑变更）                   | style: apply oxlint --fix              |
 
-PR 标题由 `pr-title-checker` 工作流强制校验——不合规的标题会阻止合并。
 
-## Changesets
-
-本仓库使用 [changesets](https://github.com/changesets/changesets) 管理版本与发布。
-
-- 每个影响发布产物（代码、行为、公开 API）的 PR **必须**包含 changeset。
-- 仅文档、仅测试或仅 CI 的 PR 可以不加。
-- 用 `pnpm changeset` 生成并按提示操作（涉及哪些包、什么 bump 级别）。
-- 包选择与 bump 级别的仓库约定见 `.changeset/README.md`。在本仓库使用编程 agent 时，使用 `gen-changesets` 技能。
 
 ## Pull Requests
 
