@@ -1,27 +1,22 @@
-import * as posixPath from 'node:path/posix';
-import * as win32Path from 'node:path/win32';
 import { PassThrough, Writable, type Readable } from 'node:stream';
 
-import type {
-  HostEnvironmentInfo,
-  HostProcessOptions,
-  IHostEnvironment,
-  IHostFileSystem,
-  IHostProcess,
-  IHostProcessService,
+import {
+  IAgentEnvironmentOverlay,
+  LOCAL_ENVIRONMENT_ID,
+  LifecycleScope,
+  ScopeActivation,
+  overrideScopedService,
+  type EnvironmentLease,
+  type HostProcessOptions,
+  type IHostProcess,
+  type IHostProcessService,
   ISessionContext,
-  Environment,
-  EnvironmentPath,
-  EnvironmentProviderAttachment,
-  EnvironmentProviderFactory,
-  EnvironmentProviderHost,
 } from '@moonshot-ai/agent-core-v2';
 
 import { AcpHostFileSystem, IAcpConnection, type IAcpTerminalHandle } from '../acp-fs';
 
 const OUTPUT_BYTE_LIMIT = 4 * 1024 * 1024;
 const OUTPUT_POLL_MS = 250;
-let nextGeneration = 1;
 
 function isBashToolInvocation(
   command: string,
@@ -133,8 +128,7 @@ class AcpTerminalProcess implements IHostProcess {
     this.stopPolling();
     try {
       await this.handle.release();
-    } catch {
-    }
+    } catch {}
   }
 
   private async run(): Promise<number> {
@@ -155,8 +149,7 @@ class AcpTerminalProcess implements IHostProcess {
       } else if (output.length < this.emitted) {
         this.emitted = output.length;
       }
-    } catch {
-    }
+    } catch {}
   }
 
   private stopPolling(): void {
@@ -164,117 +157,44 @@ class AcpTerminalProcess implements IHostProcess {
   }
 }
 
-class AcpSessionEnvironment implements Environment {
-  readonly identity;
-  readonly capabilities = new Set(['process', 'fs'] as const);
-  readonly host: HostEnvironmentInfo;
-  readonly path: EnvironmentPath;
-  readonly workspace = { mapRoots: (roots: { workDir: string; additionalDirs?: readonly string[] }) => roots };
-  readonly fs: IHostFileSystem;
-  readonly process;
-  readonly watch = undefined;
-  readonly status = 'ready' as const;
-  readonly onDidChangeStatus = () => ({ dispose: () => {} });
+export class AcpEnvironmentOverlay implements IAgentEnvironmentOverlay {
+  private attached = false;
 
-  constructor(
-    sessionId: string,
-    cwd: string,
-    connection: IAcpConnection,
-    environment: IHostEnvironment,
-  ) {
-    this.identity = {
-      environmentId: AcpEnvironmentProviderFactory.environmentId(sessionId),
-      generation: `acp-${String(nextGeneration++)}`,
-    };
-    this.host = {
-      osKind: environment.osKind,
-      osArch: environment.osArch,
-      osVersion: environment.osVersion,
-      shellName: environment.shellName,
-      shellPath: environment.shellPath,
-      pathClass: environment.pathClass,
-      homeDir: environment.homeDir,
-    };
-    const path = environment.pathClass === 'win32' ? win32Path : posixPath;
-    this.path = {
-      separator: path.sep as '/' | '\\',
-      delimiter: path.delimiter as ':' | ';',
-      isAbsolute: (p: string) => path.isAbsolute(p),
-      join: (...paths: readonly string[]) => path.join(...paths),
-      relative: (from: string, to: string) => path.relative(from, to),
-      resolve: (...paths: readonly string[]) => path.resolve(...paths),
-      basename: (p: string) => path.basename(p),
-      dirname: (p: string) => path.dirname(p),
-    };
-    this.fs = new AcpHostFileSystem({ sessionId } as unknown as ISessionContext, connection);
-    this.process = new AcpProcessService(sessionId, cwd, connection, environment.shellPath);
+  attach(): void {
+    this.attached = true;
   }
-
-  dispose(): void {}
-}
-
-class AcpSessionEnvironmentAttachment implements EnvironmentProviderAttachment {
-  private readonly sessions = new Map<string, { remove(): Promise<void> }>();
+  declare readonly _serviceBrand: undefined;
 
   constructor(
-    private readonly host: EnvironmentProviderHost,
-    private readonly connection: IAcpConnection,
-    private readonly environment: IHostEnvironment,
+    @ISessionContext private readonly session: ISessionContext,
+    @IAcpConnection private readonly connection: IAcpConnection,
   ) {}
 
-  bindSession(sessionId: string, cwd: string): string {
-    const environmentId = AcpEnvironmentProviderFactory.environmentId(sessionId);
-    if (this.sessions.has(sessionId)) return environmentId;
-    const registration = this.host.registerEnvironment(
-      new AcpSessionEnvironment(sessionId, cwd, this.connection, this.environment),
+  decorate(lease: EnvironmentLease): EnvironmentLease {
+    if (!this.attached || lease.environment.identity.environmentId !== LOCAL_ENVIRONMENT_ID)
+      return lease;
+    const process = new AcpProcessService(
+      this.session.sessionId,
+      this.session.cwd,
+      this.connection,
+      lease.environment.host?.shellPath ?? '',
     );
-    this.sessions.set(sessionId, registration);
-    return environmentId;
-  }
-
-  async unbindSession(sessionId: string): Promise<void> {
-    const registration = this.sessions.get(sessionId);
-    if (registration === undefined) return;
-    this.sessions.delete(sessionId);
-    await registration.remove();
-  }
-
-  async dispose(): Promise<void> {
-    const registrations = [...this.sessions.values()];
-    this.sessions.clear();
-    for (const registration of registrations.toReversed()) await registration.remove();
+    const fs = new AcpHostFileSystem(this.session, this.connection);
+    const environment = new Proxy(lease.environment, {
+      get: (target, property) => {
+        if (property === 'fs') return fs;
+        if (property === 'process') return process;
+        return Reflect.get(target, property, target);
+      },
+    });
+    return { ...lease, environment };
   }
 }
 
-export class AcpEnvironmentProviderFactory implements EnvironmentProviderFactory {
-  readonly id = 'acp';
-  private attachment: AcpSessionEnvironmentAttachment | undefined;
-
-  constructor(
-    private readonly connection: IAcpConnection,
-    private readonly environment: IHostEnvironment,
-  ) {}
-
-  static environmentId(sessionId: string): string {
-    return `acp:${sessionId}`;
-  }
-
-  async attach(host: EnvironmentProviderHost): Promise<EnvironmentProviderAttachment> {
-    const attachment = new AcpSessionEnvironmentAttachment(host, this.connection, this.environment);
-    this.attachment = attachment;
-    return { dispose: async () => {
-      if (this.attachment !== attachment) return;
-      this.attachment = undefined;
-      await attachment.dispose();
-    } };
-  }
-
-  bindSession(sessionId: string, cwd: string): string {
-    if (this.attachment === undefined) throw new Error('ACP environment provider is not attached');
-    return this.attachment.bindSession(sessionId, cwd);
-  }
-
-  async unbindSession(sessionId: string): Promise<void> {
-    await this.attachment?.unbindSession(sessionId);
-  }
-}
+overrideScopedService(
+  LifecycleScope.Session,
+  IAgentEnvironmentOverlay,
+  AcpEnvironmentOverlay,
+  ScopeActivation.OnDemand,
+  'acp',
+);

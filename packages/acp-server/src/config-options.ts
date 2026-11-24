@@ -26,10 +26,6 @@ import { createPlanModeConfigOption } from 'acp-extension-core';
 import { ACP_MODES, type AcpModeId } from './modes';
 import type { AcpModelEntry } from './model-catalog';
 
-/**
- * Project the catalog into the `SessionConfigOption` `model` arm. One option
- * row per catalog entry. `currentValue` is the bare model id.
- */
 export function buildModelOption(
   models: readonly AcpModelEntry[],
   currentBaseModelId: string,
@@ -51,15 +47,6 @@ export function buildModelOption(
   };
 }
 
-/**
- * Build the `thinking` select. Entries adapt to the model's declared
- * capability: with `supportEfforts` the select is `off` plus every declared
- * effort level; without them it stays the boolean `off` / `on` pair.
- * `alwaysThinking` models drop the `off` entry (thinking cannot be disabled —
- * ACP has no "disabled entry" concept). A `currentLevel` not present in the
- * entries (e.g. an engine-resolved effort the catalog didn't declare) is
- * appended so `currentValue` always stays selectable.
- */
 export function buildThinkingOption(
   currentLevel: string,
   alwaysThinking = false,
@@ -82,7 +69,6 @@ export function buildThinkingOption(
   };
 }
 
-/** Display name for a thinking select entry (`off` → `Thinking Off`). */
 function thinkingOptionName(value: string): string {
   return `Thinking ${value.charAt(0).toUpperCase()}${value.slice(1)}`;
 }
@@ -108,18 +94,6 @@ export function buildModeOption(currentModeId: AcpModeId): SessionConfigOption {
   };
 }
 
-/**
- * Compose the `SessionConfigOption[]` surface —
- * `[modelOption, …(thinkingOption?), modeOption]`. Order is part of the
- * contract: ACP clients render options top-to-bottom, model on top of mode.
- *
- * The thinking toggle only appears when the currently-selected base model is
- * `thinkingSupported`; otherwise the snapshot is just `[modelOption, modeOption]`.
- *
- * Returns a mutable `SessionConfigOption[]` (rather than `readonly`) so the
- * value is assignable to the SDK's `NewSessionResponse.configOptions` field,
- * which is typed `Array<SessionConfigOption>`.
- */
 export function buildSessionConfigOptions(
   models: readonly AcpModelEntry[],
   currentBaseModelId: string,
@@ -132,8 +106,6 @@ export function buildSessionConfigOptions(
   const alwaysThinking = currentModelEntry?.alwaysThinking === true;
   const out: SessionConfigOption[] = [buildModelOption(models, currentBaseModelId)];
   if (showThinking) {
-    // Always-thinking models render locked-on regardless of the session's
-    // recorded level — the runtime clamps the same way.
     const level = alwaysThinking && currentThinkingLevel === 'off' ? 'on' : currentThinkingLevel;
     out.push(buildThinkingOption(level, alwaysThinking, currentModelEntry?.supportEfforts));
   }

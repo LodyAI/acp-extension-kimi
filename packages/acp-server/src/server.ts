@@ -59,24 +59,21 @@ import {
   type SetSessionModeResponse,
 } from '@agentclientprotocol/sdk';
 import { ErrorCodes, isError2 } from '@moonshot-ai/agent-core-v2';
-import type {
-  AgentHandle,
-  Klient,
-  SessionHandle,
-  SessionSummary,
-} from '@moonshot-ai/klient';
+import type { AgentHandle, Klient, SessionHandle, SessionSummary } from '@moonshot-ai/klient';
 import { RPCError } from '@moonshot-ai/klient';
-import { LODY_PLAN_MODE_CONFIG_ID, supportsLodySubagentEvents } from 'acp-extension-core';
-import { readClientSystemPrompt, type ClientSystemPrompt } from './client-system-prompt';
 import {
   LODY_EXTENSION_METHODS,
+  LODY_PLAN_MODE_CONFIG_ID,
+  supportsLodySubagentEvents,
   type RateLimitsGetRequest,
   type RateLimitsGetResponse,
 } from 'acp-extension-core';
 
 import type { AcpClient } from './acp-client';
 import type { IAcpConnection } from './acp-fs';
+import { runAcpActivation } from './activation';
 import { buildTerminalAuthMethod, TERMINAL_AUTH_METHOD } from './auth-methods';
+import { readClientSystemPrompt, type ClientSystemPrompt } from './client-system-prompt';
 import { acpMcpServersToConfigRecord } from './convert';
 import {
   LODY_EXTENSION_CAPABILITIES,
@@ -90,10 +87,6 @@ import { isAcpModeId } from './modes';
 import { AcpSession } from './session';
 import { negotiateVersion } from './version';
 
-/**
- * Klient's stable wire code for "session not found" (`RPCError.code`) — the
- * branch key across the wire, mirrored from the klient facade's `NOT_FOUND`.
- */
 const SESSION_NOT_FOUND_CODE = 40404;
 
 function isSessionNotFound(error: unknown): boolean {
@@ -103,7 +96,6 @@ function isSessionNotFound(error: unknown): boolean {
   );
 }
 
-/** Host-provided slash commands plus optional aliases that activate engine skills. */
 export interface SlashCommandsSnapshot {
   readonly commands: ReadonlyArray<AvailableCommand>;
   readonly skillCommandMap?: ReadonlyMap<string, string>;
@@ -120,38 +112,16 @@ export type SlashCommandsResolver =
       | SlashCommandsSnapshot);
 
 export interface AcpServerOptions {
-  /** Agent identity advertised in `initialize.agentInfo`. */
   readonly agentInfo?: Implementation;
-  /**
-   * Bypass the auth gate (`klient.global.auth.summarize()`). Intended for
-   * tests and local dev — production ACP hosts should leave this `false` so
-   * unauthenticated clients get a structured `auth_required` before any
-   * session is created.
-   */
   readonly disableAuth?: boolean;
-  /**
-   * Env vars to advertise in `authMethods[0].env` so the `kimi login`
-   * subprocess the client spawns (via terminal-auth) lands its token under the
-   * same data root the server uses (e.g. `{ KIMI_CODE_HOME: '/tmp/...' }` for
-   * sandboxed test setups). Leave undefined in production so the advertised
-   * env stays empty.
-   */
   readonly terminalAuthEnv?: Readonly<Record<string, string>>;
-  /**
-   * Absolute binary path advertised in `_meta['terminal-auth'].command` for
-   * clients that don't yet honor the first-class `type:'terminal'`. Defaults
-   * to undefined (the `_meta` fallback is omitted).
-   */
   readonly terminalAuthLegacyCommand?: string;
-  /**
-   * Resolve a session's media-originals dir for prompt-image compression.
-   * This is a composition-root concern (it reads the live engine scope tree,
-   * not the klient facade) — `start.ts` builds it from the bootstrapped App
-   * scope. Absent → `persistOriginalImage`'s shared temp-dir fallback.
-   */
   readonly resolveOriginalsDir?: (sessionId: string) => string | undefined;
   readonly setStoredArchive: (sessionId: string, archived: boolean) => Promise<void>;
-  readonly bindSessionEnvironment?: (sessionId: string, systemPrompt?: ClientSystemPrompt) => Promise<void>;
+  readonly bindSessionEnvironment?: (
+    sessionId: string,
+    systemPrompt?: ClientSystemPrompt,
+  ) => Promise<void>;
   readonly unbindSessionEnvironment?: (sessionId: string) => Promise<void>;
   /** Static or per-session host command palette. */
   readonly slashCommands?: SlashCommandsResolver;
@@ -164,7 +134,9 @@ export class AcpServer {
   private readonly terminalAuthEnv: Readonly<Record<string, string>> | undefined;
   private readonly terminalAuthLegacyCommand: string | undefined;
   private readonly resolveOriginalsDir: ((sessionId: string) => string | undefined) | undefined;
-  private readonly bindSessionEnvironment: ((sessionId: string, systemPrompt?: ClientSystemPrompt) => Promise<void>) | undefined;
+  private readonly bindSessionEnvironment:
+    | ((sessionId: string, systemPrompt?: ClientSystemPrompt) => Promise<void>)
+    | undefined;
   private readonly unbindSessionEnvironment: ((sessionId: string) => Promise<void>) | undefined;
   private readonly resolveSlashCommands: (
     session: SessionHandle,
@@ -174,11 +146,6 @@ export class AcpServer {
   constructor(
     private readonly conn: AcpClient,
     private readonly klient: Klient,
-    /**
-     * The engine-side ACP connection holder (host file-IO reverse-RPC). This
-     * is a composition-root concern, not a klient facade concern — `start.ts`
-     * resolves it from the bootstrapped scope and passes it in.
-     */
     private readonly acpConnection: IAcpConnection,
     private readonly opts: AcpServerOptions,
   ) {
@@ -196,12 +163,10 @@ export class AcpServer {
         : async () => slashCommands ?? [];
   }
 
-  /** Returns the client capabilities advertised during `initialize`, if any. */
   get clientCaps(): ClientCapabilities | undefined {
     return this.clientCapabilities;
   }
 
-  /** @internal — for tests/inspection only. */
   getSession(sessionId: string): AcpSession | undefined {
     return this.sessions.get(sessionId);
   }
@@ -210,8 +175,6 @@ export class AcpServer {
     this.clientCapabilities = params.clientCapabilities;
     this.acpConnection.bindFsCapabilities(params.clientCapabilities?.fs);
     this.acpConnection.bindTerminalCapability(params.clientCapabilities?.terminal === true);
-    // Answer with the highest mutually-supported protocol version (a client
-    // advertising a newer major, e.g. 99, still gets our current version).
     const negotiated = negotiateVersion(params.protocolVersion);
 
     const agentCapabilities: AgentCapabilities = {
@@ -227,16 +190,9 @@ export class AcpServer {
         resume: {},
         close: {},
         delete: {},
-        // UNSTABLE per the SDK schema — declared as-is: the engine + klient
-        // fork path is fully wired (`unstable_forkSession` below).
         fork: {},
-        // Honored on `session/new` only — see the KLIENT-GAP note in
-        // `loadSession` / `resumeSession`.
         additionalDirectories: {},
       },
-      // Stdio is the implied baseline in ACP (no capability flag); we also
-      // forward http/sse servers to the engine. The unstable ACP transport
-      // is not supported (dropped with a warning — see `./convert`).
       mcpCapabilities: { http: true, sse: true },
       auth: { logout: {} },
       _meta: {
@@ -266,9 +222,6 @@ export class AcpServer {
     validateSessionDirectories(params);
     const systemPrompt = this.validateSystemPrompt(params);
     await this.ensureAuthed();
-    // The engine mints the session id and registers the workspace for the cwd
-    // implicitly. ACP `mcpServers` become ephemeral per-session servers
-    // (connected for this session only, never persisted).
     const meta = await this.klient.global.sessions.create({
       workDir: params.cwd,
       requestAdditionalDirs: params.additionalDirectories ?? [],
@@ -357,7 +310,10 @@ export class AcpServer {
 
   async setArchived(sessionId: string, archived: boolean): Promise<Record<string, never>> {
     if (this.sessions.has(sessionId)) {
-      throw RequestError.invalidRequest({ sessionId }, 'Close the session before changing its archive state');
+      throw RequestError.invalidRequest(
+        { sessionId },
+        'Close the session before changing its archive state',
+      );
     }
     await this.opts.setStoredArchive(sessionId, archived);
     return {};
@@ -381,14 +337,6 @@ export class AcpServer {
     await this.unbindSessionEnvironment?.(params.sessionId);
   }
 
-  /**
-   * Handle ACP `session/delete`. Permanently removes the session through the
-   * engine (`sessionLifecycleService.delete` — closes a live session first,
-   * then drops its persisted data and index entries) and tears down any local
-   * ACP state for it. Unlike `close`, delete is NOT best-effort: the client
-   * asked to remove one specific listed session, so an unknown id maps to ACP
-   * `invalid_params` (-32602).
-   */
   async deleteSession(params: DeleteSessionRequest): Promise<DeleteSessionResponse> {
     try {
       await this.klient.session(params.sessionId).delete();
@@ -417,29 +365,13 @@ export class AcpServer {
         `Unknown auth method: ${params.methodId}`,
       );
     }
-    // Re-check the gate; clients spawn `kimi login` themselves via the
-    // terminal-auth method and re-invoke `authenticate('login')` to confirm the
-    // token landed. `void` = empty success body.
     await this.ensureAuthed();
   }
 
-  /**
-   * Handle ACP `logout`. Drops the managed provider's token through the engine
-   * (`oauthService.logout`, which also deprovisions managed config). The auth
-   * gate re-derives from `klient.global.auth.summarize()` on every gated call,
-   * so no extra state is needed here — the next gated method hits
-   * `auth_required` again naturally. `void` = empty success body.
-   */
   async logout(_params: LogoutRequest): Promise<LogoutResponse | void> {
     await this.klient.global.auth.logout();
   }
 
-  /**
-   * Handle ACP `session/prompt`. `signal` is the app-API per-request abort
-   * signal: a JSON-RPC `$/cancel_request` for this request aborts it, and the
-   * abort is routed into the exact same cancel path as the `session/cancel`
-   * notification ({@link cancel}).
-   */
   async prompt(params: PromptRequest, signal?: AbortSignal): Promise<PromptResponse> {
     const acpSession = this.sessions.get(params.sessionId);
     if (!acpSession) {
@@ -460,7 +392,6 @@ export class AcpServer {
     };
     signal.addEventListener('abort', onAbort, { once: true });
     try {
-      // An already-aborted signal never fires the listener — cancel up front.
       if (signal.aborted) onAbort();
       return await acpSession.prompt(params.prompt);
     } finally {
@@ -471,7 +402,6 @@ export class AcpServer {
   async cancel(params: CancelNotification): Promise<void> {
     const acpSession = this.sessions.get(params.sessionId);
     if (!acpSession) {
-      // `session/cancel` is a notification — the spec forbids returning errors.
       log.warn('acp: cancel for unknown sessionId', { sessionId: params.sessionId });
       return;
     }
@@ -533,9 +463,6 @@ export class AcpServer {
         break;
       }
       case 'thinking': {
-        // Capability-aware validation lives in the session (allowed set
-        // depends on the current model's declared efforts); an unacceptable
-        // value maps to `invalid_params`.
         const accepted = await acpSession.setThinking(String(value));
         if (!accepted) {
           throw RequestError.invalidParams(
@@ -554,12 +481,6 @@ export class AcpServer {
     return { configOptions: await acpSession.configOptions() };
   }
 
-  /**
-   * Handle the custom `session/set_model` request (dropped from the SDK's
-   * typed method set in 1.x; preserved here as an extension method — see
-   * {@link createAcpAgentApp} for its registration and param parsing).
-   * Returns the empty success body.
-   */
   async setSessionModel(params: SetSessionModelParams): Promise<Record<string, unknown>> {
     const acpSession = this.sessions.get(params.sessionId);
     if (!acpSession) {
@@ -705,13 +626,6 @@ export class AcpServer {
     return { configOptions: await acpSession.configOptions(), modes: acpSession.modeState() };
   }
 
-  /**
-   * Push the `available_commands_update` AFTER the triggering lifecycle
-   * response (`session/new` / `/fork` / `/load` / `/resume`) has settled.
-   * Clients register the session when the response lands and silently drop
-   * `session/update` notifications that arrive earlier (Zed), so an eager
-   * push leaves the client's slash-command palette empty.
-   */
   private scheduleAvailableCommandsUpdate(acpSession: AcpSession): void {
     setTimeout(() => {
       void acpSession.emitAvailableCommandsUpdate();
@@ -720,8 +634,6 @@ export class AcpServer {
 
   private async bindDefaultModel(agent: AgentHandle): Promise<void> {
     try {
-      // `getModel` is '' while the profile has no model bound (the same guard
-      // the old engine-direct binding expressed via `isRunnable()`).
       if ((await agent.getModel()).length > 0) return;
       const inspected = await this.klient.global.config.inspect<string>('defaultModel');
       const model = inspected.value;
@@ -735,13 +647,8 @@ export class AcpServer {
     }
   }
 
-  /** Auth gate: throws `auth_required` unless authed (or `disableAuth`). */
   private async ensureAuthed(): Promise<void> {
     if (this.disableAuth) return;
-    // Primary: the engine's own readiness probe for the default model —
-    // config-file apiKey / provider env-bag credentials / OAuth token all
-    // count, matching how the model is actually used (the OAuth-only
-    // `summarize()` view is too narrow on its own).
     try {
       await this.klient.global.auth.ensureReady();
       return;
@@ -750,8 +657,6 @@ export class AcpServer {
         error: error instanceof Error ? error.message : String(error),
       });
     }
-    // Fallback: any logged-in OAuth provider counts as authed even when the
-    // default model is not usable (the legacy adapter's first branch).
     const summaries = await this.klient.global.auth.summarize();
     if (!summaries.some((s) => s.loggedIn)) {
       throw RequestError.authRequired();
@@ -776,10 +681,8 @@ function validateSessionDirectories(params: {
   }
 }
 
-/** The custom ACP method name for per-session model selection. */
 const SET_SESSION_MODEL_METHOD = 'session/set_model';
 
-/** Parsed params of the custom `session/set_model` request. */
 export interface SetSessionModelParams {
   readonly sessionId: string;
   readonly modelId: string;
@@ -911,20 +814,36 @@ function optionalString(
 export function createAcpAgentApp(getServer: () => AcpServer | Promise<AcpServer>): AgentApp {
   return agent({ name: 'kimi-code-acp' })
     .onRequest(methods.agent.initialize, async (ctx) => (await getServer()).initialize(ctx.params))
-    .onRequest(methods.agent.authenticate, async (ctx) => (await getServer()).authenticate(ctx.params))
+    .onRequest(methods.agent.authenticate, async (ctx) =>
+      (await getServer()).authenticate(ctx.params),
+    )
     .onRequest(methods.agent.logout, async (ctx) => (await getServer()).logout(ctx.params))
-    .onRequest(methods.agent.session.new, async (ctx) => (await getServer()).newSession(ctx.params))
-    .onRequest(methods.agent.session.load, async (ctx) => (await getServer()).loadSession(ctx.params))
-    .onRequest(methods.agent.session.resume, async (ctx) => (await getServer()).resumeSession(ctx.params))
-    .onRequest(methods.agent.session.list, async (ctx) => (await getServer()).listSessions(ctx.params))
+    .onRequest(methods.agent.session.new, async (ctx) =>
+      runAcpActivation(async () => (await getServer()).newSession(ctx.params)),
+    )
+    .onRequest(methods.agent.session.load, async (ctx) =>
+      runAcpActivation(async () => (await getServer()).loadSession(ctx.params)),
+    )
+    .onRequest(methods.agent.session.resume, async (ctx) =>
+      runAcpActivation(async () => (await getServer()).resumeSession(ctx.params)),
+    )
+    .onRequest(methods.agent.session.list, async (ctx) =>
+      (await getServer()).listSessions(ctx.params),
+    )
     .onRequest(LODY_EXTENSION_METHODS.sessionArchive, parseArchiveParams, async ({ params }) =>
-      (await getServer()).setArchived(params.sessionId, true))
+      (await getServer()).setArchived(params.sessionId, true),
+    )
     .onRequest(LODY_EXTENSION_METHODS.sessionUnarchive, parseArchiveParams, async ({ params }) =>
-      (await getServer()).setArchived(params.sessionId, false))
-    .onRequest(methods.agent.session.close, async (ctx) => (await getServer()).closeSession(ctx.params))
-    .onRequest(methods.agent.session.delete, async (ctx) => (await getServer()).deleteSession(ctx.params))
+      (await getServer()).setArchived(params.sessionId, false),
+    )
+    .onRequest(methods.agent.session.close, async (ctx) =>
+      (await getServer()).closeSession(ctx.params),
+    )
+    .onRequest(methods.agent.session.delete, async (ctx) =>
+      (await getServer()).deleteSession(ctx.params),
+    )
     .onRequest(methods.agent.session.fork, async (ctx) =>
-      (await getServer()).unstable_forkSession(ctx.params),
+      runAcpActivation(async () => (await getServer()).unstable_forkSession(ctx.params)),
     )
     .onRequest(methods.agent.session.setMode, async (ctx) =>
       (await getServer()).setSessionMode(ctx.params),
@@ -946,27 +865,17 @@ export function createAcpAgentApp(getServer: () => AcpServer | Promise<AcpServer
       parseRateLimitsGetParams,
       async (ctx) => (await getServer()).getRateLimits(ctx.params),
     )
-    .onRequest(LODY_EXTENSION_METHODS.subagentsList, parseListSubagentsParams, async (ctx) => (await getServer()).listSubagents(ctx.params),
+    .onRequest(LODY_EXTENSION_METHODS.subagentsList, parseListSubagentsParams, async (ctx) =>
+      (await getServer()).listSubagents(ctx.params),
     )
-    .onRequest(LODY_EXTENSION_METHODS.subagentsCancel, parseCancelSubagentParams, async (ctx) => (await getServer()).cancelSubagent(ctx.params),
+    .onRequest(LODY_EXTENSION_METHODS.subagentsCancel, parseCancelSubagentParams, async (ctx) =>
+      (await getServer()).cancelSubagent(ctx.params),
     )
-    .onRequest(LODY_EXTENSION_METHODS.subagentsOutput, parseSubagentOutputParams, async (ctx) => (await getServer()).subagentOutput(ctx.params),
+    .onRequest(LODY_EXTENSION_METHODS.subagentsOutput, parseSubagentOutputParams, async (ctx) =>
+      (await getServer()).subagentOutput(ctx.params),
     );
 }
 
-/**
- * Apply the optional `session/list` cwd filter to wire {@link SessionSummary}s.
- *
- * `cwd === undefined` means no filter (the adapter treats the schema-allowed
- * `null` sentinel the same way — the caller normalizes it before calling).
- * When a filter IS active, summaries that carry no `cwd` at all (sessions
- * persisted before the field existed) are KEPT: their workspace is unknown,
- * not known-different, and silently dropping them would make those sessions
- * unreachable from any cwd-filtered listing. The filter lives here (not in
- * the engine query) because the engine's `sessions.list` has no cwd predicate
- * — `workspaceIds` is its only workspace-level filter, and a raw cwd string is
- * not a workspace id.
- */
 export function filterSessionSummariesByCwd(
   items: readonly SessionSummary[],
   cwd: string | undefined,
@@ -975,10 +884,6 @@ export function filterSessionSummariesByCwd(
   return items.filter((s) => s.cwd === undefined || s.cwd === cwd);
 }
 
-/**
- * Project a wire {@link SessionSummary} into the ACP {@link SessionInfo}
- * shape used by `session/list`.
- */
 function sessionSummaryToSessionInfo(summary: SessionSummary): SessionInfo {
   let updatedAt: string | null = null;
   if (typeof summary.updatedAt === 'number' && Number.isFinite(summary.updatedAt)) {

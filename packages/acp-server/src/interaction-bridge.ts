@@ -38,7 +38,6 @@ import {
 } from './question';
 
 export class AcpInteractionBridge {
-  /** Ids the bridge has already begun handling — guards against re-entry. */
   private readonly inFlight = new Set<string>();
   private readonly subscription: IDisposable;
   private disposed = false;
@@ -62,8 +61,7 @@ export class AcpInteractionBridge {
   ) {
     this.subscription = session.events.on('interactions.changed', (pending) => {
       this.onPendingChanged(pending);
-    }); // The event stream only fires on change — sweep anything parked before the
-    // subscription attached (matches the old direct `listPending()` sweep).
+    });
     void this.session.interactions.list().then(
       (pending) => {
         this.onPendingChanged(pending);
@@ -112,10 +110,6 @@ export class AcpInteractionBridge {
         await respond(result);
       }
     } catch (error) {
-      // `respond` itself never throws for a still-pending id, and the handlers
-      // already swallow RPC failures into a safe response — so reaching here
-      // means something unexpected broke. Log and settle with the safest
-      // default so the gate/tool does not park forever.
       log.warn('acp: interaction bridge dispatch failed', {
         sessionId: this.sessionId,
         interactionId: interaction.id,
@@ -136,11 +130,6 @@ export class AcpInteractionBridge {
     }
   }
 
-  /**
-   * Bridge an engine {@link ApprovalRequest} to the ACP client and back. Any
-   * RPC failure resolves with `decision: 'rejected'` — rejecting on failure is
-   * strictly safer than approving when the client cannot confirm intent.
-   */
   private async handleApproval(req: ApprovalRequest): Promise<ApprovalResponse> {
     const toolCall = buildPermissionToolCallUpdate(req);
     const options = approvalRequestToPermissionOptions(req);
