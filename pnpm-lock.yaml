@@ -466,8 +466,8 @@ importers:
         specifier: workspace:^
         version: link:../klient
       acp-extension-core:
-        specifier: git+https://github.com/LodyAI/acp-extension-core.git#8d3ee102b7b33be809674886eafe11e83cefb095
-        version: https://codeload.github.com/LodyAI/acp-extension-core/tar.gz/8d3ee102b7b33be809674886eafe11e83cefb095(zod@4.3.6)
+        specifier: 0.4.0
+        version: 0.4.0(zod@4.3.6)
 
   packages/agent-core-v2:
     dependencies:
@@ -4828,9 +4828,8 @@ packages:
     engines: {node: '>=0.4.0'}
     hasBin: true
 
-  acp-extension-core@https://codeload.github.com/LodyAI/acp-extension-core/tar.gz/8d3ee102b7b33be809674886eafe11e83cefb095:
-    resolution: {tarball: https://codeload.github.com/LodyAI/acp-extension-core/tar.gz/8d3ee102b7b33be809674886eafe11e83cefb095}
-    version: 0.3.0
+  acp-extension-core@0.4.0:
+    resolution: {integrity: sha512-sQVEwRPDC6sqhg5tanptQ5ymrWu6nZ3mZFFGcwbImuWsHN3lukvSQIajOoABt8aLh4OjeIg0VuEZmDT7AmZ+JQ==}
 
   agent-base@7.1.4:
     resolution: {integrity: sha512-MnA+YT8fwfJPgBx3m60MNqakm30XOkyIoH1y6huTQvC0PwZG7ki8NacLBcrPbNoo8vEZy7Jpuk7+jMO+CUovTQ==}
@@ -13551,7 +13550,7 @@ snapshots:
 
   acorn@8.17.0: {}
 
-  acp-extension-core@https://codeload.github.com/LodyAI/acp-extension-core/tar.gz/8d3ee102b7b33be809674886eafe11e83cefb095(zod@4.3.6):
+  acp-extension-core@0.4.0(zod@4.3.6):
     dependencies:
       '@agentclientprotocol/sdk': 1.9.0(zod@4.3.6)
     transitivePeerDependencies:
