@@ -45,7 +45,6 @@ Process the version block exactly as `sync-changelog` does for the docs site, bu
 - **Classify** (`sync-changelog` step 4): bucket into Features / Bug Fixes / Polish / Refactors / Other; order within each section by reader value (in Polish, user-visible improvements before protocol/internal adjustments).
 - **Translate** (`sync-changelog` step 6): translate entry bodies to Chinese; keep one sentence per entry with a parallel rhythm within a section; section headings become 新功能 / 修复 / 优化 / 重构 / 其他.
 
-If an upstream entry is not in English, flag it and stop (changeset entries must be English).
 
 ### 4. Output
 

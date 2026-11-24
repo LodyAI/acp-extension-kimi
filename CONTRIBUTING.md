@@ -71,16 +71,7 @@ All commits and PR titles must follow [Conventional Commits](https://www.convent
 | perf     | Performance improvement                     | perf(session): batch event flushes        |
 | style    | Formatting only (no logic)                  | style: apply oxlint --fix                 |
 
-PR titles are enforced by the `pr-title-checker` workflow — a non-conforming title will block merge.
 
-## Changesets
-
-This repo uses [changesets](https://github.com/changesets/changesets) to manage versioning and releases.
-
-- Every PR that affects release artifacts (code, behavior, public API) **must** include a changeset.
-- Docs-only, test-only, or CI-only PRs may skip changesets.
-- Generate one with `pnpm changeset` and follow the prompts (which packages are touched, which bump level).
-- For repo-specific conventions on package selection and bump levels, see `.changeset/README.md`. When working in this repo with coding agents, use the `gen-changesets` skill.
 
 ## Pull Requests
 

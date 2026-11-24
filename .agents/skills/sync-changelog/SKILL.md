@@ -23,7 +23,6 @@ After the release flow finishes (Release PR merged → `Version Packages` comple
 - The top of `apps/kimi-code/CHANGELOG.md` contains version blocks that are not yet in `docs/en/release-notes/changelog.md`.
 - The `gen-docs` flow does not run this automatically; maintainers must explicitly do it after release.
 
-Do **not** run this before the Release PR is merged. At that point, changesets has not yet written the new version into `apps/kimi-code/CHANGELOG.md`.
 
 ## Source And Targets
 
@@ -120,7 +119,6 @@ Drop SDK-only and provider-internal detail. This changelog serves `@moonshot-ai/
 
 Do not change facts or drop a real user-facing behavior — only trim the internal-only scaffolding. For over-long, internal-heavy entries, this trim applies on the English page too, not only in translation.
 
-Upstream language rule: `gen-changesets` requires changelog entries to be English. If the upstream CLI changelog contains a non-English entry, stop and report it to the user. Do not silently rewrite it while syncing docs.
 
 Public-text rule: do not copy real internal endpoints, key names, account names, or service names into docs changelogs. Replace examples with neutral placeholders such as `example.com`, `example.test`, or `YOUR_API_KEY` while preserving the user-visible meaning.
 
@@ -403,7 +401,7 @@ Fill in `.github/pull_request_template.md`. For changelog sync PRs:
 - **Related Issue**: write `N/A — post-release docs maintenance` (no issue required).
 - **Problem**: the docs-site changelog is behind the published CLI release(s).
 - **What changed**: list synced version(s), note English source + Chinese translation, and mention verification (`pnpm --filter docs run build`).
-- **Checklist**: check CONTRIBUTING; explain no issue, no tests, no changeset, and that `gen-docs` is not needed because this is the dedicated changelog sync flow.
+- **Checklist**: check CONTRIBUTING; explain no issue, no tests, and that `gen-docs` is not needed because this is the dedicated changelog sync flow.
 
 Example body:
 
@@ -427,7 +425,6 @@ The docs-site changelog has not yet been synced for `<version range>` after the 
 - [x] I have read the CONTRIBUTING document.
 - [x] I have linked a related issue, or explained the problem above.
 - [ ] I have added tests that prove my feature works. (N/A — docs-only sync)
-- [x] Ran `gen-changesets` skill, or this PR needs no changeset. (No changeset — docs sync is out of bundle)
 - [x] Ran `gen-docs` skill, or this PR needs no doc update. (This PR is the dedicated changelog sync)
 ```
 
