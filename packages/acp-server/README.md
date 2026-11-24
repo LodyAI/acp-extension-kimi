@@ -35,7 +35,7 @@ adding an image preview to Lody.
 ## Subagent history
 
 Bilateral Core `subagentEvents` v1 replaces legacy task cards with root-scoped
-run snapshots and child text/thought/tool updates. The ACP edge subscribes to each
+run snapshots and child text/thought/tool updates. Snapshots include the registered child model and thinking effort when supplied. The ACP edge subscribes to each
 registered child through Klient, including its nested tasks; the engine is unchanged.
 Subscription starts at task registration and has no replay guarantee, so histories
 are marked potentially incomplete. Child approvals use run-scoped root tool IDs;

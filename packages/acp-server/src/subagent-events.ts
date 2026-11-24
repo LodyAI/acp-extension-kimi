@@ -100,6 +100,7 @@ export class KimiSubagentEvents {
         parentRunId: parentId === undefined ? null : this.runs.get(parentId)?.runId,
         parentToolCallId: task.parentToolCallId,
         modelId: task.model,
+        ...(task.thinkingEffort ? { reasoningEffort: task.thinkingEffort } : {}),
         startedAtEpochSeconds: task.startedAt / 1000,
         // Task registration can follow child activation; this subscription has no replay guarantee.
         outputIncomplete: true,
