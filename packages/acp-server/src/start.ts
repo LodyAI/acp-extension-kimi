@@ -13,7 +13,7 @@
 
 import { Readable, Writable } from 'node:stream';
 
-import { ndJsonStream, type AgentConnection, type Stream } from '@agentclientprotocol/sdk';
+import { RequestError, ndJsonStream, type AgentConnection, type Stream } from '@agentclientprotocol/sdk';
 import {
   bootstrap,
   drainLogCloses,
@@ -39,6 +39,7 @@ import {
   type Scope,
   type ScopeSeed,
   sessionMediaOriginalsDir,
+  setSessionArchived,
 } from '@moonshot-ai/agent-core-v2';
 import type { Klient } from '@moonshot-ai/klient';
 import { createKlient } from '@moonshot-ai/klient/memory';
@@ -52,7 +53,7 @@ import { IAcpConnection } from './acp-fs';
 import { AcpEnvironmentProviderFactory } from './acp-terminal';
 import { AcpServer, type AcpServerOptions, createAcpAgentApp } from './server';
 
-export interface RunAcpServerOptions extends AcpServerOptions {
+export interface RunAcpServerOptions extends Omit<AcpServerOptions, 'setStoredArchive'> {
   readonly homeDir?: string;
   readonly configPath?: string;
   readonly input?: NodeJS.ReadableStream;
@@ -157,6 +158,11 @@ export async function runAcpServerWithStream(
       throw error;
     });
   const server = new AcpServer(client, klient, acpConnection, {
+    setStoredArchive: async (sessionId, archived) => {
+      const result = await setSessionArchived(core.accessor, sessionId, archived);
+      if (result === 'not_found') throw RequestError.resourceNotFound(sessionId);
+      await core.accessor.get(ISessionIndexMirror).drain();
+    },
     agentInfo: opts.agentInfo,
     disableAuth: opts.disableAuth,
     terminalAuthEnv: opts.terminalAuthEnv,

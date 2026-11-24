@@ -150,6 +150,7 @@ export interface AcpServerOptions {
    * scope. Absent → `persistOriginalImage`'s shared temp-dir fallback.
    */
   readonly resolveOriginalsDir?: (sessionId: string) => string | undefined;
+  readonly setStoredArchive: (sessionId: string, archived: boolean) => Promise<void>;
   readonly bindSessionEnvironment?: (sessionId: string, systemPrompt?: ClientSystemPrompt) => Promise<void>;
   readonly unbindSessionEnvironment?: (sessionId: string) => Promise<void>;
   /** Static or per-session host command palette. */
@@ -179,7 +180,7 @@ export class AcpServer {
      * resolves it from the bootstrapped scope and passes it in.
      */
     private readonly acpConnection: IAcpConnection,
-    opts: AcpServerOptions = {},
+    private readonly opts: AcpServerOptions,
   ) {
     this.agentInfo = opts.agentInfo;
     this.disableAuth = opts.disableAuth ?? false;
@@ -352,6 +353,14 @@ export class AcpServer {
       sessionSummaryToSessionInfo,
     );
     return { sessions, nextCursor: page.nextCursor ?? null };
+  }
+
+  async setArchived(sessionId: string, archived: boolean): Promise<Record<string, never>> {
+    if (this.sessions.has(sessionId)) {
+      throw RequestError.invalidRequest({ sessionId }, 'Close the session before changing its archive state');
+    }
+    await this.opts.setStoredArchive(sessionId, archived);
+    return {};
   }
 
   /**
@@ -822,6 +831,11 @@ function parseListSubagentsParams(params: unknown): ListSubagentsParams {
   return { sessionId, activeOnly };
 }
 
+function parseArchiveParams(params: unknown): { sessionId: string } {
+  const method = 'session archive';
+  return { sessionId: requiredString(asRecord(params, method), 'sessionId', method) };
+}
+
 function parseRateLimitsGetParams(params: unknown): RateLimitsGetRequest {
   const method = LODY_EXTENSION_METHODS.rateLimitsGet;
   const record = params === undefined ? {} : asRecord(params, method);
@@ -903,6 +917,10 @@ export function createAcpAgentApp(getServer: () => AcpServer | Promise<AcpServer
     .onRequest(methods.agent.session.load, async (ctx) => (await getServer()).loadSession(ctx.params))
     .onRequest(methods.agent.session.resume, async (ctx) => (await getServer()).resumeSession(ctx.params))
     .onRequest(methods.agent.session.list, async (ctx) => (await getServer()).listSessions(ctx.params))
+    .onRequest(LODY_EXTENSION_METHODS.sessionArchive, parseArchiveParams, async ({ params }) =>
+      (await getServer()).setArchived(params.sessionId, true))
+    .onRequest(LODY_EXTENSION_METHODS.sessionUnarchive, parseArchiveParams, async ({ params }) =>
+      (await getServer()).setArchived(params.sessionId, false))
     .onRequest(methods.agent.session.close, async (ctx) => (await getServer()).closeSession(ctx.params))
     .onRequest(methods.agent.session.delete, async (ctx) => (await getServer()).deleteSession(ctx.params))
     .onRequest(methods.agent.session.fork, async (ctx) =>

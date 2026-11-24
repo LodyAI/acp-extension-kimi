@@ -16,3 +16,6 @@ minimumReleaseAgeExclude:
 overrides:
   "kimi-code>@tailwindcss/vite": "4.1.18"
   "kimi-code>tailwindcss": "4.1.18"
+
+onlyBuiltDependencies:
+  - acp-extension-core@0.3.0
