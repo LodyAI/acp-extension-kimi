@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from 'vitest';
 import {
   clearManagedKimiCodeConfig,
+  OAuthUnauthorizedError,
   resolveKimiCodeOAuthKey,
   resolveKimiCodeRuntimeAuth,
 } from '@moonshot-ai/kimi-code-oauth';
@@ -12,8 +13,11 @@ import {
 import { DisposableStore } from '#/_base/di/lifecycle';
 import { createServices, type TestInstantiationService } from '#/_base/di/test';
 import { Emitter } from '#/_base/event';
+import { Error2 } from '#/errors';
 import { IAuthSummaryService, IOAuthService, IOAuthToolkit } from '#/app/auth/auth';
 import { AuthSummaryService, OAuthService } from '#/app/auth/authService';
+import { AuthErrors } from '#/app/auth/errors';
+import { ModelOAuthTokenAdapter } from '#/app/kosongConfig/oauthTokenAdapter';
 import {
   SERVICES_SECTION,
   servicesFromToml,
@@ -295,6 +299,49 @@ describe('OAuthService', () => {
     vi.stubGlobal('fetch', fetchMock);
     return { fetchMock, releaseFetch };
   }
+
+  it('maps a rejected OAuth token to auth.login_required in ModelOAuthTokenAdapter while keeping OAuthService raw', async () => {
+    const cause = new OAuthUnauthorizedError('Stored token was rejected; re-login required.');
+    toolkit.tokenProvider.mockReturnValue({
+      getAccessToken: async () => {
+        throw cause;
+      },
+    });
+    const service = createService();
+    const rawProvider = service.resolveTokenProvider(OAUTH_PROVIDER);
+    if (rawProvider === undefined) throw new Error('expected an OAuth token provider');
+    await expect(rawProvider.getAccessToken()).rejects.toBe(cause);
+
+    const adapter = new ModelOAuthTokenAdapter(service);
+    const oauthRef = { storage: 'file' as const, key: 'kimi-code' };
+    const initialError = await adapter
+      .getAccessToken(OAUTH_PROVIDER, oauthRef)
+      .catch((error: unknown) => error);
+    const forceError = await adapter
+      .getAccessToken(OAUTH_PROVIDER, oauthRef, { force: true })
+      .catch((error: unknown) => error);
+
+    expect(initialError).toBeInstanceOf(Error2);
+    expect(initialError).toMatchObject({ code: AuthErrors.codes.AUTH_LOGIN_REQUIRED, cause });
+    expect(forceError).toBeInstanceOf(Error2);
+    expect(forceError).toMatchObject({ code: AuthErrors.codes.AUTH_LOGIN_REQUIRED, cause });
+  });
+
+  it('rethrows unrecognized token failures without guessing an auth category', async () => {
+    const cause = new Error('token storage failed');
+    toolkit.tokenProvider.mockReturnValue({
+      getAccessToken: async () => {
+        throw cause;
+      },
+    });
+    const adapter = new ModelOAuthTokenAdapter(createService());
+
+    const error = await adapter
+      .getAccessToken(OAUTH_PROVIDER, { storage: 'file', key: 'kimi-code' })
+      .catch((error: unknown) => error);
+
+    expect(error).toBe(cause);
+  });
 
   it('startLogin resolves a device-code flow and flips to authenticated on success', async () => {
     stubManagedModelsFetch();
