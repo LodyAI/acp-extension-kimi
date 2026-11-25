@@ -39,6 +39,24 @@ function remoteErrorOf(
   return request.protocol.base.decodeError(error, source);
 }
 
+function authLoginRequiredError(error: unknown): LlmRemoteErrorMessage | undefined {
+  if (
+    error instanceof Error &&
+    (error as { readonly code?: unknown }).code === 'auth.login_required'
+  ) {
+    return {
+      kind: 'auth',
+      code: 'auth.login_required',
+      message: error.message,
+      retryable: false,
+      requestId: null,
+      retryAfterMs: null,
+      headers: null,
+    };
+  }
+  return undefined;
+}
+
 interface EventSink extends DecodeSink {
   readonly failed: () => boolean;
 }
@@ -199,9 +217,22 @@ export async function generate(request: LlmRequest, control: LlmAttemptControl):
     onEvent?.(event);
     return;
   }
+  let endpoint: Awaited<ReturnType<typeof resolveEndpoint>>;
+  try {
+    endpoint = await resolveEndpoint(request.endpoint);
+  } catch (error) {
+    emitTiming();
+    const event: LlmAttemptEvent = {
+      type: 'attempt.failed',
+      error: authLoginRequiredError(error) ?? remoteErrorOf(request, error),
+      rawError: error,
+    };
+    log.info({ ...event, err: error }, 'llm event');
+    onEvent?.(event);
+    return;
+  }
   let streamStarted = false;
   try {
-    const endpoint = await resolveEndpoint(request.endpoint);
     const clientFactory = request.endpoint?.clientFactory;
     const client =
       clientFactory === undefined

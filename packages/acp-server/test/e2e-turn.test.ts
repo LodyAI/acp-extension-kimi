@@ -24,6 +24,10 @@ import {
   ISessionManager,
   IEventBus,
   IOAuthToolkit,
+  IProtocolAdapterRegistry,
+  ProtocolAdapterRegistry,
+  type IProtocolAdapterRegistry as IProtocolAdapterRegistryType,
+  type Model,
 } from '@moonshot-ai/agent-core-v2';
 import { ToolUpdated } from '@moonshot-ai/agent-core-v2/agent/toolExecutor/toolExecutorEvents';
 import { OAuthUnauthorizedError } from '@moonshot-ai/kimi-code-oauth';
@@ -240,10 +244,30 @@ maxContextSize = 8192
         },
       }),
     } as unknown as IOAuthToolkit;
-    scripted = createScriptedProvider();
+    let fetchCalls = 0;
+    const realRegistry = new ProtocolAdapterRegistry();
+    const fetchRegistry: IProtocolAdapterRegistryType = {
+      _serviceBrand: undefined,
+      supportedProtocols: () => realRegistry.supportedProtocols(),
+      resolveAdapterIdentity: realRegistry.resolveAdapterIdentity.bind(realRegistry),
+      resolveProviderBaseId: realRegistry.resolveProviderBaseId.bind(realRegistry),
+      resolveCapability: realRegistry.resolveCapability.bind(realRegistry),
+      request: (model: Model) =>
+        realRegistry.request(model).with({
+          endpoint: {
+            fetch: async () => {
+              fetchCalls += 1;
+              return new Response('', { status: 500 });
+            },
+          },
+        }),
+    };
     client = await createTestClient({
       homeDir,
-      extraSeeds: [scripted.seed, [IOAuthToolkit, toolkit]],
+      extraSeeds: [
+        [IProtocolAdapterRegistry, fetchRegistry],
+        [IOAuthToolkit, toolkit],
+      ],
     });
     const c = client;
     await c.send('initialize', { protocolVersion: 1, clientCapabilities: {} });
@@ -257,7 +281,88 @@ maxContextSize = 8192
         prompt: [{ type: 'text', text: 'Run a synthetic turn' }],
       }),
     ).rejects.toThrow(/"code":-32000/);
-    expect(scripted.callCount()).toBe(0);
+    expect(fetchCalls).toBe(0);
+  }, 30_000);
+
+  it('rejects with auth_required when forced OAuth refresh fails after a model 401', async () => {
+    homeDir = await mkdtemp(join(tmpdir(), 'acp-oauth-refresh-turn-'));
+    await writeFile(
+      join(homeDir, 'config.toml'),
+      `defaultModel = "fake"
+
+[providers.test-oauth]
+type = "kimi"
+baseUrl = "https://api.example.com"
+
+[providers.test-oauth.oauth]
+storage = "file"
+key = "test-key"
+
+[models.fake]
+name = "fake-model"
+protocol = "openai"
+provider = "test-oauth"
+maxContextSize = 8192
+`,
+      'utf8',
+    );
+    const forceCalls: boolean[] = [];
+    const toolkit = {
+      getCachedAccessToken: async () => 'stale-token',
+      getManagedUsage: async () => ({ kind: 'error', message: 'not configured' }),
+      tokenProvider: () => ({
+        getAccessToken: async (options?: { readonly force?: boolean }) => {
+          const force = options?.force === true;
+          forceCalls.push(force);
+          if (force) {
+            throw new OAuthUnauthorizedError('Refresh token was rejected; re-login required.');
+          }
+          return 'stale-token';
+        },
+      }),
+    } as unknown as IOAuthToolkit;
+    let fetchCalls = 0;
+    const realRegistry = new ProtocolAdapterRegistry();
+    const fetchRegistry: IProtocolAdapterRegistryType = {
+      _serviceBrand: undefined,
+      supportedProtocols: () => realRegistry.supportedProtocols(),
+      resolveAdapterIdentity: realRegistry.resolveAdapterIdentity.bind(realRegistry),
+      resolveProviderBaseId: realRegistry.resolveProviderBaseId.bind(realRegistry),
+      resolveCapability: realRegistry.resolveCapability.bind(realRegistry),
+      request: (model: Model) =>
+        realRegistry.request(model).with({
+          endpoint: {
+            fetch: async () => {
+              fetchCalls += 1;
+              return new Response(JSON.stringify({ error: { message: 'Unauthorized' } }), {
+                status: 401,
+                headers: { 'content-type': 'application/json' },
+              });
+            },
+          },
+        }),
+    };
+    client = await createTestClient({
+      homeDir,
+      extraSeeds: [
+        [IProtocolAdapterRegistry, fetchRegistry],
+        [IOAuthToolkit, toolkit],
+      ],
+    });
+    const c = client;
+    await c.send('initialize', { protocolVersion: 1, clientCapabilities: {} });
+    const created = (await c.send('session/new', { cwd: homeDir, mcpServers: [] })) as {
+      sessionId: string;
+    };
+
+    await expect(
+      c.send('session/prompt', {
+        sessionId: created.sessionId,
+        prompt: [{ type: 'text', text: 'Run a synthetic turn' }],
+      }),
+    ).rejects.toThrow(/"code":-32000/);
+    expect(fetchCalls).toBe(1);
+    expect(forceCalls).toEqual([false, true]);
   }, 30_000);
 
   it('drives initialize → new → prompt and streams the assistant text as agent_message_chunk', async () => {

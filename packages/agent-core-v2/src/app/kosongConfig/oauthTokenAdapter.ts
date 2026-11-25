@@ -1,3 +1,4 @@
+import { OAuthUnauthorizedError } from '@moonshot-ai/kimi-code-oauth';
 import { LifecycleScope } from '#/app/scopes';
 
 import { ScopeActivation, registerScopedService } from '#/_base/di/scope';
@@ -30,18 +31,27 @@ export class ModelOAuthTokenAdapter implements IModelOAuthTokens {
   ): Promise<string> {
     const tokenProvider = this.oauth.resolveTokenProvider(provider, oauthRef);
     if (tokenProvider === undefined) throw loginRequired(provider);
-    const token = await tokenProvider.getAccessToken(
-      options?.force === true ? { force: true } : undefined,
-    );
+    let token: string;
+    try {
+      token = await tokenProvider.getAccessToken(
+        options?.force === true ? { force: true } : undefined,
+      );
+    } catch (error) {
+      if (error instanceof OAuthUnauthorizedError) {
+        throw loginRequired(provider, error);
+      }
+      throw error;
+    }
     if (token.trim().length === 0) throw loginRequired(provider);
     return token;
   }
 }
 
-function loginRequired(providerKey: string): Error2 {
+function loginRequired(providerKey: string, cause?: unknown): Error2 {
   return new Error2(
     AuthErrors.codes.AUTH_LOGIN_REQUIRED,
     `OAuth provider "${providerKey}" requires login before it can be used.`,
+    { cause },
   );
 }
 

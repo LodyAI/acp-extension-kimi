@@ -8,7 +8,6 @@ import {
   kimiCodeBaseUrl,
   kimiRegionLoginHosts,
   OAuthError,
-  OAuthUnauthorizedError,
   applyManagedKimiCodeConfig,
   clearManagedKimiCodeConfig,
   fetchManagedKimiCodeModels,
@@ -79,7 +78,6 @@ import {
   IOAuthToolkit,
   type OAuthLoginOptions,
 } from './auth';
-import { AuthErrors } from './errors';
 
 const TERMINAL_RETENTION_MS = 5 * 60 * 1000;
 const DEFAULT_DEVICE_EXPIRES_IN_SEC = 15 * 60;
@@ -277,26 +275,7 @@ export class OAuthService extends Disposable implements IOAuthService {
   }
 
   resolveTokenProvider(provider: string, oauthRef?: OAuthRef): BearerTokenProvider | undefined {
-    const tokenProvider = this.toolkit.tokenProvider(
-      provider,
-      this.resolveRuntimeOAuthRef(provider, oauthRef),
-    );
-    return {
-      getAccessToken: async (options) => {
-        try {
-          return await tokenProvider.getAccessToken(options);
-        } catch (error) {
-          if (error instanceof OAuthUnauthorizedError) {
-            throw new Error2(
-              AuthErrors.codes.AUTH_LOGIN_REQUIRED,
-              `OAuth provider "${provider}" requires login before it can be used.`,
-              { cause: error },
-            );
-          }
-          throw error;
-        }
-      },
-    };
+    return this.toolkit.tokenProvider(provider, this.resolveRuntimeOAuthRef(provider, oauthRef));
   }
 
   getCachedAccessToken(provider: string, oauthRef?: OAuthRef): Promise<string | undefined> {

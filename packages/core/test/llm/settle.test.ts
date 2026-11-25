@@ -309,4 +309,46 @@ describe('LLM request settlement', () => {
       outcome: { type: 'aborted' },
     });
   });
+
+  it('preserves auth.login_required from endpoint credentials without calling protocol decodeError or sendStream', async () => {
+    let sendCount = 0;
+    const authError = Object.assign(
+      new Error('OAuth provider "kimi-code" requires login before it can be used.'),
+      { code: 'auth.login_required' },
+    );
+    const failed = failedOutcome(
+      (
+        await runGenerate(
+          fakeProtocol({
+            sendStream: async () => {
+              sendCount += 1;
+              return { body: asyncChunks([]) };
+            },
+          }),
+          {
+            module: testModule(),
+            endpoint: {
+              credentials: {
+                resolve: async () => {
+                  throw authError;
+                },
+              },
+            },
+          },
+        )
+      ).outcome,
+    );
+
+    expect(sendCount).toBe(0);
+    expect(failed.error).toMatchObject({
+      kind: 'auth',
+      code: 'auth.login_required',
+      message: authError.message,
+      retryable: false,
+      requestId: null,
+      retryAfterMs: null,
+      headers: null,
+    });
+    expect(failed.rawError).toBe(authError);
+  });
 });

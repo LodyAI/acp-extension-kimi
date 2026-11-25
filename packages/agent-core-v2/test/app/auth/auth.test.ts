@@ -17,6 +17,7 @@ import { Error2 } from '#/errors';
 import { IAuthSummaryService, IOAuthService, IOAuthToolkit } from '#/app/auth/auth';
 import { AuthSummaryService, OAuthService } from '#/app/auth/authService';
 import { AuthErrors } from '#/app/auth/errors';
+import { ModelOAuthTokenAdapter } from '#/app/kosongConfig/oauthTokenAdapter';
 import {
   SERVICES_SECTION,
   servicesFromToml,
@@ -299,20 +300,31 @@ describe('OAuthService', () => {
     return { fetchMock, releaseFetch };
   }
 
-  it('maps a rejected OAuth token to auth.login_required with its cause', async () => {
+  it('maps a rejected OAuth token to auth.login_required in ModelOAuthTokenAdapter while keeping OAuthService raw', async () => {
     const cause = new OAuthUnauthorizedError('Stored token was rejected; re-login required.');
     toolkit.tokenProvider.mockReturnValue({
       getAccessToken: async () => {
         throw cause;
       },
     });
-    const provider = createService().resolveTokenProvider(OAUTH_PROVIDER);
-    if (provider === undefined) throw new Error('expected an OAuth token provider');
+    const service = createService();
+    const rawProvider = service.resolveTokenProvider(OAUTH_PROVIDER);
+    if (rawProvider === undefined) throw new Error('expected an OAuth token provider');
+    await expect(rawProvider.getAccessToken()).rejects.toBe(cause);
 
-    const error = await provider.getAccessToken().catch((error: unknown) => error);
+    const adapter = new ModelOAuthTokenAdapter(service);
+    const oauthRef = { storage: 'file' as const, key: 'kimi-code' };
+    const initialError = await adapter
+      .getAccessToken(OAUTH_PROVIDER, oauthRef)
+      .catch((error: unknown) => error);
+    const forceError = await adapter
+      .getAccessToken(OAUTH_PROVIDER, oauthRef, { force: true })
+      .catch((error: unknown) => error);
 
-    expect(error).toBeInstanceOf(Error2);
-    expect(error).toMatchObject({ code: AuthErrors.codes.AUTH_LOGIN_REQUIRED, cause });
+    expect(initialError).toBeInstanceOf(Error2);
+    expect(initialError).toMatchObject({ code: AuthErrors.codes.AUTH_LOGIN_REQUIRED, cause });
+    expect(forceError).toBeInstanceOf(Error2);
+    expect(forceError).toMatchObject({ code: AuthErrors.codes.AUTH_LOGIN_REQUIRED, cause });
   });
 
   it('rethrows unrecognized token failures without guessing an auth category', async () => {
@@ -322,10 +334,11 @@ describe('OAuthService', () => {
         throw cause;
       },
     });
-    const provider = createService().resolveTokenProvider(OAUTH_PROVIDER);
-    if (provider === undefined) throw new Error('expected an OAuth token provider');
+    const adapter = new ModelOAuthTokenAdapter(createService());
 
-    const error = await provider.getAccessToken().catch((error: unknown) => error);
+    const error = await adapter
+      .getAccessToken(OAUTH_PROVIDER, { storage: 'file', key: 'kimi-code' })
+      .catch((error: unknown) => error);
 
     expect(error).toBe(cause);
   });
