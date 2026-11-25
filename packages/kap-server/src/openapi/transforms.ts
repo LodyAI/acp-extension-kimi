@@ -24,6 +24,7 @@ import {
 } from '@moonshot-ai/agent-core-v2/workspace/workspaceFs/fs';
 import { z } from 'zod';
 
+import { buildSuccessEnvelopeSchema } from '../middleware/defineRoute';
 import {
   openApiDocumentEnvelopeJsonSchema,
   openApiDocumentJsonSchema,
@@ -38,9 +39,13 @@ import {
 } from '../protocol/rest-fs';
 import {
   archiveSessionResponseSchema,
-  takeoverSessionResponseSchema,
+  cancelSessionBodySchema,
   deleteSessionResponseSchema,
   getSessionResponseSchema,
+  sessionCancelResponseSchema,
+  takeoverSessionResponseSchema,
+  waitSessionBodySchema,
+  waitSessionResponseSchema,
 } from '../protocol/rest-session';
 
 const binarySchema = {
@@ -102,8 +107,14 @@ export function transformOpenApiDocument(
   const paths = asRecord(document['paths']);
   if (paths === undefined) return document;
 
-  patchFileUpload(paths);
+  patchFileUpload(paths, '/api/v1/files', fileUploadMultipartSchema);
+  patchFileUpload(paths, '/api/v1/feedback/{feedback_id}/attachments', {
+    type: 'object',
+    properties: { file: binarySchema },
+    required: ['file'],
+  });
   patchFileDownload(paths);
+  patchKapSpec(paths);
   patchSessionExport(paths);
   patchSessionAction(paths);
   patchFsAction(paths);
@@ -111,6 +122,19 @@ export function transformOpenApiDocument(
   patchWorkspaceFsContent(paths);
 
   return document;
+}
+
+function patchKapSpec(paths: Record<string, unknown>): void {
+  const operation = getOperation(paths, '/api/v1/kap.md', 'get');
+  if (operation === undefined) return;
+  setResponse(operation, '200', {
+    description: 'Built-in Kimi Agent Protocol (KAP) Markdown specification',
+    content: {
+      'text/markdown': {
+        schema: { type: 'string' },
+      },
+    },
+  });
 }
 
 function patchSessionExport(paths: Record<string, unknown>): void {
@@ -133,15 +157,19 @@ function patchSessionExport(paths: Record<string, unknown>): void {
   });
 }
 
-function patchFileUpload(paths: Record<string, unknown>): void {
-  const operation = getOperation(paths, '/api/v1/files', 'post');
+function patchFileUpload(
+  paths: Record<string, unknown>,
+  path: string,
+  schema: Record<string, unknown>,
+): void {
+  const operation = getOperation(paths, path, 'post');
   if (operation === undefined) return;
 
   operation['requestBody'] = {
     required: true,
     content: {
       'multipart/form-data': {
-        schema: fileUploadMultipartSchema,
+        schema,
       },
     },
   };
@@ -176,22 +204,50 @@ function patchSessionAction(paths: Record<string, unknown>): void {
   const operation = asRecord(pathItem?.['post']);
   if (pathItem === undefined || operation === undefined) return;
 
-  projectSessionAction(paths, pathItem, 'archive', 'runSessionArchiveAction', {
-    description: 'Session archive response',
-    content: jsonContent(openApiDocumentEnvelopeJsonSchema(archiveSessionResponseSchema)),
-  });
-  projectSessionAction(paths, pathItem, 'delete', 'runSessionDeleteAction', {
-    description: 'Session delete response',
-    content: jsonContent(openApiDocumentEnvelopeJsonSchema(deleteSessionResponseSchema)),
-  });
-  projectSessionAction(paths, pathItem, 'reload', 'runSessionReloadAction', {
-    description: 'Session reload response',
-    content: jsonContent(openApiDocumentEnvelopeJsonSchema(getSessionResponseSchema)),
-  });
-  projectSessionAction(paths, pathItem, 'takeover', 'runSessionTakeoverAction', {
-    description: 'Session lock takeover response',
-    content: jsonContent(openApiDocumentEnvelopeJsonSchema(takeoverSessionResponseSchema)),
-  });
+  projectSessionAction(
+    paths,
+    pathItem,
+    'cancel',
+    'runSessionCancelAction',
+    sessionCancelResponseSchema,
+    cancelSessionBodySchema,
+  );
+  projectSessionAction(
+    paths,
+    pathItem,
+    'wait',
+    'runSessionWaitAction',
+    waitSessionResponseSchema,
+    waitSessionBodySchema,
+  );
+  projectSessionAction(
+    paths,
+    pathItem,
+    'archive',
+    'runSessionArchiveAction',
+    archiveSessionResponseSchema,
+  );
+  projectSessionAction(
+    paths,
+    pathItem,
+    'delete',
+    'runSessionDeleteAction',
+    deleteSessionResponseSchema,
+  );
+  projectSessionAction(
+    paths,
+    pathItem,
+    'reload',
+    'runSessionReloadAction',
+    getSessionResponseSchema,
+  );
+  projectSessionAction(
+    paths,
+    pathItem,
+    'takeover',
+    'runSessionTakeoverAction',
+    takeoverSessionResponseSchema,
+  );
   delete paths[internalPath];
 }
 
@@ -200,14 +256,38 @@ function projectSessionAction(
   pathItem: Record<string, unknown>,
   action: string,
   operationId: string,
-  okResponse: Record<string, unknown>,
+  successDataSchema: z.ZodTypeAny,
+  bodySchema?: z.ZodTypeAny,
 ): void {
   const cloned = cloneRecord(pathItem);
   replacePathParamName(cloned, 'tail', 'session_id');
   const clonedOperation = asRecord(cloned['post']);
   if (clonedOperation !== undefined) {
     clonedOperation['operationId'] = operationId;
-    setResponse(clonedOperation, '200', okResponse);
+    if (bodySchema !== undefined) {
+      clonedOperation['requestBody'] = {
+        required: false,
+        content: jsonContent(openApiDocumentJsonSchema(bodySchema)),
+      };
+    } else {
+      delete clonedOperation['requestBody'];
+    }
+    const existingResponses = asRecord(clonedOperation['responses']);
+    const existing200 = asRecord(existingResponses?.['200']);
+    const existingContent = asRecord(existing200?.['content']);
+    const existingSchema = asRecord(asRecord(existingContent?.['application/json'])?.['schema']);
+    const existingOneOf = existingSchema?.['oneOf'];
+    const okVariant = openApiDocumentJsonSchema(
+      buildSuccessEnvelopeSchema(successDataSchema),
+      'output',
+    );
+    const mergedSchema = Array.isArray(existingOneOf) && existingOneOf.length > 1
+      ? { oneOf: [okVariant, ...existingOneOf.slice(1)] }
+      : okVariant;
+    setResponse(clonedOperation, '200', {
+      description: `Session ${action} response`,
+      content: jsonContent(mergedSchema),
+    });
   }
   paths[`/api/v1/sessions/{session_id}:${action}`] = cloned;
 }

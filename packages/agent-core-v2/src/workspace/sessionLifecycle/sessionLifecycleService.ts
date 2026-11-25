@@ -92,6 +92,7 @@ import {
   createWireMetadataRecord,
   type WireRecord,
 } from '#/wire/record';
+import { normalizeLegacyTurnSteerRecords } from '#/wire/human';
 import { repairWireJournal } from '#/wire/repair';
 import { flattenChain } from '#/wire/tree/index';
 import { IModelService } from '#/llm-adapter/model/model';
@@ -657,7 +658,7 @@ export class SessionLifecycleService extends Disposable implements ISessionLifec
       await this.appendLogStore.flush();
       this.event.publish(
         new SessionDeleted({
-          payload: { sessionId, workspaceId: this.workspaceContext.workspaceId },
+          payload: { sessionId, workspaceId: this.workspaceContext.workspaceId, session: summary },
         }),
       );
     } finally {
@@ -737,7 +738,7 @@ export class SessionLifecycleService extends Disposable implements ISessionLifec
             queuedPromptIds.set(
               agentHandle.id,
               snapshot.queue.flatMap((item) => {
-                const promptId = item.meta?.promptId;
+                const promptId = item.attributes?.promptId;
                 return typeof promptId === 'string' ? [promptId] : [];
               }),
             );
@@ -775,7 +776,9 @@ export class SessionLifecycleService extends Disposable implements ISessionLifec
       const mainRecords =
         opts.turnIndex === undefined && !runningFork
           ? undefined
-          : flattenChain(await this.readSourceWireRecords(sourceHandle, sourceId, MAIN_AGENT_ID));
+          : normalizeLegacyTurnSteerRecords(
+              flattenChain(await this.readSourceWireRecords(sourceHandle, sourceId, MAIN_AGENT_ID)),
+            );
       const completedMainRecords =
         mainRecords === undefined || !runningFork
           ? mainRecords

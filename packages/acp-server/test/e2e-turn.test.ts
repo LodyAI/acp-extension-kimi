@@ -10,15 +10,18 @@
  */
 
 import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { promisify } from 'node:util';
 
 import {
+  ensureMainAgent,
   getLiveSessionById,
   IAgentLifecycleService,
+  IAgentLoopService,
+  ISessionManager,
   IEventBus,
   IOAuthToolkit,
 } from '@moonshot-ai/agent-core-v2';
@@ -33,7 +36,6 @@ import { writeFakeModelConfig } from './_helpers/fakeModelConfig';
 import { solidPngBase64 } from './_helpers/png';
 import { createScriptedProvider, type ScriptedProvider } from './_helpers/scriptedProvider';
 
-/** Real stdio MCP fixture server from the agent-core-v2 test suite. */
 const STDIO_MCP_FIXTURE = fileURLToPath(
   new URL('../../agent-core-v2/test/mcpCore/fixtures/mock-stdio-server.mjs', import.meta.url),
 );
@@ -84,6 +86,65 @@ describe('acp-server real prompt turn (scripted LLM)', () => {
     if (clientCapabilities['terminal'] === true) installTerminalClient(client);
     return client;
   }
+
+  it('holds queued work during cold ACP restore until output and execution are attached', async () => {
+    const c = await boot();
+    c.onRequest('session/request_permission', () => ({
+      outcome: { outcome: 'selected', optionId: 'approve_once' },
+    }));
+    const { sessionId } = (await c.send('session/new', { cwd: homeDir, mcpServers: [] })) as {
+      sessionId: string;
+    };
+    await c.send('session/close', { sessionId });
+    const marker = join(homeDir!, 'must-not-run-locally');
+    scripted!.mockNextResponse(
+      { type: 'text', text: 'Restored background work' },
+      {
+        type: 'function',
+        id: 'restore-bash',
+        name: 'Bash',
+        arguments: JSON.stringify({ command: `printf unsafe > "${marker}"` }),
+      },
+    );
+    scripted!.mockNextText('Restored task settled');
+    const lifecycle = c.server.core.accessor.get(ISessionManager);
+    let injected = false;
+    const subscription = lifecycle.onWillCreateSession!((event) => {
+      if (event.sessionId !== sessionId) return;
+      event.onDidCreateScope((session) => {
+        session.accessor.get(IAgentLifecycleService).onDidCreateScope(({ context, handle }) => {
+          if (injected || context.agentId !== 'main') return;
+          injected = true;
+          handle.accessor.get(IAgentLoopService).submit({
+            role: 'user',
+            content: [{ type: 'text', text: 'Resume queued background work' }],
+            attributes: { promptId: 'cold-resume-queued' },
+          });
+        });
+      });
+    });
+    try {
+      await c.send('session/resume', { sessionId, cwd: homeDir, mcpServers: [] });
+      await vi.waitFor(() => {
+        const updates = JSON.stringify(c.sessionUpdates());
+        expect(updates).toContain('Restored task settled');
+      });
+      const updates = JSON.stringify(c.sessionUpdates());
+      expect(updates).toContain('Restored background work');
+      expect(updates).toContain('ACP terminal capability is unavailable');
+      await expect(readFile(marker)).rejects.toMatchObject({ code: 'ENOENT' });
+      expect(usageUpdates(c).at(-1)?.usage.outputTokens).toBeGreaterThan(0);
+      const session = getLiveSessionById(c.server.core.accessor, sessionId)!;
+      const agents = session.accessor.get(IAgentLifecycleService);
+      await agents.remove(agents.get('main')!);
+      const recreated = await ensureMainAgent(session);
+      expect(
+        agents.handleOf(recreated.agentId)!.accessor.get(IAgentLoopService).snapshot().paused,
+      ).toBe(false);
+    } finally {
+      subscription.dispose();
+    }
+  }, 30_000);
 
   it('applies and replaces ACP system prompts without changing sibling sessions', async () => {
     const c = await boot();
@@ -207,8 +268,6 @@ maxContextSize = 8192
       sessionId: string;
     };
     expect(created.sessionId).toMatch(/^session_/);
-    // Drain the post-new available_commands_update so prompt assertions only
-    // see turn traffic.
     await c.waitForSessionUpdate('available_commands_update', 10_000);
 
     const promptPromise = c.send('session/prompt', {
@@ -224,10 +283,6 @@ maxContextSize = 8192
     expect(result.stopReason).toBe('end_turn');
     expect(scripted!.callCount()).toBe(1);
 
-    // Turn settlement pushes a one-shot usage_update: `used` is the
-    // LLM-measured context token count (the scripted provider reports
-    // output usage only, so > 0), `size` the fake model's max context
-    // size (8192, see fakeModelConfig); `cost` stays omitted.
     const usage = await c.waitForSessionUpdate('usage_update', 10_000);
     const usageUpdate = (
       usage.params as { update?: { used?: number; size?: number; cost?: unknown } }
@@ -239,31 +294,48 @@ maxContextSize = 8192
 
   it('reports usage for an engine-initiated turn without an ACP prompt', async () => {
     const c = await boot();
-    const { sessionId } = await c.send('session/new', { cwd: homeDir, mcpServers: [] }) as { sessionId: string };
+    const { sessionId } = (await c.send('session/new', { cwd: homeDir, mcpServers: [] })) as {
+      sessionId: string;
+    };
     scripted!.mockNextText('background reply');
-    await c.server.klient.session(sessionId).agent('main').prompt({ input: [{ type: 'text', text: 'background work' }] });
+    await c.server.klient
+      .session(sessionId)
+      .agent('main')
+      .prompt({ input: [{ type: 'text', text: 'background work' }] });
     await vi.waitFor(() => {
       const updates = usageUpdates(c);
       const usage = updates.at(-1);
       expect(usage?.usage.outputTokens).toBe(1);
-      expect(updates.reduce((total, update) => total + (update.delta?.usage.outputTokens ?? 0), 0)).toBe(1);
+      expect(
+        updates.reduce((total, update) => total + (update.delta?.usage.outputTokens ?? 0), 0),
+      ).toBe(1);
     });
   });
 
   it('keeps reasoning separate across multiple requests and cumulative usage updates', async () => {
     const c = await boot();
-    const { sessionId } = await c.send('session/new', { cwd: homeDir, mcpServers: [] }) as { sessionId: string };
+    const { sessionId } = (await c.send('session/new', { cwd: homeDir, mcpServers: [] })) as {
+      sessionId: string;
+    };
     for (let turn = 0; turn < 2; turn++) {
       scripted!.mockNextProviderResponse({
         parts: [{ type: 'text', text: 'answer' }],
-        usage: { inputOther: 10, output: 30, reasoningOutput: 12, inputCacheRead: 0, inputCacheCreation: 0 },
+        usage: {
+          inputOther: 10,
+          output: 30,
+          reasoningOutput: 12,
+          inputCacheRead: 0,
+          inputCacheCreation: 0,
+        },
       });
       await c.send('session/prompt', { sessionId, prompt: [{ type: 'text', text: 'hello' }] });
     }
     await vi.waitFor(() => {
       const updates = usageUpdates(c);
       expect(updates.at(-1)?.usage).toMatchObject({ outputTokens: 36, reasoningOutputTokens: 24 });
-      expect(updates.reduce((sum, update) => sum + (update.delta?.usage.reasoningOutputTokens ?? 0), 0)).toBe(24);
+      expect(
+        updates.reduce((sum, update) => sum + (update.delta?.usage.reasoningOutputTokens ?? 0), 0),
+      ).toBe(24);
       // One activation is one cumulative usage scope.
       const scopes = new Set(updates.map((update) => update._meta?.lody?.usageScopeId));
       expect(scopes.size).toBe(1);
@@ -276,23 +348,49 @@ maxContextSize = 8192
 
   it('reports a detached subagent contribution before its wake response completes', async () => {
     const c = await boot();
-    const { sessionId } = await c.send('session/new', { cwd: homeDir, mcpServers: [] }) as { sessionId: string };
+    const { sessionId } = (await c.send('session/new', { cwd: homeDir, mcpServers: [] })) as {
+      sessionId: string;
+    };
     const child = Promise.withResolvers<void>();
     const wake = Promise.withResolvers<void>();
-    scripted!.mockNextResponse({ type: 'function', id: 'spawn-1', name: 'Agent', arguments: JSON.stringify({ prompt: 'reply briefly', description: 'background task', run_in_background: true }) });
-    scripted!.mockNextProviderResponse({ parts: [{ type: 'text', text: 'child done' }], beforeResponse: () => child.promise });
+    scripted!.mockNextResponse({
+      type: 'function',
+      id: 'spawn-1',
+      name: 'Agent',
+      arguments: JSON.stringify({
+        prompt: 'reply briefly',
+        description: 'background task',
+        run_in_background: true,
+      }),
+    });
+    scripted!.mockNextProviderResponse({
+      parts: [{ type: 'text', text: 'child done' }],
+      beforeResponse: () => child.promise,
+    });
     scripted!.mockNextText('launched');
-    scripted!.mockNextProviderResponse({ parts: [{ type: 'text', text: 'wake done' }], beforeResponse: () => wake.promise });
-    const prompt = c.send('session/prompt', { sessionId, prompt: [{ type: 'text', text: 'delegate' }] });
+    scripted!.mockNextProviderResponse({
+      parts: [{ type: 'text', text: 'wake done' }],
+      beforeResponse: () => wake.promise,
+    });
+    const prompt = c.send('session/prompt', {
+      sessionId,
+      prompt: [{ type: 'text', text: 'delegate' }],
+    });
     try {
-      await vi.waitFor(() => {
-        expect(scripted!.callCount()).toBe(3);
-      }, { timeout: 5000 });
+      await vi.waitFor(
+        () => {
+          expect(scripted!.callCount()).toBe(3);
+        },
+        { timeout: 5000 },
+      );
       child.resolve();
-      await vi.waitFor(() => {
-        const usage = usageUpdates(c).at(-1);
-        expect(usage?.usage.outputTokens).toBe(3);
-      }, { timeout: 5000 });
+      await vi.waitFor(
+        () => {
+          const usage = usageUpdates(c).at(-1);
+          expect(usage?.usage.outputTokens).toBe(3);
+        },
+        { timeout: 5000 },
+      );
     } finally {
       child.resolve();
       wake.resolve();
@@ -302,8 +400,6 @@ maxContextSize = 8192
 
   it('runs a tool call and bridges the approval request to the client', async () => {
     const c = await boot({ terminal: true });
-    // First model response: a Bash tool call. Second: a short text wrap-up
-    // after the tool result is fed back to the model.
     scripted!.mockNextResponse({
       type: 'function',
       id: 'call_1',
@@ -312,8 +408,6 @@ maxContextSize = 8192
     });
     scripted!.mockNextText('ran it');
 
-    // Auto-approve any permission request and record it so we can assert the
-    // bridge forwarded the engine's approval to the ACP client.
     const permissionRequests: unknown[] = [];
     c.onRequest('session/request_permission', (params) => {
       permissionRequests.push(params);
@@ -330,23 +424,17 @@ maxContextSize = 8192
       prompt: [{ type: 'text', text: 'run echo' }],
     });
 
-    // The tool call must be created and then completed (Bash actually ran).
     await c.waitForSessionUpdate('tool_call', 10_000);
     await c.waitForSessionUpdate('tool_call_update', 10_000);
 
     const result = (await promptPromise) as { stopReason: string };
     expect(result.stopReason).toBe('end_turn');
-    // Two model calls: the tool-call response and the post-tool text response.
     expect(scripted!.callCount()).toBe(2);
 
-    // The default (manual) permission mode asks before running Bash, so the
-    // bridge must have forwarded exactly one approval request to the client.
     expect(permissionRequests).toHaveLength(1);
     const req = permissionRequests[0] as { toolCall?: { toolCallId?: string } };
     expect(req.toolCall?.toolCallId).toContain('call_1');
 
-    // The terminal tool_call_update must report success and include the
-    // command's output.
     type ToolCallUpdate = {
       sessionUpdate?: string;
       status?: string;
@@ -453,8 +541,6 @@ maxContextSize = 8192
 
   it('bridges AskUserQuestion through elicitation/create for form-capable clients', async () => {
     const c = await boot({ elicitation: { form: {} } });
-    // First model response: an AskUserQuestion tool call with a single-select
-    // and a multi-select question. Second: wrap-up after the answers come back.
     scripted!.mockNextResponse({
       type: 'function',
       id: 'call_q',
@@ -483,7 +569,6 @@ maxContextSize = 8192
       elicitationRequests.push(params);
       return { action: 'accept', content: { q0: 'B', q1: ['Z', 'X'] } };
     });
-    // Auto-approve in case the tool itself requires an approval first.
     const permissionRequests: unknown[] = [];
     c.onRequest('session/request_permission', (params) => {
       permissionRequests.push(params);
@@ -502,11 +587,10 @@ maxContextSize = 8192
     expect(result.stopReason).toBe('end_turn');
     expect(scripted!.callCount()).toBe(2);
 
-    // The question went over `elicitation/create` — never the permission
-    // bridge — as one form carrying both questions.
     expect(elicitationRequests).toHaveLength(1);
-    expect(permissionRequests.filter((p) => JSON.stringify(p).includes('AskUserQuestion')))
-      .toHaveLength(0);
+    expect(
+      permissionRequests.filter((p) => JSON.stringify(p).includes('AskUserQuestion')),
+    ).toHaveLength(0);
     const elicitation = elicitationRequests[0] as {
       mode?: string;
       toolCallId?: string;
@@ -518,9 +602,6 @@ maxContextSize = 8192
     expect(elicitation.requestedSchema?.properties?.['q0']?.type).toBe('string');
     expect(elicitation.requestedSchema?.properties?.['q1']?.type).toBe('array');
 
-    // The answers fed back to the model key by question text; the multi-select
-    // joins in declared option order. (The history is JSON-stringified, so
-    // the tool output's quotes appear escaped.)
     const history = JSON.stringify(scripted!.callHistory()[1]);
     expect(history).toContain('\\"Pick one\\":\\"B\\"');
     expect(history).toContain('\\"Pick many\\":\\"X, Z\\"');
@@ -528,8 +609,6 @@ maxContextSize = 8192
 
   it('rejects a second prompt while a turn is in flight', async () => {
     const c = await boot();
-    // First model response parks the turn at a Bash approval; the follow-up
-    // text closes the turn once the approval lands.
     scripted!.mockNextResponse({
       type: 'function',
       id: 'call_busy',
@@ -538,7 +617,6 @@ maxContextSize = 8192
     });
     scripted!.mockNextText('done');
 
-    // Park the approval until the test releases it.
     let answerPermission: ((response: unknown) => void) | undefined;
     const permissionSeen = new Promise<void>((seen) => {
       c.onRequest('session/request_permission', () => {
@@ -558,11 +636,8 @@ maxContextSize = 8192
       sessionId: created.sessionId,
       prompt: [{ type: 'text', text: 'run echo' }],
     });
-    // The turn is in flight once its approval reached the client.
     await permissionSeen;
 
-    // A second prompt while the turn runs must fail fast with -32600, not
-    // silently queue behind the engine and overwrite the in-flight driver.
     await expect(
       c.send('session/prompt', {
         sessionId: created.sessionId,
@@ -570,8 +645,6 @@ maxContextSize = 8192
       }),
     ).rejects.toThrow(/another turn is already in progress/);
 
-    // Release the parked approval: the first turn completes normally and its
-    // prompt settles with end_turn (the driver was never displaced).
     answerPermission!({ outcome: { outcome: 'selected', optionId: 'approve_once' } });
     const result = (await firstPrompt) as { stopReason: string };
     expect(result.stopReason).toBe('end_turn');
@@ -580,9 +653,6 @@ maxContextSize = 8192
 
   it('settles as cancelled when cancel arrives while the launch is in flight', async () => {
     const c = await boot();
-    // The scripted Bash call would park the turn at approval — but the cancel
-    // must win regardless of whether it lands before or after the launch
-    // round-trip delivers the turn id.
     scripted!.mockNextResponse({
       type: 'function',
       id: 'call_cancel',
@@ -602,9 +672,6 @@ maxContextSize = 8192
       sessionId: created.sessionId,
       prompt: [{ type: 'text', text: 'run echo' }],
     });
-    // Fire the cancel immediately: the driver's turn id is very likely still
-    // unknown at this point, which used to drop the cancel on the floor and
-    // let the turn run to completion.
     c.notify('session/cancel', { sessionId: created.sessionId });
 
     const result = (await promptPromise) as { stopReason: string };
@@ -623,7 +690,6 @@ maxContextSize = 8192
     });
     scripted!.mockNextText('read it');
 
-    // Auto-approve in case the manual permission mode gates the Read.
     c.onRequest('session/request_permission', () => ({
       outcome: { outcome: 'selected', optionId: 'approve_once' },
     }));
@@ -645,9 +711,6 @@ maxContextSize = 8192
     };
     const updateOf = (m: unknown) => (m as { params?: { update?: ToolCallWire } }).params?.update;
 
-    // The engine streams the args delta BEFORE `tool.call.started`, so the
-    // CREATE is the lazy pending one, which cannot carry locations yet (they
-    // derive from the full args/display at started).
     const createdNotification = await c.waitForSessionUpdate('tool_call', 10_000);
     expect(updateOf(createdNotification)?.status).toBe('pending');
     expect(updateOf(createdNotification)?.locations).toBeUndefined();
@@ -655,15 +718,12 @@ maxContextSize = 8192
     const result = (await promptPromise) as { stopReason: string };
     expect(result.stopReason).toBe('end_turn');
 
-    // The started-upgrade update attaches the absolute path as a location…
     const updates = c.sessionUpdates().map(updateOf);
     const upgrade = updates.find(
       (u) => u?.sessionUpdate === 'tool_call_update' && u?.locations !== undefined,
     );
     expect(upgrade?.locations?.[0]?.path).toBe(filePath);
 
-    // …and the terminal tool_call_update re-attaches the same locations
-    // (`tool.result` itself carries no args/display).
     const terminal = updates.find(
       (u) => u?.sessionUpdate === 'tool_call_update' && u?.status === 'completed',
     );
@@ -677,9 +737,6 @@ maxContextSize = 8192
     };
     await c.waitForSessionUpdate('available_commands_update', 10_000);
 
-    // A solid 3600×1800 PNG is small on the wire but slow enough to compress
-    // (decode + rescale) that the cancel below reliably lands mid-compression,
-    // before any turn exists — while staying well inside the test timeout.
     const promptPromise = c.send('session/prompt', {
       sessionId: created.sessionId,
       prompt: [{ type: 'image', data: solidPngBase64(3600, 1800), mimeType: 'image/png' }],
@@ -688,7 +745,6 @@ maxContextSize = 8192
     const result = (await promptPromise) as { stopReason: string };
 
     expect(result.stopReason).toBe('cancelled');
-    // The turn was never launched — the model was never called.
     expect(scripted!.callCount()).toBe(0);
   }, 30_000);
 
@@ -731,8 +787,6 @@ maxContextSize = 8192
     const textOf = (u: ToolCallWire | undefined) =>
       u?.content?.map((entry) => entry.content?.text ?? '').join('') ?? '';
 
-    // 1. First delta → lazy CREATE: pending, titled by the tool name, content
-    //    is the first args fragment, no rawInput yet.
     expect(updates[0]?.sessionUpdate).toBe('tool_call');
     expect(updates[0]?.status).toBe('pending');
     expect(updates[0]?.title).toBe('Bash');
@@ -740,19 +794,15 @@ maxContextSize = 8192
     expect(updates[0]?.rawInput).toBeUndefined();
     expect(textOf(updates[0])).toBe('{"command":"ec');
 
-    // 2. Second delta → cumulative REPLACE update with the full args text.
     expect(updates[1]?.sessionUpdate).toBe('tool_call_update');
     expect(updates[1]?.status).toBe('in_progress');
     expect(textOf(updates[1])).toBe('{"command":"echo delta_stream"}');
 
-    // 3. `tool.call.started` → upgrade update: canonical metadata lands on the
-    //    existing card (kind + rawInput), status stays in_progress.
     expect(updates[2]?.sessionUpdate).toBe('tool_call_update');
     expect(updates[2]?.status).toBe('in_progress');
     expect(updates[2]?.kind).toBe('execute');
     expect(updates[2]?.rawInput).toEqual({ command: 'echo delta_stream' });
 
-    // 4. Result → terminal completed update.
     expect(updates.at(-1)?.sessionUpdate).toBe('tool_call_update');
     expect(updates.at(-1)?.status).toBe('completed');
     expect(JSON.stringify(scripted!.callHistory()[1])).toContain('delta_stream');
@@ -763,7 +813,12 @@ maxContextSize = 8192
     const args = JSON.stringify({ path: mediaPath });
     const splitAt = 12;
     scripted!.mockNextResponse(
-      { type: 'function', id: 'call_media', name: 'ReadMediaFile', arguments: args.slice(0, splitAt) },
+      {
+        type: 'function',
+        id: 'call_media',
+        name: 'ReadMediaFile',
+        arguments: args.slice(0, splitAt),
+      },
       { type: 'tool_call_part', argumentsPart: args.slice(splitAt) },
     );
     scripted!.mockNextText('done');
@@ -815,17 +870,13 @@ maxContextSize = 8192
       .filter((u) => u?.toolCallId?.endsWith(':call_media') && u.status === 'completed');
     expect(replayedUpdates).toHaveLength(1);
     expect(replayedUpdates[0]?.content).toEqual(
-      expect.arrayContaining([
-        { type: 'content', content: { type: 'text', text: '[image_url]' } },
-      ]),
+      expect.arrayContaining([{ type: 'content', content: { type: 'text', text: '[image_url]' } }]),
     );
     expect(JSON.stringify(replayedUpdates)).not.toContain('"source"');
   }, 30_000);
 
   it('refreshes the tool card title on a status progress update and drops other progress kinds', async () => {
     const c = await boot();
-    // A slow command keeps the turn alive so the progress events below land
-    // while the call is still in flight.
     scripted!.mockNextResponse({
       type: 'function',
       id: 'call_1',
@@ -847,9 +898,6 @@ maxContextSize = 8192
       prompt: [{ type: 'text', text: 'run it' }],
     });
 
-    // Wait for the in-flight call, then publish progress events onto the main
-    // agent's event bus (the same channel a progress-reporting tool uses) —
-    // a stdout chunk (dropped by the mapping) and a status text (forwarded).
     const create = await c.waitForSessionUpdate('tool_call', 10_000);
     const wireId = (create.params as { update?: { toolCallId?: string } }).update?.toolCallId;
     const turnId = Number(wireId?.split(':')[0]);
@@ -891,11 +939,9 @@ maxContextSize = 8192
       .sessionUpdates()
       .map((m) => (m.params as { update?: ToolCallWire }).update)
       .filter((u) => u?.toolCallId === wireId);
-    // The status progress refreshed the card title…
     expect(
       updates.some((u) => u?.sessionUpdate === 'tool_call_update' && u?.title === 'Still working…'),
     ).toBe(true);
-    // …while the stdout progress never crossed the wire.
     expect(updates.some((u) => u?.title === 'raw-stdout-bytes')).toBe(false);
   }, 30_000);
 });
@@ -911,7 +957,8 @@ describe('acp-server additional directories with real file tools', () => {
   afterEach(async () => {
     await client?.close();
     client = undefined;
-    if (homeDir) await rm(homeDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+    if (homeDir)
+      await rm(homeDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   });
 
   async function boot(terminal = false): Promise<TestClient> {
@@ -930,20 +977,37 @@ describe('acp-server additional directories with real file tools', () => {
     return client;
   }
 
-  async function tool(sessionId: string, name: string, args: Record<string, unknown>): Promise<string> {
+  async function tool(
+    sessionId: string,
+    name: string,
+    args: Record<string, unknown>,
+  ): Promise<string> {
     scripted.mockNextResponse({
-      type: 'function', id: `file_${scripted.callCount()}`, name, arguments: JSON.stringify(args),
+      type: 'function',
+      id: `file_${scripted.callCount()}`,
+      name,
+      arguments: JSON.stringify(args),
     });
     scripted.mockNextText('done');
-    expect(await client!.send('session/prompt', {
-      sessionId, prompt: [{ type: 'text', text: 'Run the requested file operation.' }],
-    })).toMatchObject({ stopReason: 'end_turn' });
-    const result = scripted.callHistory().at(-1)?.findLast((message) => message.role === 'tool');
+    expect(
+      await client!.send('session/prompt', {
+        sessionId,
+        prompt: [{ type: 'text', text: 'Run the requested file operation.' }],
+      }),
+    ).toMatchObject({ stopReason: 'end_turn' });
+    const result = scripted
+      .callHistory()
+      .at(-1)
+      ?.findLast((message) => message.role === 'tool');
     expect(result).toBeDefined();
     return JSON.stringify(result);
   }
 
-  async function expectRoots(sessionId: string, roots: readonly string[], primary = cwd): Promise<void> {
+  async function expectRoots(
+    sessionId: string,
+    roots: readonly string[],
+    primary = cwd,
+  ): Promise<void> {
     expect(await tool(sessionId, 'Read', { path: 'fixture.txt' })).toContain(`fixture:${primary}`);
     const systemPrompt = scripted.systemPrompts().at(-1)!;
     expect(systemPrompt).toContain(primary);
@@ -951,7 +1015,10 @@ describe('acp-server additional directories with real file tools', () => {
       if (roots.includes(directory)) expect(systemPrompt).toContain(`### ${directory}\n`);
       else expect(systemPrompt).not.toContain(`### ${directory}\n`);
     }
-    for (const [directory, relative] of [[a, '../a/fixture.txt'], [b, '../b/fixture.txt']] as const) {
+    for (const [directory, relative] of [
+      [a, '../a/fixture.txt'],
+      [b, '../b/fixture.txt'],
+    ] as const) {
       const result = await tool(sessionId, 'Read', { path: relative });
       if (roots.includes(directory)) expect(result).toContain(`fixture:${directory}`);
       else {
@@ -971,7 +1038,11 @@ describe('acp-server additional directories with real file tools', () => {
       output = result.stdout;
       return { terminalId: 'fixture-terminal' };
     });
-    c.onRequest('terminal/output', () => ({ output, truncated: false, exitStatus: { exitCode: 0 } }));
+    c.onRequest('terminal/output', () => ({
+      output,
+      truncated: false,
+      exitStatus: { exitCode: 0 },
+    }));
     c.onRequest('terminal/wait_for_exit', () => ({ exitCode: 0 }));
     c.onRequest('terminal/release', () => ({}));
     c.onRequest('terminal/kill', () => ({}));
@@ -986,43 +1057,64 @@ describe('acp-server additional directories with real file tools', () => {
     { method: 'session/load', cold: true },
     { method: 'session/resume', cold: false },
     { method: 'session/resume', cold: true },
-  ])('$method (cold=$cold) replaces and clears actual file access without changing cwd', async ({ method, cold }) => {
-    const c = await boot();
-    const { sessionId } = await c.send('session/new', {
-      cwd, mcpServers: [], additionalDirectories: [a],
-    }) as { sessionId: string };
-    await expectRoots(sessionId, [a]);
-    for (const roots of [[b], [], [a], undefined]) {
-      if (cold) await c.send('session/close', { sessionId });
-      await c.send(method, { sessionId, cwd, mcpServers: [], additionalDirectories: roots });
-      await expectRoots(sessionId, roots ?? []);
-    }
-  }, 30_000);
+  ])(
+    '$method (cold=$cold) replaces and clears actual file access without changing cwd',
+    async ({ method, cold }) => {
+      const c = await boot();
+      const { sessionId } = (await c.send('session/new', {
+        cwd,
+        mcpServers: [],
+        additionalDirectories: [a],
+      })) as { sessionId: string };
+      await expectRoots(sessionId, [a]);
+      for (const roots of [[b], [], [a], undefined]) {
+        if (cold) await c.send('session/close', { sessionId });
+        await c.send(method, { sessionId, cwd, mcpServers: [], additionalDirectories: roots });
+        await expectRoots(sessionId, roots ?? []);
+      }
+    },
+    30_000,
+  );
 
   it.each([
     { method: 'session/load', cold: false },
     { method: 'session/load', cold: true },
     { method: 'session/resume', cold: false },
     { method: 'session/resume', cold: true },
-  ])('$method (cold=$cold) rejects a different cwd without changing file roots or execution cwd', async ({ method, cold }) => {
-    const c = await boot(true);
-    const terminalCwds = installExecutingTerminal(c);
-    const { sessionId } = await c.send('session/new', {
-      cwd, mcpServers: [], additionalDirectories: [a],
-    }) as { sessionId: string };
-    await expectRoots(sessionId, [a]);
-    expect(await tool(sessionId, 'Bash', { command: 'cat fixture.txt' })).toContain(`fixture:${cwd}`);
-    if (cold) await c.send('session/close', { sessionId });
-    await expect(c.send(method, {
-      sessionId, cwd: b, mcpServers: [], additionalDirectories: [b],
-    })).rejects.toThrow('The request cwd must match the session cwd');
-    if (cold) {
-      await c.send(method, { sessionId, cwd, mcpServers: [], additionalDirectories: [a] });
-    }
-    await expectRoots(sessionId, [a]);
-    expect(await tool(sessionId, 'Bash', { command: 'cat fixture.txt' })).toContain(`fixture:${cwd}`);
-    expect(terminalCwds).toEqual([cwd, cwd]);
-  }, 30_000);
+  ])(
+    '$method (cold=$cold) rejects a different cwd without changing file roots or execution cwd',
+    async ({ method, cold }) => {
+      const c = await boot(true);
+      const terminalCwds = installExecutingTerminal(c);
+      const { sessionId } = (await c.send('session/new', {
+        cwd,
+        mcpServers: [],
+        additionalDirectories: [a],
+      })) as { sessionId: string };
+      await expectRoots(sessionId, [a]);
+      expect(await tool(sessionId, 'Bash', { command: 'cat fixture.txt' })).toContain(
+        `fixture:${cwd}`,
+      );
+      if (cold) await c.send('session/close', { sessionId });
+      await expect(
+        c.send(method, {
+          sessionId,
+          cwd: b,
+          mcpServers: [],
+          additionalDirectories: [b],
+        }),
+      ).rejects.toThrow('The request cwd must match the session cwd');
+      if (cold) {
+        await c.send(method, { sessionId, cwd, mcpServers: [], additionalDirectories: [a] });
+      }
+      await expectRoots(sessionId, [a]);
+      expect(await tool(sessionId, 'Bash', { command: 'cat fixture.txt' })).toContain(
+        `fixture:${cwd}`,
+      );
+      expect(terminalCwds).toEqual([cwd, cwd]);
+    },
+    30_000,
+  );
 
   it('retains native local.toml directories and leaves user configuration untouched when request roots clear', async () => {
     const c = await boot();
@@ -1030,9 +1122,11 @@ describe('acp-server additional directories with real file tools', () => {
     const config = '[workspace]\nadditional_dir = ["../a"]\n\n[user]\nnote = "keep this setting"\n';
     await mkdir(dirname(configPath));
     await writeFile(configPath, config);
-    const { sessionId } = await c.send('session/new', {
-      cwd, mcpServers: [], additionalDirectories: [b],
-    }) as { sessionId: string };
+    const { sessionId } = (await c.send('session/new', {
+      cwd,
+      mcpServers: [],
+      additionalDirectories: [b],
+    })) as { sessionId: string };
     await expectRoots(sessionId, [a, b]);
     await c.send('session/load', { sessionId, cwd, mcpServers: [], additionalDirectories: [] });
     await expectRoots(sessionId, [a]);
@@ -1047,22 +1141,33 @@ describe('acp-server additional directories with real file tools', () => {
   it('executes Bash in the primary cwd after directory replacement and in the independent fork cwd', async () => {
     const c = await boot(true);
     const terminalCwds = installExecutingTerminal(c);
-    const parent = await c.send('session/new', {
-      cwd, mcpServers: [], additionalDirectories: [a],
-    }) as { sessionId: string };
+    const parent = (await c.send('session/new', {
+      cwd,
+      mcpServers: [],
+      additionalDirectories: [a],
+    })) as { sessionId: string };
     const command = 'cat fixture.txt';
     expect(await tool(parent.sessionId, 'Bash', { command })).toContain(`fixture:${cwd}`);
     await c.send('session/load', {
-      sessionId: parent.sessionId, cwd, mcpServers: [], additionalDirectories: [b],
+      sessionId: parent.sessionId,
+      cwd,
+      mcpServers: [],
+      additionalDirectories: [b],
     });
     expect(await tool(parent.sessionId, 'Bash', { command })).toContain(`fixture:${cwd}`);
     await c.send('session/resume', {
-      sessionId: parent.sessionId, cwd, mcpServers: [], additionalDirectories: [],
+      sessionId: parent.sessionId,
+      cwd,
+      mcpServers: [],
+      additionalDirectories: [],
     });
     expect(await tool(parent.sessionId, 'Bash', { command })).toContain(`fixture:${cwd}`);
-    const fork = await c.send('session/fork', {
-      sessionId: parent.sessionId, cwd: b, mcpServers: [], additionalDirectories: [a],
-    }) as { sessionId: string };
+    const fork = (await c.send('session/fork', {
+      sessionId: parent.sessionId,
+      cwd: b,
+      mcpServers: [],
+      additionalDirectories: [a],
+    })) as { sessionId: string };
     expect(await tool(fork.sessionId, 'Bash', { command })).toContain(`fixture:${b}`);
     expect(await tool(parent.sessionId, 'Bash', { command })).toContain(`fixture:${cwd}`);
     expect(terminalCwds).toEqual([cwd, cwd, cwd, b, cwd]);
@@ -1070,19 +1175,26 @@ describe('acp-server additional directories with real file tools', () => {
 
   it('fork and sibling file access remain independent and writes retain native approval', async () => {
     const c = await boot();
-    const parent = await c.send('session/new', {
-      cwd, mcpServers: [], additionalDirectories: [a],
-    }) as { sessionId: string };
-    const sibling = await c.send('session/new', {
-      cwd, mcpServers: [], additionalDirectories: [b],
-    }) as { sessionId: string };
+    const parent = (await c.send('session/new', {
+      cwd,
+      mcpServers: [],
+      additionalDirectories: [a],
+    })) as { sessionId: string };
+    const sibling = (await c.send('session/new', {
+      cwd,
+      mcpServers: [],
+      additionalDirectories: [b],
+    })) as { sessionId: string };
     await expectRoots(parent.sessionId, [a]);
     const targetCwd = join(homeDir, 'fork-primary');
     await mkdir(targetCwd);
     await writeFile(join(targetCwd, 'fixture.txt'), `fixture:${targetCwd}`);
-    const fork = await c.send('session/fork', {
-      sessionId: parent.sessionId, cwd: targetCwd, mcpServers: [], additionalDirectories: [b],
-    }) as { sessionId: string };
+    const fork = (await c.send('session/fork', {
+      sessionId: parent.sessionId,
+      cwd: targetCwd,
+      mcpServers: [],
+      additionalDirectories: [b],
+    })) as { sessionId: string };
     expect(fork.sessionId).not.toBe(parent.sessionId);
     await expectRoots(fork.sessionId, [b], targetCwd);
     await c.send('session/resume', { sessionId: fork.sessionId, cwd: targetCwd, mcpServers: [] });
@@ -1095,13 +1207,23 @@ describe('acp-server additional directories with real file tools', () => {
       approvals.push(params);
       return { outcome: { outcome: 'selected', optionId: 'approve_once' } };
     });
-    expect(await tool(parent.sessionId, 'Write', { path: '../a/written.txt', content: 'approved write' }))
-      .toContain('Wrote');
+    expect(
+      await tool(parent.sessionId, 'Write', {
+        path: '../a/written.txt',
+        content: 'approved write',
+      }),
+    ).toContain('Wrote');
     expect(approvals).toHaveLength(1);
     expect(await readFile(join(a, 'written.txt'), 'utf8')).toBe('approved write');
-    expect(await tool(sibling.sessionId, 'Write', { path: '../a/rejected.txt', content: 'must not write' }))
-      .toContain('must provide an absolute path');
-    await expect(readFile(join(a, 'rejected.txt'), 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(
+      await tool(sibling.sessionId, 'Write', {
+        path: '../a/rejected.txt',
+        content: 'must not write',
+      }),
+    ).toContain('must provide an absolute path');
+    await expect(readFile(join(a, 'rejected.txt'), 'utf8')).rejects.toMatchObject({
+      code: 'ENOENT',
+    });
     expect(approvals).toHaveLength(1);
   }, 30_000);
 });
@@ -1126,7 +1248,6 @@ describe('mapPromptLaunchError', () => {
   it('maps a generic rejection to a fixed internalError without leaking the raw message', () => {
     const mapped = mapPromptLaunchError(new Error('boom internal secret'), 'sess-x');
     expect(mapped.code).toBe(-32603);
-    // The SDK prefixes the wire message with "Internal error: ".
     expect(mapped.message).toBe('Internal error: session prompt failed');
     expect(JSON.stringify(mapped)).not.toContain('boom internal secret');
   });
@@ -1156,9 +1277,6 @@ describe('acp-server prompt error hygiene', () => {
       sessionId: string;
     };
 
-    // Delete the session engine-side (bypassing ACP) so the ACP session stays
-    // registered locally but its klient calls fail with the engine's raw
-    // "session not found: <id>" — a message that must not cross the wire.
     await c.server.klient.session(created.sessionId).delete();
 
     let captured: unknown;
@@ -1203,7 +1321,6 @@ describe('acp-server builtin slash commands (local execution, no LLM turn)', () 
     return client;
   }
 
-  /** Create a session and drain the post-new available_commands_update. */
   async function newSession(c: TestClient): Promise<string> {
     const created = (await c.send('session/new', { cwd: homeDir, mcpServers: [] })) as {
       sessionId: string;
@@ -1212,10 +1329,6 @@ describe('acp-server builtin slash commands (local execution, no LLM turn)', () 
     return created.sessionId;
   }
 
-  /**
-   * Send a slash-command prompt and return the text of the
-   * `agent_message_chunk` it produced plus the prompt's stop reason.
-   */
   async function runSlash(
     c: TestClient,
     sessionId: string,
@@ -1318,9 +1431,6 @@ describe('acp-server builtin slash commands (local execution, no LLM turn)', () 
     const c = await boot();
     const sessionId = await newSession(c);
 
-    // One real turn so the history is non-empty (`begin` refuses an empty
-    // context); the compaction summarization itself consumes the second
-    // scripted reply asynchronously.
     scripted!.mockNextText('turn reply');
     const result = (await c.send('session/prompt', {
       sessionId,
@@ -1352,8 +1462,6 @@ describe('acp-server builtin slash commands (local execution, no LLM turn)', () 
     const c = await boot();
     const sessionId = await newSession(c);
 
-    // One real turn so the history is non-empty; the compaction summarization
-    // consumes the second scripted reply asynchronously.
     scripted!.mockNextText('turn reply');
     const result = (await c.send('session/prompt', {
       sessionId,
@@ -1362,7 +1470,6 @@ describe('acp-server builtin slash commands (local execution, no LLM turn)', () 
     expect(result.stopReason).toBe('end_turn');
     scripted!.mockNextText('compaction summary');
 
-    // The args travel as the summarization instruction.
     const { chunk, stopReason } = await runSlash(c, sessionId, '/compact keep it short');
     expect(stopReason).toBe('end_turn');
     expect(chunk).toContain('Context compaction started');
@@ -1522,7 +1629,6 @@ describe('acp-server terminal reverse-RPC (clientCapabilities.terminal)', () => 
     released: boolean;
   }
 
-  /** Register fake `terminal/*` handlers; returns the created terminals. */
   function fakeTerminalClient(c: TestClient, output: string, exitCode = 0): FakeTerminal[] {
     const terminals: FakeTerminal[] = [];
     let next = 0;
@@ -1619,9 +1725,6 @@ describe('acp-server terminal reverse-RPC (clientCapabilities.terminal)', () => 
     expect(stopReason).toBe('end_turn');
     expect(scripted!.callCount()).toBe(2);
 
-    // terminal/create fired once, for this session, wrapping the model's
-    // command in the Bash tool's shell invocation with its noninteractive
-    // env and the session cwd.
     expect(terminals).toHaveLength(1);
     const t = terminals[0]!;
     expect(t.createParams.sessionId).toBe(sessionId);
@@ -1630,21 +1733,15 @@ describe('acp-server terminal reverse-RPC (clientCapabilities.terminal)', () => 
     expect(t.createParams.cwd).toBe(homeDir);
     expect(t.createParams.env).toContainEqual({ name: 'TERM', value: 'dumb' });
 
-    // Normal-exit lifecycle: wait_for_exit resolved, the terminal was
-    // released exactly once (via IProcess.dispose), never killed.
     expect(t.released).toBe(true);
     expect(t.killed).toBe(false);
 
-    // The tool card carries the terminal embed — not a textual copy of the
-    // output (the client already renders the bytes in the terminal pane).
     const updates = toolCallUpdates(c);
     const attached = updates.find((u) => u.content?.[0]?.type === 'terminal');
     expect(attached?.content?.[0]?.terminalId).toBe(t.id);
     const completed = updates.find((u) => u.status === 'completed');
     expect(completed?.content).toEqual([{ type: 'terminal', terminalId: t.id }]);
 
-    // …while the model still received the captured output in the tool
-    // result fed back on the second generate() call.
     const secondCall = scripted!.callHistory()[1];
     expect(JSON.stringify(secondCall)).toContain('hello_from_terminal');
   }, 30_000);

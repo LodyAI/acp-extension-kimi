@@ -15,7 +15,7 @@ This is a TypeScript monorepo built for agent-assisted development. Keep the roo
 ## Project Map
 
 - `apps/kimi-code`: the CLI / TUI application. It consumes core capabilities through `@moonshot-ai/kimi-code-sdk` and must not depend directly on engine packages. When writing or modifying its terminal UI, use the `write-tui` skill (`.agents/skills/write-tui/SKILL.md`).
-- the browser web UI: **its source no longer lives in this repo.** It is developed in the code-app repo (`apps/web`) and shipped as the committed, prebuilt bundle `apps/kimi-code/dist-web` (gitignored, force-added), synced from code-app with `KIMI_CODE_REPO=<this checkout> pnpm run sync:web` — sync and commit the bundle in the same change whenever the web UI should ship differently. `apps/kimi-code/scripts/check-web-assets.mjs` guards packaging against a missing bundle. To hack on the web UI against this repo's server, run `pnpm dev:server` here and point code-app's `pnpm dev:web` at it via `KIMI_SERVER_URL`.
+- the desktop and browser web UI share `apps/desktop/src/renderer`; `packages/app-core/src/api/daemon` owns their KAP client. The CLI also ships its prebuilt `apps/kimi-code/dist-web` bundle.
 - `apps/vis`, `apps/vis/server`, `apps/vis/web`: visual debugging tools for sessions and replays.
 - `packages/agent-core-v2`: the DI × Scope agent engine (the v2 port behind kap-server). Three `LifecycleScope` tiers — `App` / `Session` / `Agent` (`app/scopes.ts`) — plus the L3 unit layer (`Service`/`Fiber` units, collection contribution points, the Feature seam in `src/features/`); `WorkspaceInstance`/`Program` graphs are materialized at runtime through `IWorkspaceInstanceManager`, with the App-scoped `ISessionManager` creating per-workspace session controllers through `Program`.
 - `packages/node-sdk`: the public TypeScript SDK and harness.
@@ -59,7 +59,7 @@ This is a TypeScript monorepo built for agent-assisted development. Keep the roo
 - Except for a package's `index.ts`, other `index.ts` files should prefer `export * from './module';`.
 - Do not add too many new test files. Prefer adding tests to the existing test file of the corresponding component or module.
 - When a test fails because of a user modification, default to fixing the test first; do not change the implementation to satisfy an old test unless the implementation truly has a bug.
-- Do not sacrifice code quality for external compatibility unless the user explicitly asks for it. Breaking changes go through changesets and a `major` bump, gated by the rule below.
+- Do not sacrifice code quality for external compatibility unless the user explicitly asks for it.
 
 ## Experimental Features
 
@@ -73,11 +73,6 @@ This is a TypeScript monorepo built for agent-assisted development. Keep the roo
 - Project-map entries stay at 1–2 sentences; deep package docs live in the package's own `AGENTS.md`.
 - Keep instruction updates focused and supported by code facts.
 
-## Release Workflow
-
-- `main` accumulates changesets; `release/*` maintains `ci: release packages` PRs. Merging the matching version PR authorizes publication after its merge-commit CI succeeds. Ordinary pushes do not publish.
-- npm publishing and native artifacts retain the existing Changesets flow. CDN upload and routing remain separately approved operations. See `.changeset/README.md` for migration and main synchronization.
-
 ## Workflow Requirements
 
 - Prefer `rg` / `rg --files` when reading code.
@@ -86,9 +81,6 @@ This is a TypeScript monorepo built for agent-assisted development. Keep the roo
 - When creating a PR, use the `write-pr` skill (`.agents/skills/write-pr/SKILL.md`) to write the PR description. The PR title must follow Conventional Commit style, e.g. `chore: remove legacy format commands`.
 - When an AI agent opens or updates a PR, fill in `.github/pull_request_template.md` — link the related issue or explain the problem, then describe what changed. Do not leave placeholder text or submit a generic summary of the diff.
 - Do not submit vague AI-generated PR text. The human author must understand the change well enough to explain the code, edge cases, and why the approach fits this repository.
-- After finishing a task and before submitting a PR, you must run the `gen-changesets` skill (see `.agents/skills/gen-changesets/SKILL.md`) and generate a changeset under `.changeset/` according to its rules.
-- Changesets must strictly follow the rules in `.agents/skills/gen-changesets/SKILL.md`: write one short user-facing sentence that states only what changed, and skip any change users cannot perceive.
-- When generating a changeset, **never** decide on a `major` bump on your own — stop, explain, and get explicit user confirmation first; default to `minor`, fall back to `patch`. See `.agents/skills/gen-changesets/SKILL.md`.
 - Prefer importing via `import ... from '#/...'`, which serves the same purpose as `import ... from '@/...'`.
 - Do not commit throwaway scratch or exploratory files. Never stage:
   - Agent working notes or handoff/summary documents (e.g. `HANDOVER-*.md`, `HANDOFF-*.md`, `handoff.md`).
@@ -105,7 +97,7 @@ These rules apply to every pull request review, automated or human. The user pop
 - Report a class of issues in one pass: when a finding generalizes to several locations in the diff, list all of them at once instead of raising them across successive rounds.
 - No pure style or personal-preference findings. Every finding carries a severity: P0 blocking / P1 should-fix / P2 suggestion.
 - Re-reviews are incremental: review only what changed since the previous review; do not restate findings on unchanged code or re-raise resolved threads. Before treating a resolved thread as settled, verify the current code: suppress a finding only when the problem is actually fixed or the finding no longer holds.
-- Domain-specific rules keep their own canonical homes — changesets (`.agents/skills/gen-changesets/SKILL.md`), comments (General Coding Rules), PR text (`write-pr` skill); review against those, not ad-hoc taste.
+- Domain-specific rules keep their own canonical homes — comments (General Coding Rules), PR text (`write-pr` skill); review against those, not ad-hoc taste.
 
 ### Enumerate changed behavior, not just bugs
 
@@ -113,7 +105,7 @@ Any input that worked before the change — a config key, env var, CLI flag, pro
 
 ### A flipped default or removed behavior needs a named loss and an escape hatch
 
-Everyone on the old default is affected. Require the changeset to name the behavior users lose, not only the new default; a config, env, or flag escape hatch or a maintainer's explicit sign-off in the PR; and a test that pins the old behavior for the population that keeps it.
+Everyone on the old default is affected. Require the PR to name the behavior users lose, not only the new default; a config, env, or flag escape hatch or a maintainer's explicit sign-off in the PR; and a test that pins the old behavior for the population that keeps it.
 
 ### Prompt text is behavior
 
@@ -121,7 +113,7 @@ Editing or deleting sentences under `packages/agent-core-v2/src/**/*.md` (system
 
 ### Contract files are tripwires
 
-The manifests under `packages/agent-core-v2/docs/` (`config-manifest.toml`, `wire-manifest.d.ts`, `state-manifest.d.ts`), `packages/kap-server/test/__snapshots__/apiSurface.snapshot.test.ts.snap`, `packages/node-sdk/src/index.ts`, `packages/agent-core-v2/src/features/externalHooks/`, `packages/acp-server/`, and `apps/kimi-code/src/cli/` are consumed outside this repository: desktop and web in code-app, the VS Code extension, ACP clients such as Zed, SDK users, hook scripts, and headless-output parsers. When they change, require the PR to name the consumers and how data and clients from the previous release keep working.
+The manifests under `packages/agent-core-v2/docs/` (`config-manifest.toml`, `wire-manifest.d.ts`, `state-manifest.d.ts`), `packages/kap-server/test/__snapshots__/apiSurface.snapshot.test.ts.snap`, `packages/node-sdk/src/index.ts`, `packages/agent-core-v2/src/features/externalHooks/`, `packages/acp-server/`, and `apps/kimi-code/src/cli/` are consumed outside this repository: desktop and web, the VS Code extension, ACP clients such as Zed, SDK users, hook scripts, and headless-output parsers. When they change, require the PR to name the consumers and how data and clients from the previous release keep working.
 
 ### Ports and refactors carry the old path's feature inventory
 

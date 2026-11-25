@@ -1,14 +1,14 @@
-import { describe, expect, it, vi } from 'vitest';
-
 import type {
-  IHostEnvironment,
-  Environment,
-  EnvironmentProviderHost,
+  EnvironmentLease,
+  IHostProcess,
+  IHostProcessService,
 } from '@moonshot-ai/agent-core-v2';
+import { describe, expect, it } from 'vitest';
 
+import { makeSessionContext } from '../../agent-core-v2/src/session/sessionContext/sessionContext';
+import { fakeEnvironment } from '../../agent-core-v2/test/environment/stubs';
 import type { IAcpConnection, IAcpTerminalHandle } from '../src/acp-fs/acpConnection';
-import { AcpHostFileSystem } from '../src/acp-fs/acpFsService';
-import { AcpEnvironmentProviderFactory } from '../src/acp-terminal/acpTerminalRunner';
+import { AcpEnvironmentOverlay } from '../src/acp-terminal/acpTerminalRunner';
 
 function makeConnection(
   options: { terminalEnabled?: boolean; createTerminal?: () => IAcpTerminalHandle } = {},
@@ -28,128 +28,113 @@ function makeConnection(
   };
 }
 
-function makeEnvironment(overrides: Partial<IHostEnvironment> = {}): IHostEnvironment {
+function makeTerminalHandle(): IAcpTerminalHandle {
   return {
-    _serviceBrand: undefined,
-    osKind: 'macOS',
-    osArch: 'arm64',
-    osVersion: '24.0.0',
-    shellName: 'bash',
-    shellPath: '/bin/bash',
-    pathClass: 'posix',
-    homeDir: '/Users/test',
-    ready: Promise.resolve(),
-    ...overrides,
-  } as IHostEnvironment;
+    id: 'term-1',
+    currentOutput: async () => ({ output: '', truncated: false }),
+    waitForExit: async () => ({ exitCode: 0 }),
+    kill: async () => ({}),
+    release: async () => ({}),
+  };
 }
 
-async function bindEnvironment(
-  environment: IHostEnvironment,
-  connection: IAcpConnection = makeConnection(),
-): Promise<Environment> {
-  const runtimes: Environment[] = [];
-  const host = {
-    registerEnvironment: (runtime: Environment) => {
-      runtimes.push(runtime);
-      return { remove: async () => {} };
-    },
-  } as unknown as EnvironmentProviderHost;
-  const factory = new AcpEnvironmentProviderFactory(connection, environment);
-  await factory.attach(host);
-  factory.bindSession('s1', '/repo');
-  const runtime = runtimes[0];
-  if (runtime === undefined) throw new Error('runtime was not registered');
-  return runtime;
+function lease(environmentId: string, process: IHostProcessService): EnvironmentLease {
+  return {
+    environment: Object.assign(fakeEnvironment(environmentId, 'one'), { process }),
+    track: <T>(resource: T): T => resource,
+    dispose: () => {},
+  };
 }
 
-describe('AcpSessionEnvironment', () => {
-  it('mirrors the probed host environment and exposes fs + process capabilities', async () => {
-    const runtime = await bindEnvironment(makeEnvironment());
+const session = makeSessionContext({
+  sessionId: 's1',
+  workspaceId: 'workspace',
+  sessionDir: '/session',
+  sessionScope: 'sessions/s1',
+  cwd: '/repo',
+});
 
-    expect([...runtime.capabilities].sort()).toEqual(['fs', 'process']);
-    expect(runtime.host).toMatchObject({
-      osKind: 'macOS',
-      osArch: 'arm64',
-      shellName: 'bash',
-      shellPath: '/bin/bash',
-      pathClass: 'posix',
-      homeDir: '/Users/test',
+const bashEnv = { NO_COLOR: '1', TERM: 'dumb' };
+
+describe('AcpEnvironmentOverlay', () => {
+  it('routes local Bash-shaped spawns through the ACP terminal', async () => {
+    let created = 0;
+    const connection = makeConnection({
+      createTerminal: () => {
+        created += 1;
+        return makeTerminalHandle();
+      },
     });
-    expect(runtime.fs).toBeInstanceOf(AcpHostFileSystem);
-    expect(runtime.path!.isAbsolute('/repo')).toBe(true);
+    const local = { _serviceBrand: undefined, spawn: async () => ({}) as IHostProcess };
+    const overlay = new AcpEnvironmentOverlay(session, connection);
+    overlay.attach();
+    const decorated = overlay.decorate(lease('local', local));
+
+    expect(decorated.environment.identity.environmentId).toBe('local');
+    await decorated.environment.process!.spawn('/bin/bash', ['-c', 'echo hi'], {
+      env: { ...bashEnv },
+    });
+    expect(created).toBe(1);
   });
 
-  it('adapts path semantics and shell to a win32 host environment', async () => {
-    const runtime = await bindEnvironment(
-      makeEnvironment({
-        osKind: 'Windows',
-        osArch: 'x64',
-        shellName: 'bash',
-        shellPath: 'C:\\Program Files\\Git\\bin\\bash.exe',
-        pathClass: 'win32',
-        homeDir: 'C:\\Users\\test',
+  it('forwards non-Bash spawns through ACP without executing locally', async () => {
+    let created = 0;
+    const calls: string[] = [];
+    const local = {
+      _serviceBrand: undefined,
+      spawn: async (command: string) => {
+        calls.push(command);
+        return {} as IHostProcess;
+      },
+    };
+    const overlay = new AcpEnvironmentOverlay(
+      session,
+      makeConnection({
+        createTerminal: () => {
+          created += 1;
+          return makeTerminalHandle();
+        },
       }),
     );
+    overlay.attach();
+    const decorated = overlay.decorate(lease('local', local));
 
-    expect(runtime.host).toMatchObject({
-      osKind: 'Windows',
-      shellPath: 'C:\\Program Files\\Git\\bin\\bash.exe',
-      pathClass: 'win32',
-      homeDir: 'C:\\Users\\test',
-    });
-    expect(runtime.path!.separator).toBe('\\');
-    expect(runtime.path!.isAbsolute('C:\\repo')).toBe(true);
-    expect(runtime.path!.isAbsolute('repo')).toBe(false);
-    expect(runtime.path!.resolve('C:\\repo', 'src')).toBe('C:\\repo\\src');
+    await decorated.environment.process!.spawn('rg', ['--files']);
+    expect(calls).toEqual([]);
+    expect(created).toBe(1);
   });
 
-  it('forwards non-Bash processes without attaching them to a Bash tool card', async () => {
-    const handle: IAcpTerminalHandle = {
-      id: 'term-rg',
-      currentOutput: vi.fn(async () => ({ output: '', truncated: false })),
-      waitForExit: vi.fn(
-        () =>
-          new Promise<{ readonly exitCode?: number | null; readonly signal?: string | null }>(
-            () => {},
-          ),
-      ),
-      kill: vi.fn(async () => {}),
-      release: vi.fn(async () => {}),
-    };
-    const createTerminal = vi.fn(async () => handle);
-    const notifyTerminalCreated = vi.fn();
-    const connection: IAcpConnection = {
-      ...makeConnection(),
-      get: () => ({ createTerminal }) as never,
-      notifyTerminalCreated,
-    };
-    const runtime = await bindEnvironment(
-      makeEnvironment({
-        osKind: 'Windows',
-        shellPath: 'C:\\Users\\test\\scoop\\apps\\git\\current\\bin\\bash.exe',
-        pathClass: 'win32',
-      }),
-      connection,
+  it('preserves the local environment status getter', () => {
+    const original = lease('local', {
+      _serviceBrand: undefined,
+      spawn: async () => ({}) as IHostProcess,
+    });
+    const overlay = new AcpEnvironmentOverlay(session, makeConnection());
+    overlay.attach();
+    const decorated = overlay.decorate(original);
+    expect(decorated.environment.status).toBe('ready');
+    expect(Object.getPrototypeOf(decorated.environment)).toBe(
+      Object.getPrototypeOf(original.environment),
     );
-    const rgPath = 'C:\\Users\\test\\AppData\\Local\\kimi\\rg.exe';
+  });
 
-    const process = await runtime.process!.spawn(rgPath, ['-c', 'printf should-not-attach'], {
-      cwd: 'C:\\repo',
-      env: { NO_COLOR: '1', TERM: 'dumb' },
-    });
+  it('rejects execution without the terminal capability', async () => {
+    const process = { _serviceBrand: undefined, spawn: async () => ({}) as IHostProcess };
+    const overlay = new AcpEnvironmentOverlay(session, makeConnection({ terminalEnabled: false }));
+    overlay.attach();
+    const decorated = overlay.decorate(lease('local', process));
+    await expect(decorated.environment.process!.spawn('rg', ['--files'])).rejects.toThrow(
+      'ACP terminal capability is unavailable',
+    );
+  });
 
-    expect(createTerminal).toHaveBeenCalledWith({
-      sessionId: 's1',
-      command: rgPath,
-      args: ['-c', 'printf should-not-attach'],
-      env: [
-        { name: 'NO_COLOR', value: '1' },
-        { name: 'TERM', value: 'dumb' },
-      ],
-      cwd: 'C:\\repo',
-      outputByteLimit: 4 * 1024 * 1024,
-    });
-    expect(notifyTerminalCreated).not.toHaveBeenCalled();
-    await process.dispose();
+  it('keeps remote process and environment identity unchanged', async () => {
+    const process = { _serviceBrand: undefined, spawn: async () => ({}) as IHostProcess };
+    const original = lease('test-remote', process);
+    const overlay = new AcpEnvironmentOverlay(session, makeConnection());
+    overlay.attach();
+    const decorated = overlay.decorate(original);
+    expect(decorated).toBe(original);
+    expect(decorated.environment.identity.environmentId).toBe('test-remote');
   });
 });

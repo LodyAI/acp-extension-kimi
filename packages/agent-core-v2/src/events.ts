@@ -1,12 +1,22 @@
 import type { CompactionBlockedEvent, CompactionCancelledEvent, CompactionCompletedEvent, CompactionStartedEvent } from '#/agent/fullCompaction/compactionOps';
 import type { TurnStartedEvent, TurnStepCompletedEvent, TurnStepInterruptedEvent, TurnStepRetryingEvent, TurnStepStartedEvent, AssistantDeltaEvent, ThinkingDeltaEvent } from '#/agent/loop/turnEvents';
 import type { TurnEndedEvent } from '#/agent/loop/turnOps';
+import type { LoopDrainedEvent, LoopIdleEvent } from '#/agent/loop/loopOps';
 import type { PluginCommandActivatedEvent } from '#/agent/pluginCommand/pluginCommand';
 import type { PromptAbortedEvent, PromptCompletedEvent, PromptSteeredEvent, PromptSubmittedEvent } from '#/agent/prompt/promptEvents';
 import type { EnvironmentStatusChangedEvent } from '#/agent/environmentBinding/environmentEvents';
 import type { BackgroundTaskStartedEvent, BackgroundTaskTerminatedEvent, TaskStartedEvent, TaskTerminatedEvent } from '#/agent/task/types';
-import type { McpServerStatusEvent, ShellCompletedEvent, ShellOutputEvent, ShellStartedEvent, ToolCallDeltaEvent, ToolCallStartedEvent, ToolListUpdatedEvent, ToolUpdatedEvent } from '#/agent/toolExecutor/toolExecutorEvents';
-import type { ToolResultEventPayload } from '#/agent/toolExecutor/toolExecutorEvents';
+import type {
+  McpServerStatusEvent,
+  ShellCompletedEvent,
+  ShellOutputEvent,
+  ShellStartedEvent,
+  ToolCallDeltaEvent,
+  ToolCallStartedEvent,
+  ToolListUpdatedEvent,
+  ToolUpdatedEvent,
+  ToolResultEventPayload,
+} from '#/agent/toolExecutor/toolExecutorEvents';
 import type { AgentStatusUpdatedEvent } from '#/agent/usage/usageEvents';
 import type { CapabilityChangedEvent } from '#/app/capability/capabilityEvents';
 import type { ConfigChangedEvent, ConfigWarningEvent } from '#/app/config/configEvents';
@@ -50,6 +60,8 @@ export type AgentEvent =
   | EnvironmentStatusChangedEvent
   | TurnStartedEvent
   | TurnEndedEvent
+  | LoopDrainedEvent
+  | LoopIdleEvent
   | TurnStepStartedEvent
   | TurnStepCompletedEvent
   | TurnStepRetryingEvent

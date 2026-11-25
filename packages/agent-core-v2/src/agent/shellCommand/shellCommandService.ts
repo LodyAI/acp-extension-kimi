@@ -1,4 +1,4 @@
-/* oxlint-disable typescript-eslint/no-unsafe-declaration-merging, eslint-plugin-import/namespace -- Event2 class+payload-interface declaration merging is the sanctioned event-declaration idiom. */
+/* oxlint-disable typescript-eslint/no-unsafe-declaration-merging -- Event2 class+payload-interface declaration merging is the sanctioned event-declaration idiom. */
 import { LifecycleScope } from '#/app/scopes';
 
 import { Service } from '#/_base/di/service';
@@ -17,7 +17,7 @@ import { createTaskCompletionEntry } from '#/agent/task/taskOutput';
 import { agentTaskInfo } from '#/agent/task/handler';
 import { TaskStarted, TaskTerminated } from '#/agent/task/taskOps';
 import { toErrorMessage } from '#/_base/errors/errorMessage';
-import type { ToolCall } from '#human/llm/message';
+import type { ToolCall } from '@moonshot-ai/core/llm/message';
 import { isToolDetachAck } from '#/tool/executor';
 import { AgentEvent2 } from '#/app/event/event2';
 import { ITelemetryService } from '#/app/telemetry/telemetry';

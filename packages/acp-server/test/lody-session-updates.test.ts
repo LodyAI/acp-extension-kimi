@@ -211,7 +211,7 @@ describe('background subagent work and the client prompt', () => {
       true,
     );
     await session.init();
-    const task = { ...subagentTask(), agentId: 'child' };
+    const task = subagentTask({ agentId: 'child', model: 'worker', thinkingEffort: 'low' });
     fake.emit('task.started', { info: task });
     fake.emitAgent('child', 'assistant.delta', { turnId: 1, delta: 'Child text' });
     fake.emitAgent('child', 'tool.call.started', {
@@ -243,7 +243,7 @@ describe('background subagent work and the client prompt', () => {
     expect(events[4]).toMatchObject({ snapshot: { parentRunId: events[0]!.runId } });
     expect(events[0]).toMatchObject({
       sessionId: SESSION_ID,
-      snapshot: { outputIncomplete: true },
+      snapshot: { outputIncomplete: true, modelId: 'worker', reasoningEffort: 'low' },
     });
     expect(events[1]).toMatchObject({
       nativeTurnId: '1',

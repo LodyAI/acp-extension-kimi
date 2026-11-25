@@ -11,7 +11,6 @@ import { KlientValidationError } from '../src/core/validation.js';
 
 const tick = (ms = 0): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
-/** Records calls, replays scripted results, and captures listen subscriptions. */
 class FakeChannel implements KlientChannel {
   readonly calls: Array<{ scope: ScopeRef; service: string; method: string; args: unknown[] }> = [];
   readonly subscriptions: Array<{
@@ -20,7 +19,6 @@ class FakeChannel implements KlientChannel {
     dispose: ReturnType<typeof vi.fn>;
   }> = [];
   result: unknown;
-  /** Keyed `${service}.${method}` result overrides. */
   readonly results = new Map<string, unknown>();
   private readonly handlers = new Map<number, (data: unknown) => void>();
   private nextSub = 0;
@@ -31,10 +29,7 @@ class FakeChannel implements KlientChannel {
     return Promise.resolve(this.results.has(key) ? this.results.get(key) : this.result);
   }
 
-  // eslint-disable-next-line @typescript-eslint/require-await
-  async *stream(_scope: ScopeRef, _service: string, _method: string, _args: unknown[]): AsyncIterableIterator<unknown> {
-    // stub — streaming is not exercised in facade tests
-  }
+  async *stream(_scope: ScopeRef, _service: string, _method: string, _args: unknown[]): AsyncIterableIterator<unknown> {}
 
   listen(scope: ScopeRef, source: EventSourceRef, handler: (data: unknown) => void): IDisposable {
     const id = this.nextSub;
@@ -47,7 +42,6 @@ class FakeChannel implements KlientChannel {
     return { dispose };
   }
 
-  /** Push a raw payload into the Nth subscription (0-based). */
   emit(index: number, data: unknown): void {
     this.handlers.get(index)?.(data);
   }
@@ -78,7 +72,7 @@ describe('facade routing', () => {
       args: ['/x', 'n'],
     });
 
-    channel.result = undefined; // void output
+    channel.result = undefined;
     await klient.global.plugins.setMcpServerEnabled({ id: 'p', server: 's', enabled: true });
     expect(channel.calls[1]).toMatchObject({
       service: 'pluginService',
@@ -102,6 +96,27 @@ describe('facade routing', () => {
       method: 'getManagedUsage',
       args: [undefined],
     });
+    channel.results.set('sessionPromptPredictionService.predict', 'next prompt');
+    await expect(klient.session('s1').predictNextPrompt({
+      predictionId: 'prediction-1',
+      expectedTurnId: 4,
+    })).resolves.toBe('next prompt');
+    channel.results.set('sessionPromptPredictionService.cancel', true);
+    await expect(klient.session('s1').cancelPromptPrediction('prediction-1', 'escape')).resolves.toBe(true);
+    expect(channel.calls.slice(4)).toEqual([
+      {
+        scope: { sessionId: 's1' },
+        service: 'sessionPromptPredictionService',
+        method: 'predict',
+        args: [{ predictionId: 'prediction-1', expectedTurnId: 4 }],
+      },
+      {
+        scope: { sessionId: 's1' },
+        service: 'sessionPromptPredictionService',
+        method: 'cancel',
+        args: ['prediction-1', 'escape'],
+      },
+    ]);
   });
 
   it('forwards the login region option through the wire contract', async () => {
@@ -137,7 +152,6 @@ describe('facade routing', () => {
       supported: true,
       state: 'partial',
       steps: [{ id: 'permissions', state: 'missing' }],
-      // The completed-install note survives the contract parse (not stripped).
       install: { running: false, note: 'user-skill-migrated' },
     };
     channel.result = [status];
@@ -259,7 +273,7 @@ describe('agent profile routing', () => {
     const klient = createKlientFromChannel(channel);
     const agent = klient.session('s1').agent('main');
 
-    channel.result = undefined; // void output
+    channel.result = undefined;
     await agent.setThinking('on');
     expect(channel.calls[0]).toEqual({
       scope: { sessionId: 's1', agentId: 'main' },
@@ -449,8 +463,9 @@ describe('session skills routing', () => {
         method: 'notifyClient',
         args: [
           {
-            message: { role: 'user', content: [{ type: 'text', text: 'steer' }] },
-            meta: { origin: { kind: 'user' } },
+            role: 'user',
+            content: [{ type: 'text', text: 'steer' }],
+            attributes: { origin: { kind: 'user' } },
           },
         ],
       },
@@ -700,7 +715,7 @@ describe('contract validation', () => {
   it('rejects drifted output payloads', async () => {
     const channel = new FakeChannel();
     const klient = createKlientFromChannel(channel);
-    channel.result = { id: 's1' }; // missing required SessionSummary fields
+    channel.result = { id: 's1' };
     await expect(klient.global.sessions.get('s1')).rejects.toBeInstanceOf(KlientValidationError);
   });
 
@@ -829,6 +844,8 @@ describe('event hub', () => {
       blocked: [] as unknown[],
       cancelled: [] as unknown[],
       completed: [] as unknown[],
+      drained: [] as unknown[],
+      idle: [] as unknown[],
     };
     const errors: Error[] = [];
     agent.events.onError((error) => {
@@ -841,9 +858,9 @@ describe('event hub', () => {
     agent.events.on('compaction.blocked', (event) => seen.blocked.push(event));
     agent.events.on('compaction.cancelled', (event) => seen.cancelled.push(event));
     agent.events.on('compaction.completed', (event) => seen.completed.push(event));
+    agent.events.on('loop.drained', (event) => seen.drained.push(event));
+    agent.events.on('loop.idle', (event) => seen.idle.push(event));
 
-    // All six registrations share one `events` stream subscription bound to
-    // the agent scope.
     expect(channel.subscriptions).toHaveLength(1);
     expect(channel.subscriptions[0]?.scope).toEqual({ sessionId: 's1', agentId: 'main' });
     expect(channel.subscriptions[0]?.source).toEqual({ kind: 'stream', name: 'events' });
@@ -872,6 +889,8 @@ describe('event hub', () => {
     channel.emit(0, blocked);
     channel.emit(0, cancelled);
     channel.emit(0, completed);
+    channel.emit(0, { type: 'loop.drained', generation: 1, time: 1 });
+    channel.emit(0, { type: 'loop.idle', generation: 2, time: 2 });
     channel.emit(0, { type: 'tool.updated', turnId: 1, toolCallId: 'tc1', taskId: 'task-1', status: 'running', detached: false }); // missing fields
     channel.emit(0, { type: 'unregistered.type', turnId: 1 });
     await tick();
@@ -882,6 +901,8 @@ describe('event hub', () => {
     expect(seen.blocked).toEqual([blocked]);
     expect(seen.cancelled).toEqual([cancelled]);
     expect(seen.completed).toEqual([completed]);
+    expect(seen.drained).toEqual([{ type: 'loop.drained', generation: 1, time: 1 }]);
+    expect(seen.idle).toEqual([{ type: 'loop.idle', generation: 2, time: 2 }]);
     expect(errors).toHaveLength(1);
     expect(errors[0]).toBeInstanceOf(KlientValidationError);
   });

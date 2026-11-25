@@ -79,6 +79,8 @@ workspace 级 MCP server 启动时连不上或意外断连时，会自动按指�
 
 HTTP 与 SSE server 支持通过 `headers` 或 `bearerTokenEnvVar` 提供静态凭证。需要 OAuth 时，运行 `/mcp-config login <server-name>` 完成浏览器授权。
 
+在本机聊天中，如果 Agent 调用 MCP 授权工具，允许执行工具后，还需要在服务商的网页上确认授权。桌面端会尝试打开系统浏览器；网页端可点击聊天卡片上的「打开授权页」。如果浏览器没有打开或被误关，点击同一按钮即可继续，不用重新发送消息。
+
 Plugins 也可以在 manifest 中声明 MCP servers。Plugin 声明的 servers 默认启用，可以在 `/plugins` 中禁用或重新启用：禁用或移除后，已打开会话中的工具调用会失败并返回移除提示；新增或启用 server 会立即连接到已打开的会话。详见 [Plugins](./plugins.md#plugin-中的-mcp-servers)。
 
 ::: warning 注意
@@ -109,7 +111,7 @@ defaultCwd = "/srv/work"
 }
 ```
 
-`environment_id` 引用在 `config.toml` 的 `[environments]` 中声明的环境（见 [声明环境](../guides/remote-environment.md#声明环境)）。该字段默认为 `local`，且不跟随会话自身的环境绑定：绑定到 `dev-box` 的会话仍会在本地运行未设置 `environment_id` 的 stdio server。环境尚未连接时，会在 server 启动时按需建立连接。
+`environment_id` 引用在 `config.toml` 的 `[environments]` 中声明的环境（见 [声明 Docker 与自定义命令环境](../guides/remote-environment.md#声明-docker-与自定义命令环境)）。该字段默认为 `local`，且不跟随会话自身的环境绑定：绑定到 `dev-box` 的会话仍会在本地运行未设置 `environment_id` 的 stdio server。环境尚未连接时，会在 server 启动时按需建立连接。
 
 ### 远程 stdio server 的环境变量
 
@@ -159,7 +161,7 @@ defaultCwd = "/srv/work"
 
 MCP 工具按 `mcp__<server>__<tool>` 格式命名，例如 `mcp__github__create_issue`。权限规则中支持 `*` 和 `**` 通配，例如 `mcp__github__*` 命中该 server 下所有工具。MCP 工具参数不参与权限匹配。
 
-未命中权限规则的调用会触发审批请求；在审批弹窗中选择“Approve for this session”后，本次会话内的后续同类调用自动放行。
+未命中权限规则的调用会触发审批请求；在审批弹窗中选择 "Approve for this session" 后，本次会话内的后续同类调用自动放行。
 
 也可以在 `config.toml` 的 `[[permission.rules]]` 中预置永久规则：
 

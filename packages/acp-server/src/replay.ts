@@ -21,7 +21,7 @@
 
 import type { SessionNotification } from '@agentclientprotocol/sdk';
 import type { ContextMessage, ForkTurnSummary } from '@moonshot-ai/agent-core-v2';
-import type { ContentPart, ToolCall } from '@moonshot-ai/agent-core-v2/human/llm/message';
+import type { ContentPart, ToolCall } from '@moonshot-ai/core/llm/message';
 
 import {
   assistantDeltaToSessionUpdate,
@@ -30,11 +30,6 @@ import {
 } from './events-map';
 import { withLodyTurnId } from './lody-extension';
 
-/**
- * Project a persisted context history into an ordered batch of ACP
- * `session/update` notifications. Pure — no IO, never throws on a single
- * malformed message (it is skipped).
- */
 export function projectHistoryToSessionUpdates(
   sessionId: string,
   messages: readonly ContextMessage[],
@@ -77,7 +72,6 @@ export function projectHistoryToSessionUpdates(
         break;
       }
       default:
-        // system / unknown roles — ACP has no analogue; skip.
         break;
     }
   }
@@ -132,8 +126,6 @@ function assistantContentPartToUpdate(
       delta: part.think,
     });
   }
-  // image_url / audio_url / video_url belong to the user-input side and ACP
-  // has no dedicated assistant-media chunk; skip them.
   return null;
 }
 
@@ -159,16 +151,10 @@ function toolMessageToUpdate(
 ): SessionNotification | null {
   const rawToolCallId = message.toolCallId;
   if (!rawToolCallId) {
-    // Tool result with no correlation id — skip rather than crash; the
-    // on-disk session is the source of truth and we cannot synthesize a
-    // missing id.
     return null;
   }
   const turnId = toolCallTurnIds.get(rawToolCallId);
   if (turnId === undefined) {
-    // The matching assistant message was not in this history slice (e.g. the
-    // session was compacted). Skip — emitting an update for a tool_call the
-    // client never saw would orphan the card.
     return null;
   }
   const isError = message.isError === true;
@@ -183,11 +169,6 @@ function toolMessageToUpdate(
   };
 }
 
-/**
- * Parse a tool call's `arguments` field (a JSON string or `null`) into the
- * structured object expected by {@link toolCallStartToSessionUpdate}. Falls
- * back to the raw string when the payload is not valid JSON.
- */
 function parseToolCallArguments(rawArguments: string | null): unknown {
   if (rawArguments === null || rawArguments === '') return {};
   try {
@@ -197,12 +178,6 @@ function parseToolCallArguments(rawArguments: string | null): unknown {
   }
 }
 
-/**
- * Project a `tool`-role message's content parts into the ACP
- * `tool_call_update.content` shape. Text parts surface directly; anything else
- * (image refs, etc.) becomes a `[type]` placeholder so the result card is not
- * empty.
- */
 function toolMessageContentToAcpToolCallContent(
   parts: readonly ContentPart[],
 ): Array<{ type: 'content'; content: { type: 'text'; text: string } }> {

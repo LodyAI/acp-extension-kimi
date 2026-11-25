@@ -21,10 +21,6 @@ interface FakeSession {
   fire(): void;
 }
 
-/**
- * Fake the klient session surface the bridge consumes:
- * `events.on('interactions.changed')` + `interactions.list()` / `respond()`.
- */
 function makeFakeSession(): FakeSession {
   let listener: ((pending: readonly Interaction[]) => void) | undefined;
   let pending: readonly Interaction[] = [];
@@ -332,7 +328,6 @@ describe('AcpInteractionBridge', () => {
         },
       },
     });
-    // Answers key by question text; multi-select joins in declared option order.
     expect(session.responses).toEqual([
       { id: 'question-el-1', response: { 'Pick one': 'B', 'Pick many': 'X, Z' } },
     ]);

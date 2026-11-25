@@ -8,6 +8,12 @@ The input box accepts free-form text. Press `Enter` to send, or `Shift-Enter` / 
 
 **Exiting the CLI**: press `Ctrl-D` with the input box empty, press `Ctrl-C` twice while idle, or type `/exit`. Pressing `Ctrl-C` or `Esc` during streaming output interrupts the current turn — it does not exit the program.
 
+## Prompt prediction (experimental)
+
+After a main agent turn completes normally, Kimi Code CLI can suggest the next prompt in an empty input box. The suggestion is generated in a side request and never submitted automatically.
+
+Set `KIMI_CODE_EXPERIMENTAL_PROMPT_PREDICTION=1` before launching to enable it, or run `/experiments` and enable `Prompt prediction`. Press `Tab` or `→` to insert the full suggestion, edit it if needed, and press `Enter` to submit. Typing, pressing `Esc`, starting a new turn, or switching sessions cancels or clears the suggestion. Cancelled, failed, or blocked turns do not produce suggestions.
+
 ## Pasting images and video
 
 Kimi Code CLI supports pasting images and video directly into the input box, so you can discuss screenshots, UI mockups, architecture diagrams, or code demos without uploading or converting files first.
@@ -130,9 +136,12 @@ Use `/goal next <objective>` to line up follow-up work without interrupting the 
 
 The input box remains usable while the agent is thinking or calling tools, and supports the following extra actions:
 
+- **`Enter`**: queue the message; pick Steer under `/settings` → `Follow-up behavior` to inject it into the running turn instead
 - **`Ctrl-S`**: inject the content in the input box into the running turn immediately, without waiting for it to finish
 - **`Esc` / `Ctrl-C`**: interrupt the current turn
 - **`Ctrl-O`**: globally toggle the collapsed/expanded state of tool output and compaction summaries
+
+Queued messages stay in the queue through follow-up turns triggered by background-task notifications, and are sent in order only after the engine has drained all pending turns.
 
 When the agent is waiting for background tasks through `WaitFor`, sending a message with `Enter` steers it in and ends that wait early; messages already queued when the wait starts are steered in automatically as well. If the queue holds a shell command or a skill, automatic steering is skipped and the queue and new input stay queued until the turn ends. Press `Ctrl-S` to manually steer non-shell inputs from the editor and the queue. Background tasks keep running and existing tool results are preserved. If other foreground tools remain in the same batch, the agent processes your message after they return.
 

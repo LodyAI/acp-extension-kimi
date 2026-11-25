@@ -49,3 +49,7 @@ Package-local rules for `packages/acp-server`.
   generated/explicit/fallback title sources. Never force generation over a user name.
 
 - Standard ACP `systemPrompt` customizes the session's main-agent profile at this edge. Validate before activation, rebuild each customization from the catalog profile, preserve tools and permissions, and reject changes while the session is busy.
+
+- Core archive and restore target the stored native ID through the engine lifecycle service. Reject sessions still attached to this connection and publish list changes before acknowledging success.
+
+- ACP new, cold load/resume and fork hold the native main loop through activation. Bind the ACP environment before restored work can execute, and release the existing quiescence hold only after output subscriptions and usage baselines are ready. Native restoration outside ACP retains local execution.

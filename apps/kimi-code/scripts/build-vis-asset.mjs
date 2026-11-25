@@ -1,7 +1,3 @@
-// Builds the vis web single-file bundle, gzips it, and writes a generated
-// TS module that embeds it as base64 so tsdown can later bundle it into
-// dist/main.mjs (works identically for the npm package and the native SEA
-// binary).
 import { execSync } from 'node:child_process';
 import { gzipSync } from 'node:zlib';
 import { readFileSync, mkdirSync, writeFileSync } from 'node:fs';
@@ -23,7 +19,7 @@ try {
   // execSync runs through the platform shell, which is required on Windows:
   // pnpm's launcher is `pnpm.cmd`, which a bare argv exec cannot resolve (no
   // PATHEXT without a shell). The win32 native binary IS built on Windows
-  // runners (.github/workflows/_native-build.yml), which run this generator.
+  // runners that run this generator.
   // A single command string (not an args array) avoids the args+shell
   // deprecation; the command is static (no injection surface).
   execSync('pnpm --filter @moonshot-ai/vis-web exec vite build', {
